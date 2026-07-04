@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -147,4 +147,189 @@ test('missing file → exit 1', () => {
   const r = run(['--file', '/nonexistent/req.md']);
   assert.equal(r.status, 1);
   assert.ok(r.stderr.includes('error:'));
+});
+
+// ---------------------------------------------------------------------------
+// --record-verdict — captures the operator's prompt-only verdict into
+// .adlc/manifest.jsonl via gate-manifest's record() (closes #44).
+// ---------------------------------------------------------------------------
+
+function readManifestEntries(dir) {
+  const manifestPath = join(dir, '.adlc', 'manifest.jsonl');
+  return readFileSync(manifestPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+}
+
+test('--record-verdict without --prompt-only → exit 1', () => {
+  const r = run(['--request', 'test', '--record-verdict', '-']);
+  assert.equal(r.status, 1);
+  assert.ok(r.stderr.includes('--record-verdict requires --prompt-only'));
+});
+
+test('spec mode: --prompt-only --record-verdict <file> writes a gate-manifest entry', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const verdictPath = join(dir, 'verdict.txt');
+    writeFileSync(verdictPath, 'ambiguity score 0.1 — request is clear, no divergence.\n');
+    const r = run(['--request', 'Add a login page', '--prompt-only', '--record-verdict', verdictPath], { cwd: dir });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\nstderr: ${r.stderr}`);
+    assert.ok(r.stdout.includes('Add a login page'), 'prompt is still printed');
+
+    const [entry] = readManifestEntries(dir);
+    assert.equal(entry.gate, 'parallax');
+    assert.equal(entry.data.promptOnly, true);
+    assert.equal(entry.data.mode, 'spec');
+    assert.ok(entry.data.verdict.includes('ambiguity score 0.1'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spec mode: --record-verdict - reads verdict from stdin', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = spawnSync(NODE, [BIN, '--request', 'Add a login page', '--prompt-only', '--record-verdict', '-'], {
+      cwd: dir,
+      input: 'no divergence found\n',
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\nstderr: ${r.stderr}`);
+    const [entry] = readManifestEntries(dir);
+    assert.equal(entry.gate, 'parallax');
+    assert.ok(entry.data.verdict.includes('no divergence found'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('edge mode: --prompt-only --record-verdict <file> writes a gate-manifest entry with ticket ids', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const ticketsFile = join(dir, 'tickets.json');
+    writeFileSync(ticketsFile, JSON.stringify({
+      tickets: [
+        { id: 'T1', title: 'Auth Service', body: 'Build auth', scope: [] },
+        { id: 'T2', title: 'API Gateway', body: 'Route requests', scope: [] },
+      ],
+    }));
+    const verdictPath = join(dir, 'verdict.txt');
+    writeFileSync(verdictPath, 'no contract conflict between T1 and T2\n');
+
+    const r = run(['--edge', 'T1', 'T2', '--tickets', ticketsFile, '--prompt-only', '--record-verdict', verdictPath], { cwd: dir });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\nstderr: ${r.stderr}`);
+
+    const [entry] = readManifestEntries(dir);
+    assert.equal(entry.gate, 'parallax');
+    assert.equal(entry.data.mode, 'edge');
+    assert.deepEqual(entry.data.tickets, ['T1', 'T2']);
+    assert.ok(entry.data.verdict.includes('no contract conflict'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('route mode: --prompt-only --record-verdict <file> writes a gate-manifest entry with the question', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const verdictPath = join(dir, 'verdict.txt');
+    writeFileSync(verdictPath, 'answer: exponential backoff, 3 retries\n');
+
+    const r = run(['--route', 'What is the retry policy?', '--prompt-only', '--record-verdict', verdictPath], { cwd: dir });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\nstderr: ${r.stderr}`);
+
+    const [entry] = readManifestEntries(dir);
+    assert.equal(entry.gate, 'parallax');
+    assert.equal(entry.data.mode, 'route');
+    assert.equal(entry.data.question, 'What is the retry policy?');
+    assert.ok(entry.data.verdict.includes('exponential backoff'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('omitting --record-verdict preserves current --prompt-only behavior (no manifest written)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = run(['--request', 'Add a login page', '--prompt-only'], { cwd: dir });
+    assert.equal(r.status, 0);
+    assert.ok(r.stdout.includes('Add a login page'));
+    assert.equal(existsSync(join(dir, '.adlc', 'manifest.jsonl')), false, 'no manifest file when flag omitted');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--record-verdict "" (empty string) does NOT silently degrade to plain --prompt-only — errors instead', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = run(['--request', 'Add a login page', '--prompt-only', '--record-verdict', ''], { cwd: dir });
+    assert.notEqual(r.status, 0, `empty --record-verdict must not silently succeed; got exit 0\nstdout: ${r.stdout}`);
+    assert.equal(existsSync(join(dir, '.adlc', 'manifest.jsonl')), false, 'no manifest entry should be written for an empty verdict source');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--record-verdict "" without --prompt-only → exit 1 with the mutual-exclusion error (not silently ignored)', () => {
+  const r = run(['--request', 'test', '--record-verdict', '']);
+  assert.equal(r.status, 1);
+  assert.ok(r.stderr.includes('--record-verdict requires --prompt-only'));
+});
+
+// ---------------------------------------------------------------------------
+// spec mode: stdin-sourced request text vs. `--record-verdict -` collide on
+// the same stdin stream (review round 2 finding, #44).
+// ---------------------------------------------------------------------------
+
+test('spec mode: stdin request + --record-verdict - → exit 1, no manifest written, no misrouted request', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = spawnSync(NODE, [BIN, '--prompt-only', '--record-verdict', '-'], {
+      cwd: dir,
+      input: 'Add a login page\n',
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.ok(r.stderr.includes('error:'));
+    assert.ok(
+      !r.stdout.includes('Add a login page'),
+      'request text must not be printed/consumed once the stdin conflict is detected'
+    );
+    assert.equal(existsSync(join(dir, '.adlc', 'manifest.jsonl')), false, 'no manifest entry should be written');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spec mode: multi-line stdin + --record-verdict - → still errors, never swallows the second line into the request', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = spawnSync(NODE, [BIN, '--prompt-only', '--record-verdict', '-'], {
+      cwd: dir,
+      input: 'Add a login page\nPASS: verdict text\n',
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`);
+    assert.ok(!r.stdout.includes('PASS: verdict text'), 'verdict line must not be baked into a printed/recorded request');
+    assert.equal(existsSync(join(dir, '.adlc', 'manifest.jsonl')), false, 'no manifest entry should be written');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spec mode: --request + --record-verdict - is fine (request does not come from stdin)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'parallax-test-'));
+  try {
+    const r = spawnSync(NODE, [BIN, '--request', 'Add a login page', '--prompt-only', '--record-verdict', '-'], {
+      cwd: dir,
+      input: 'no divergence found\n',
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, `expected exit 0, got ${r.status}\nstderr: ${r.stderr}`);
+    const [entry] = readManifestEntries(dir);
+    assert.equal(entry.data.mode, 'spec');
+    assert.equal(entry.data.request, 'Add a login page');
+    assert.ok(entry.data.verdict.includes('no divergence found'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
