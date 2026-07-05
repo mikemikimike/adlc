@@ -64,13 +64,29 @@ Or as part of the full test suite:
 npm test
 ```
 
+## Marketing Site
+
+`@adlc/docs` now serves the ADLC marketing pages at `/` (home, `/lifecycle`,
+`/failure-modes`, `/vs-sdlc`, `/toolkit`, `/integrations` and its per-agent
+pages, `/enterprise`) alongside Fumadocs at `/docs`, unaffected.
+
+- **`scripts/generate-images.mjs`** — reproducible image-generation pipeline
+  for the site's illustrative art. Needs `OPENAI_API_KEY` or `GEMINI_API_KEY`
+  in the environment (exits 1 with neither set); output is gitignored and
+  regenerated from the checked-in provenance manifest. Use `--force` to
+  regenerate existing images and `--only <slug>` to target a single image.
+- **`scripts/check-links.mjs <base-url>`** — fetches every URL in the running
+  server's `sitemap.xml`, plus four known legacy docs paths, and fails on any
+  non-2xx response. It does not crawl in-page links. This is the **cutover
+  gate**: run it against a local build before flipping the marketing site live.
+
 ## Documentation Structure
 
 - **Home:** Product-level overview and core concepts
 - **Theory:** ADLC principles, lifecycle phases, failure modes
 - **Lifecycle:** Gate-by-gate walkthrough with role guidance
 - **Toolkit:** Tool reference pages with lifecycle positioning
-- **Integrations:** Claude Code, Codex, Cursor, OpenCode, and Pi
+- **Integrations:** Claude Code, Codex, Cursor, OpenCode, Pi, and Antigravity
 - **Reference:** conventions, exit codes, the `.adlc/` runtime, and ADRs
 
 ## Deployment Notes
