@@ -66,12 +66,12 @@ test('index.mdx is a real landing page (no "coming soon" stub) enumerating all s
   }
 });
 
-test('index.mdx discloses that the stub harness pages (codex, cursor, opencode, pi) are still being written', () => {
+test('index.mdx discloses that the stub harness pages (codex, opencode, pi) are still being written', () => {
   const p = path.join(integrationsDir, 'index.mdx');
   const content = readFileSync(p, 'utf8');
 
-  const STUB_HARNESSES = ['codex', 'cursor', 'opencode', 'pi'];
-  const WRITTEN_HARNESSES = ['claude-code', 'antigravity'];
+  const STUB_HARNESSES = ['codex', 'opencode', 'pi'];
+  const WRITTEN_HARNESSES = ['claude-code', 'antigravity', 'cursor'];
 
   for (const harness of STUB_HARNESSES) {
     const bulletMatch = content.match(
