@@ -164,6 +164,30 @@ export function shouldContinue(state: {
   maxDry?: number;
 }): { continue: boolean; dryStreak: number };
 
+export type RecordableFinding = {
+  readonly file: string;
+  readonly desc: string;
+  readonly category?: string;
+  readonly severity?: string;
+  readonly line?: number;
+  readonly verdict?: string;
+};
+export type LedgerFinding = {
+  ts: string;
+  tool: string;
+  file: string;
+  line: number;
+  category: string;
+  severity: string;
+  desc: string;
+  verdict: string;
+};
+export function recordFinding(finding: RecordableFinding, dir?: string): LedgerFinding;
+
+export function matchFenceOpen(line: string): { char: string; len: number } | null;
+export function isFenceClose(line: string, char: string, len: number): boolean;
+export function computeFencedLines(content: string, opts?: { unclosedToEof?: boolean }): Set<number>;
+
 export function ensureGitignore(root: string): { path: string; added: string[]; changed: boolean };
 export function ensureFormatterIgnores(root: string): {
   biome: { path: string | null; detected: boolean; changed: boolean; skipped?: string };
