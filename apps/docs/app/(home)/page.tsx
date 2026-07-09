@@ -2,12 +2,13 @@ import Link from 'next/link';
 import type { Metadata } from 'next';
 import { FAILURE_MODES } from '@/lib/failure-modes.mjs';
 import { INTEGRATIONS } from '@/lib/integration-facts.mjs';
-import { SERIES_BASE } from '@/lib/theory-links.mjs';
+import { SERIES_BASE, theoryLink } from '@/lib/theory-links.mjs';
 import { ALL_PACKAGES } from '@/lib/toolkit-packages.mjs';
 import { SITE_URL } from '@/lib/routes.mjs';
 import { MarketingSection } from '@/components/marketing/section';
 import { TerminalCard } from '@/components/marketing/terminal-card';
 import { Backdrop } from '@/components/marketing/backdrop';
+import { Barbell } from '@/components/marketing/barbell';
 import { GateSequence } from '@/components/marketing/gate-sequence';
 import { LifecyclePipeline } from '@/components/marketing/lifecycle-pipeline';
 
@@ -162,7 +163,40 @@ export default function HomePage() {
         </div>
       </MarketingSection>
 
-      {/* 6 — Enterprise band */}
+      {/* 6 — Economics: the barbell */}
+      <MarketingSection kicker="Economics" title="Spend heavy at the ends, light in the middle.">
+        <div className="grid gap-10 lg:grid-cols-2 lg:items-center">
+          <Barbell />
+          <div className="flex flex-col gap-6">
+            <blockquote
+              className="border-l-2 pl-5 text-xl font-medium leading-snug"
+              style={{ borderColor: '#ef7c2a', color: '#cbcdd2' }}
+            >
+              The unit of account is cost per merged, verified change — never
+              tokens per developer per month.
+            </blockquote>
+            <p className="leading-relaxed" style={{ color: 'var(--mk-muted)' }}>
+              Inverted from the SDLC, because misbuilding is expensive and
+              building is cheap. What that buys the executive: throughput
+              without a review bottleneck, review depth no human team sustains,
+              a lifecycle that gets cheaper every run as lessons distill into
+              lints and skills, senior time redeployed to the two human gates,
+              and auditability — an evidence manifest attached to every merge.
+            </p>
+            <p className="text-sm">
+              <a href={theoryLink('distill')} style={{ color: '#4fb4d8' }}>
+                The lifecycle gets cheaper ↗
+              </a>
+              <span className="px-2" style={{ color: 'var(--mk-muted)' }}>·</span>
+              <Link href="/vs-sdlc" style={{ color: '#4fb4d8' }}>
+                ADLC vs the enterprise SDLC →
+              </Link>
+            </p>
+          </div>
+        </div>
+      </MarketingSection>
+
+      {/* 7 — Enterprise band */}
       <div className="border-y" style={{ borderColor: '#3f4044', background: '#26272c' }}>
         <MarketingSection kicker="Enterprise" title="Rolling out agentic development across an org?">
           <p className="max-w-2xl text-lg leading-relaxed" style={{ color: 'var(--mk-muted)' }}>
@@ -179,7 +213,7 @@ export default function HomePage() {
         </MarketingSection>
       </div>
 
-      {/* 7 — Theory footer band */}
+      {/* 8 — Theory footer band */}
       <div className="border-t" style={{ borderColor: '#3f4044' }}>
         <div className="mx-auto max-w-5xl px-6 py-12">
           <p className="text-sm" style={{ color: 'var(--mk-muted)' }}>
