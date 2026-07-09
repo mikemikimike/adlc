@@ -18,5 +18,8 @@
   "dependencies": {
     "@adlc/core": "^1.1.0",
     "@adlc/rails-guard": "^1.1.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.3"
   }
 }
