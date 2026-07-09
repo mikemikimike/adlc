@@ -165,34 +165,97 @@ export function checkShellCommand(command, ticket, root) {
     return { decision: 'allow', mutating: false, reason: 'pure branch creation cannot touch a rail' };
   }
   const c = classifyShellCommand(command);
+  // Every verdict carries `mutating` so advisory consumers (user_bash) can key
+  // on the mutation CLASS instead of parsing reason strings (P5 finding F2).
   if (c.readOnly) {
     if (c.writeOption) {
-      return { decision: 'deny', reason: 'read-only shell command uses an output option; use a structured edit tool or a literal path-transparent mutation' };
+      return { decision: 'deny', mutating: true, reason: 'read-only shell command uses an output option; use a structured edit tool or a literal path-transparent mutation' };
     }
     return { decision: 'allow', mutating: false, reason: 'shell command is positively read-only' };
   }
   if (!c.mutating) {
-    return { decision: 'deny', reason: 'shell command is neither positively read-only nor a path-transparent mutation — unverifiable while a ticket is active (the CI diff gate remains the backstop)' };
+    return { decision: 'deny', mutating: false, reason: 'shell command is neither positively read-only nor a path-transparent mutation — unverifiable while a ticket is active (the CI diff gate remains the backstop)' };
   }
   if (c.opaque) {
-    return { decision: 'deny', reason: 'mutating shell command uses an opaque form (git apply/checkout/patch/tar…); use a structured edit tool or a literal path-transparent mutation' };
+    return { decision: 'deny', mutating: true, reason: 'mutating shell command uses an opaque form (git apply/checkout/patch/tar…); use a structured edit tool or a literal path-transparent mutation' };
   }
   if (c.changesCwd) {
-    return { decision: 'deny', reason: 'mutating shell command changes cwd; target paths cannot be verified against the frozen rails' };
+    return { decision: 'deny', mutating: true, reason: 'mutating shell command changes cwd; target paths cannot be verified against the frozen rails' };
   }
   if (c.expands) {
-    return { decision: 'deny', reason: 'mutating shell command uses shell expansion ($VAR, $(…), backticks, globs); target paths cannot be verified against the frozen rails' };
+    return { decision: 'deny', mutating: true, reason: 'mutating shell command uses shell expansion ($VAR, $(…), backticks, globs); target paths cannot be verified against the frozen rails' };
   }
   if (c.paths.length === 0) {
-    return { decision: 'deny', reason: 'mutating shell command carries no literal target paths — failing closed while a ticket is active' };
+    return { decision: 'deny', mutating: true, reason: 'mutating shell command carries no literal target paths — failing closed while a ticket is active' };
   }
   for (const target of c.paths) {
     const hit = railHit(target, ticket, root);
     if (hit) {
-      return { decision: 'deny', reason: `shell mutation targets frozen rail "${hit}"` };
+      return { decision: 'deny', mutating: true, reason: `shell mutation targets frozen rail "${hit}"` };
     }
   }
   return { decision: 'allow', mutating: true, reason: 'shell mutation targets no frozen rail' };
+}
+
+// pi built-in tools that carry paths but never mutate them (they arrive as
+// their own typed events, not CustomToolCallEvent, but are listed for the
+// name-keyed check). Kept minimal: every entry is bypass surface.
+export const READONLY_TOOLS = ['read', 'grep', 'find', 'ls'];
+
+// Input keys that name a file target on third-party tools.
+const PATH_KEY = /^(?:path|file|file_?path|filepath|target)$/i;
+
+/**
+ * Extract path-like targets from a custom tool's input (spec 2.5): values of
+ * path-named keys (string or string[], including ONE level of object
+ * nesting — {opts:{path:…}} is a common tool-arg shape), plus any other
+ * top-level string that looks path-like AND resolves to an existing file
+ * inside the repo.
+ */
+export function extractToolPaths(input, root, depth = 0) {
+  const out = new Set();
+  for (const [key, value] of Object.entries(input ?? {})) {
+    if (depth === 0 && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      for (const nested of extractToolPaths(value, root, 1)) out.add(nested);
+      continue;
+    }
+    const candidates = typeof value === 'string' ? [value] : Array.isArray(value) ? value.filter((v) => typeof v === 'string') : [];
+    for (const candidate of candidates) {
+      if (candidate === '') continue;
+      if (PATH_KEY.test(key)) {
+        out.add(candidate);
+      } else if (/[/\\]|\.[A-Za-z0-9]+$/.test(candidate) && existsSync(join(root, candidate))) {
+        out.add(candidate);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Gate decision for a third-party (custom) tool call. Layered posture
+ * (spec 2.5): extractable targets are rail-checked (symlink-aware, via
+ * railHit); a no-target unknown tool is allowed but marked unvetted so the
+ * evidence rail records it. Custom tools are NOT snapshotted by the reactive
+ * gate — for anything this extraction cannot see (deeper nesting, spoofed
+ * read-only names), the CI rails-guard diff gate is the backstop.
+ */
+export function checkCustomTool(toolName, input, ticket, root) {
+  const name = String(toolName ?? '').toLowerCase();
+  if (READONLY_TOOLS.includes(name)) {
+    return { decision: 'allow', reason: 'known read-only tool' };
+  }
+  const paths = extractToolPaths(input, root);
+  for (const path of paths) {
+    const hit = railHit(path, ticket, root);
+    if (hit) {
+      return { decision: 'deny', reason: `custom tool "${toolName}" targets frozen rail "${hit}" via "${path}"` };
+    }
+  }
+  if (paths.length === 0) {
+    return { decision: 'allow', reason: 'no extractable file target', unvetted: true };
+  }
+  return { decision: 'allow', reason: 'targets hit no frozen rail' };
 }
 
 /** Suppressions allowed by the ticket: structured field + `allow-suppression:` body lines. */

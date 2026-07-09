@@ -13,6 +13,7 @@ import {
   resolveActiveTicket,
   checkStructuredWrite,
   checkShellCommand,
+  checkCustomTool,
   railHit,
   getAllowedSuppressions,
 } from './rails-checker.mjs';
@@ -23,10 +24,15 @@ import {
   touchedSince,
   diffAddedLines,
   scanAddedLines,
+  scanOperativeDelta,
+  mergeViolations,
   BASH_SCAN_FILE_CAP,
 } from './reactive-gate.mjs';
+import { recordGateEvent } from './evidence.mjs';
 import { parseAddedLines } from '@adlc/rails-guard/lib/suppressions.mjs';
 import { appendToSystemPrompt, buildTicketDoctrine, buildErrorDoctrine } from './doctrine.mjs';
+import { createFitnessTracker, checkBuildGate } from './build-gate.mjs';
+import { createFlailTracker } from './flail.mjs';
 
 // Bound the pending-snapshot map: a blocked call never gets a tool_result, so
 // stale entries are evicted oldest-first well past any realistic concurrency.
@@ -38,6 +44,31 @@ export function createExtension({ env = process.env } = {}) {
     let active = { ticketId: null, ticket: null, error: null };
     let ticketStamp = null;
     const snapshots = new Map();
+    const fitness = createFitnessTracker();
+    const flail = createFlailTracker();
+    const unvettedSeen = new Set();
+
+    // ctx.getContextUsage() is TUI/SDK-provided; degrade to null when absent
+    // (a missing signal must not crash the gate — compaction still covers it).
+    function safeUsage(ctx) {
+      try { return typeof ctx?.getContextUsage === 'function' ? ctx.getContextUsage() : null; }
+      catch { return null; }
+    }
+
+    function steerFlailAdvisories(filePath, ctx) {
+      for (const churn of flail.recordMutation(filePath)) {
+        const text = `ADLC flail advisory: ${churn.path} has been edited ${churn.count} times this session. Stop, re-read the failing evidence, and reconsider the approach before editing it again.`;
+        ctx.ui.notify(text, 'warning');
+        try {
+          pi.sendMessage(
+            { customType: 'adlc-flail-advisory', content: text, display: true },
+            { deliverAs: 'steer' }
+          );
+        } catch {
+          // Advisory only — a sendMessage failure must never affect the call.
+        }
+      }
+    }
 
     function stampTicketFiles(cwd) {
       const mtime = (p) => {
@@ -79,6 +110,9 @@ export function createExtension({ env = process.env } = {}) {
 
     pi.on('session_start', async (_event, ctx) => {
       reload(ctx.cwd);
+      fitness.reset();
+      flail.reset();
+      unvettedSeen.clear();
       if (!active.ticketId) return;
       if (active.error) {
         ctx.ui.setStatus('adlc-ticket', `🎟️ Ticket: \x1b[31m${active.ticketId} (ERROR)\x1b[0m`);
@@ -91,6 +125,12 @@ export function createExtension({ env = process.env } = {}) {
 
     pi.on('turn_start', async (_event, ctx) => {
       maybeReload(ctx?.cwd);
+    });
+
+    // A threshold/overflow compaction marks the session context-degraded for
+    // the build gate; a manual /compact does not.
+    pi.on('session_compact', async (event, _ctx) => {
+      fitness.markCompaction(event.reason);
     });
 
     // Append (never replace) the ADLC doctrine to the turn's system prompt.
@@ -131,8 +171,25 @@ export function createExtension({ env = process.env } = {}) {
         const verdict = checkStructuredWrite(filePath, active.ticket, activeCwd);
         if (verdict.decision === 'deny') {
           ctx.ui.notify(`Blocked ${event.toolName}: ${verdict.reason}`, 'error');
+          recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'rail-deny', detail: { tool: event.toolName, path: filePath, reason: verdict.reason } });
           return { block: true, reason: `Blocked ${event.toolName}: ${verdict.reason} (ticket ${active.ticketId})` };
         }
+        // Build-gate backstop (spec 2.1): a high-risk ticket in a degraded
+        // context may not take structured mutations without an audited override.
+        const gate = checkBuildGate({
+          ticket: active.ticket,
+          usage: safeUsage(ctx),
+          compacted: fitness.isCompacted(),
+          env,
+          root: activeCwd,
+        });
+        if (gate.decision === 'deny') {
+          ctx.ui.notify(`Build gate: ${gate.reason}`, 'error');
+          recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'build-gate-deny', detail: { tool: event.toolName, path: filePath, reason: gate.reason } });
+          return { block: true, reason: `Blocked ${event.toolName} by the ADLC build gate: ${gate.reason} (ticket ${active.ticketId})` };
+        }
+        // Flail advisory (spec 2.2): never blocks.
+        steerFlailAdvisories(filePath, ctx);
         // Snapshot the target so a post-write violation restores exactly this
         // state — never HEAD, never any other file.
         rememberSnapshot(event.toolCallId, { kind: 'file', snap: snapshotFile(activeCwd, filePath) });
@@ -147,6 +204,7 @@ export function createExtension({ env = process.env } = {}) {
         const verdict = checkShellCommand(command, active.ticket, activeCwd);
         if (verdict.decision === 'deny') {
           ctx.ui.notify(`Blocked shell command: ${verdict.reason}`, 'error');
+          recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'shell-deny', detail: { reason: verdict.reason } });
           return { block: true, reason: `Blocked command: ${verdict.reason} (ticket ${active.ticketId})` };
         }
         if (verdict.mutating) {
@@ -164,6 +222,37 @@ export function createExtension({ env = process.env } = {}) {
         return undefined;
       }
 
+      // Third-party (custom) tool coverage (spec 2.5): rail-check extractable
+      // targets; record no-target unknown tools as unvetted.
+      const custom = checkCustomTool(event.toolName, event.input, active.ticket, activeCwd);
+      if (custom.decision === 'deny') {
+        ctx.ui.notify(`Blocked ${event.toolName}: ${custom.reason}`, 'error');
+        recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'custom-tool-deny', detail: { tool: event.toolName, reason: custom.reason } });
+        return { block: true, reason: `Blocked ${event.toolName}: ${custom.reason} (ticket ${active.ticketId})` };
+      }
+      if (custom.unvetted && !unvettedSeen.has(event.toolName)) {
+        // Once per tool name per session — evidence, not noise.
+        unvettedSeen.add(event.toolName);
+        recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'unvetted-tool', detail: { tool: event.toolName } });
+      }
+      return undefined;
+    });
+
+    // user_bash advisory (spec 2.3): `!` commands are human-typed and bypass
+    // tool gates by design. A command that would mutate a frozen rail is
+    // warned about and recorded — never blocked.
+    pi.on('user_bash', async (event, ctx) => {
+      if (!active.ticket) return undefined;
+      const verdict = checkShellCommand(event.command, active.ticket, activeCwd);
+      // Advise on any MUTATING deny (rail hit, opaque git checkout/apply,
+      // expansion, output-option smuggle…) — keying on the mutation class,
+      // not the reason string, so `git checkout -- <rail>` is audited too
+      // (P5 finding F2). Non-mutating unverifiable commands (npm run build)
+      // stay silent: warning a human about every build command is noise.
+      if (verdict.decision === 'deny' && verdict.mutating) {
+        ctx.ui.notify(`ADLC: the agent would be denied this command under ticket ${active.ticketId} (${verdict.reason}) — running anyway (human override), recorded to evidence`, 'warning');
+        recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'user-bash-rail-override', detail: { command: event.command, reason: verdict.reason } });
+      }
       return undefined;
     });
 
@@ -176,17 +265,20 @@ export function createExtension({ env = process.env } = {}) {
       const path = snap.path;
       const current = snapshotFile(activeCwd, path);
       const newContent = current.existed ? current.content ?? '' : '';
-      const added = diffAddedLines(snap.existed ? snap.content ?? '' : '', newContent, path);
-      const violations = scanAddedLines(
-        added,
-        new Map([[path, newContent]]),
-        getAllowedSuppressions(active.ticket),
-        active.ticket.body
+      const oldContent = snap.existed ? snap.content ?? '' : '';
+      const added = diffAddedLines(oldContent, newContent, path);
+      const allowed = getAllowedSuppressions(active.ticket);
+      const violations = mergeViolations(
+        scanAddedLines(added, new Map([[path, newContent]]), allowed, active.ticket.body),
+        // Position-aware delta: catches a pre-existing marker line relocated
+        // from an inert to an operative position (multiset-invisible).
+        scanOperativeDelta(oldContent, newContent, path, allowed, active.ticket.body)
       );
       if (violations.length === 0) return undefined;
 
       const restored = restoreSnapshot(activeCwd, snap);
       ctx.ui.notify(`Blocked unallowed suppression marker: ${violations[0].marker}`, 'error');
+      recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'suppression-revert', detail: { path, markers: violations.map((v) => v.marker), restored } });
       return {
         isError: true,
         content: [
@@ -236,6 +328,7 @@ export function createExtension({ env = process.env } = {}) {
 
       if (railViolations.length > 0) {
         ctx.ui.notify(`Blocked modifications to frozen rails: ${railViolations.join(', ')}`, 'error');
+        recordGateEvent({ pi, ctx, root: activeCwd, ticketId: active.ticketId, type: 'bash-rail-revert', detail: { paths: railViolations, unrestorable, degraded: entry.degraded === true } });
         return {
           isError: true,
           content: [
