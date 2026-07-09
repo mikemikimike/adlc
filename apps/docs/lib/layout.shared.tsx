@@ -17,5 +17,8 @@ export function baseOptions(): BaseLayoutProps {
       { text: 'Docs', url: '/docs' },
     ],
     githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
+    // The site is dark-only (dark class forced on <html>, RootProvider theme
+    // disabled) — hide the sun/moon toggle so a dead control never ships.
+    themeSwitch: { enabled: false },
   };
 }

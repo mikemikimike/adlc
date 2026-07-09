@@ -6,9 +6,9 @@ export function PhaseDiagram({ phase }: { phase: string }) {
   return (
     <figure className="my-4">
       <Mermaid chart={buildPhaseMermaid(phase)} />
-      <figcaption className="text-sm" style={{ color: '#686b78' }}>
-        ADLC lifecycle —{' '}
-        <a href={theoryLink(phase)}>read the theory for {phase}</a>
+      <figcaption className="text-sm" style={{ color: 'var(--color-fd-muted-foreground)' }}>
+        The ADLC lifecycle — highlighted: {phase}.{' '}
+        <a href={theoryLink(phase)}>Read the theory for {phase}</a>
       </figcaption>
     </figure>
   );

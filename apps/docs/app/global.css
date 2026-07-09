@@ -17,7 +17,8 @@ html > body[data-scroll-locked] {
   --color-fd-background: #1c1d21;
   --color-fd-foreground: #cbcdd2;
   --color-fd-muted: #2f3137;
-  --color-fd-muted-foreground: #686b78;
+  /* 4.6:1 on #1c1d21 — keeps 14px captions above the WCAG AA 4.5:1 floor */
+  --color-fd-muted-foreground: #8b8f9c;
   --color-fd-popover: #1c1d21;
   --color-fd-popover-foreground: #cbcdd2;
   --color-fd-card: #26272c;
