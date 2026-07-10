@@ -36,13 +36,18 @@ import { createFlailTracker } from './flail.mjs';
 import { registerCommands } from './commands.mjs';
 import { renderWidgetLines } from './widget.mjs';
 import { createRenderers } from './renderers.mjs';
+import { registerProsecuteTool } from './prosecute-tool.mjs';
+import { registerGateTool } from './gate-tool.mjs';
+import { makeCompletionListener } from './completion.mjs';
+import { makeCompactionListener, readSessionEntries } from './compaction.mjs';
+import { makeShutdownListener } from './shutdown.mjs';
 
 // Bound the pending-snapshot map: a blocked call never gets a tool_result, so
 // stale entries are evicted oldest-first well past any realistic concurrency.
 const SNAPSHOT_MAP_CAP = 100;
 
 export function createExtension({ env = process.env } = {}) {
-  return function adlcPiExtension(pi) {
+  return async function adlcPiExtension(pi) {
     let activeCwd = process.cwd();
     let active = { ticketId: null, ticket: null, error: null };
     let ticketStamp = null;
@@ -188,6 +193,36 @@ export function createExtension({ env = process.env } = {}) {
       // Renderer registration is cosmetic — never fail extension load.
     }
 
+    // Completion-protocol listener (spec 4.2): watches message_end for the
+    // TICKET-DONE / TICKET-BLOCKED tokens the doctrine already demands.
+    const completion = makeCompletionListener({
+      pi,
+      getActive: () => active,
+      note: noteGate,
+    });
+
+    // Post-compaction ADLC-state re-assertion (spec 4.4): after any compaction,
+    // re-assert unresolved enforcement state (recent denies/reverts, degraded
+    // flag, active ticket) as a nextTurn digest so context-rot cannot silently
+    // drop enforcement history.
+    const compaction = makeCompactionListener({
+      pi,
+      getActive: () => active,
+      getEntries: readSessionEntries,
+      isDegraded: () => fitness.isCompacted(),
+    });
+
+    // Session-shutdown open-ticket capture (spec 4.5): on teardown, if a ticket
+    // is active and the session ended carrying unresolved denies/reverts, append
+    // one durable 'session-shutdown-open-ticket' manifest entry. Never blocks
+    // shutdown; the session-side write is best-effort as the file may be closing.
+    const shutdown = makeShutdownListener({
+      pi,
+      getActive: () => active,
+      getCwd: () => activeCwd,
+      getEntries: readSessionEntries,
+    });
+
     // =====================================================================
     // Lifecycle
     // =====================================================================
@@ -211,18 +246,30 @@ export function createExtension({ env = process.env } = {}) {
 
     pi.on('turn_start', async (_event, ctx) => {
       maybeReload(ctx?.cwd);
+      // A new turn re-arms the once-per-turn completion listener (spec 4.2).
+      completion.resetTurn();
       // Picks up a mid-session ticket switch AND clears the widget with
       // undefined once a ticket deactivates (AC2).
       refreshWidget(ctx);
     });
 
+    // Completion-protocol interception: TICKET-DONE nudges prosecution,
+    // TICKET-BLOCKED records the reason. Never rewrites the message.
+    pi.on('message_end', completion.onMessageEnd);
+
     // A threshold/overflow compaction marks the session context-degraded for
-    // the build gate; a manual /compact does not.
+    // the build gate; a manual /compact does not. Regardless of reason, re-assert
+    // unresolved ADLC enforcement state (spec 4.4) — state loss is state loss.
     pi.on('session_compact', async (event, ctx) => {
       fitness.markCompaction(event.reason);
       // Surface the degraded flag in the widget immediately.
       refreshWidget(ctx);
+      await compaction(event, ctx);
     });
+
+    // Extension teardown (quit/reload/replacement): capture an open ticket with
+    // unresolved enforcement state before the runtime goes away (spec 4.5).
+    pi.on('session_shutdown', shutdown);
 
     // Append (never replace) the ADLC doctrine to the turn's system prompt.
     pi.on('before_agent_start', async (event, _ctx) => {
@@ -553,6 +600,38 @@ export function createExtension({ env = process.env } = {}) {
       reload,
       getActive: () => active,
       getCwd: () => activeCwd,
+    });
+
+    // Native deterministic P5 prosecutor tool (spec 4.1). Registered LAST and
+    // AWAITED so the tool exists before pi starts the agent loop (pi awaits the
+    // extension factory — a fire-and-forget registration races an instant first
+    // turn and loses). Loading TypeBox (a pi-runtime-only peer) throws under a
+    // plain `node --test`, so the failure is swallowed: there the tool simply
+    // never registers and the /adlc-prosecute command + CI remain the backstop.
+    // All pi.on/registerCommand wiring above ran synchronously already, so unit
+    // tests that read pi.handlers without awaiting this factory still see them.
+    const noteFromTool = (evt) => noteGate({ ctx: null, type: evt.type, detail: evt.detail });
+    await registerProsecuteTool(pi, {
+      pi,
+      getActive: () => active,
+      getCwd: () => activeCwd,
+      env,
+      note: noteFromTool,
+    }).catch(() => {
+      // Best-effort at load — see above.
+    });
+
+    // Native adlc_gate tool (spec 4.3): the model runs deterministic gates
+    // through the rails-aware argv policy instead of shelling `adlc <gate>`.
+    // Awaited (TypeBox load) and swallowed under a plain `node --test`, exactly
+    // like adlc_prosecute above.
+    await registerGateTool(pi, {
+      pi,
+      getActive: () => active,
+      getCwd: () => activeCwd,
+      note: noteFromTool,
+    }).catch(() => {
+      // Best-effort at load — see above.
     });
 
     // Exposed for tests only (not part of the pi extension contract).
