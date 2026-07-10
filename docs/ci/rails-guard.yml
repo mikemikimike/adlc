@@ -14,6 +14,26 @@
 # trust roots even if no ticket rails exist yet. Configure it as a required check
 # only after acknowledging the SECURITY LIMITATION below.
 #
+# RAILS COMPLETION LIFECYCLE (T36): a ticket's rails freeze sibling paths only
+# while the ticket is IN FLIGHT. When a ticket in the trusted base
+# .adlc/tickets.json is marked `completed: true`, its rails AUTO-EXPIRE — they
+# stop contributing to the frozen set. The trust anchor is the ticket contract,
+# NOT the manifest (this gate cannot verify manifest signatures, so a manifest
+# tag would be forgeable): setting `completed` on an existing ticket is a change
+# to that ticket's contract, which this gate already DENIES for ordinary PRs
+# (see the ticket-contract-preservation check below) — only the protected-base
+# admin ceremony can mark completion, and the union reads it from the BASE ref,
+# never the PR HEAD. It fails closed: only a strict boolean `true` lifts, and a
+# path frozen by ANY still-in-flight ticket stays frozen. This replaces the
+# previously-routine manual rail lift (an ADLC_RAILS_BYPASS=1 byte-splice of
+# rails to [] after a ticket shipped) with a single admin-set `completed` flag
+# that preserves the rails as history; the manual byte-splice is no longer needed.
+# NOTE: `completed: true` expires ALL of that ticket's rails. If a path must stay
+# protected AFTER the ticket completes, re-declare it on a still-in-flight ticket
+# (or a permanent-guardian ticket) before completing — do not complete a ticket
+# that is the sole freezer of a still-sensitive path. A completed ticket's
+# CONTRACT stays immutable (only its rails expire from enforcement).
+#
 # SECURITY LIMITATION: this template does not protect rails introduced for the
 # first time in the same PR. New rails are enforced only after they land on the
 # base branch. Do not treat this workflow as complete rail-freeze enforcement for
@@ -397,7 +417,9 @@ jobs:
             let d; try { d = JSON.parse(show.stdout); } catch (e) { fail("cannot parse base tickets: " + e.message); }
             const baseTickets = validateTickets(d, "base");
             const rails = [];
-            for (const t of baseTickets) for (const r of t.rails ?? []) rails.push(r);
+            // T36: a completed ticket's rails auto-expire (skip `completed === true`;
+            // admin-set + contract-protected — see scripts/rails-guard-ci.mjs).
+            for (const t of baseTickets) { if (t.completed === true) continue; for (const r of t.rails ?? []) rails.push(r); }
             if (ls.stdout.trim()) {
               if (!require("fs").existsSync(".adlc/tickets.json")) deny(".adlc/tickets.json exists at base but is absent at HEAD");
               const headTickets = JSON.parse(require("fs").readFileSync(".adlc/tickets.json", "utf8"));

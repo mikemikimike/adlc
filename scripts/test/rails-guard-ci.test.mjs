@@ -556,3 +556,170 @@ test('unresolvable base ref → exit 1 (fail closed, not fail open)', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- T36: rails completion lifecycle — a completed ticket's rails auto-expire ----
+// TRUST ANCHOR: `completed: true` on the ticket in the BASE tickets.json. It is
+// admin-ceremony-only because assertBaseTicketContractsPreserved DENIES a PR
+// that adds/changes a field on an existing base ticket, and it is read from
+// base (never HEAD). The manifest is NOT trusted (the gate can't verify it).
+
+const editT1Rail = (d) => writeFileSync(join(d, 'src', 'critical', 'auth.mjs'), 'changed\n');
+
+test('T36 AC1: completed:true on a base ticket → its rails auto-expire → exit 0', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: editT1Rail,
+  });
+  assert.equal(code, 0, 'a done ticket no longer freezes its rails');
+});
+
+test('T36 AC1: completed must be a STRICT boolean true — "true"/1/truthy do NOT lift → exit 2', () => {
+  for (const val of ['true', 1, 'yes', {}]) {
+    const code = runScenario({
+      baseTickets: JSON.stringify({ tickets: [{ id: 'T1', completed: val, rails: ['src/critical/**'] }] }),
+      seedFiles: ['src/critical/auth.mjs'],
+      mutate: editT1Rail,
+    });
+    assert.equal(code, 2, `completed:${JSON.stringify(val)} must not lift (fail closed)`);
+  }
+});
+
+test('T36 AC2: an IN-FLIGHT ticket (no completed field) still freezes its rails → exit 2', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: editT1Rail,
+  });
+  assert.equal(code, 2);
+});
+
+test('T36 AC3 forge resistance: a PR that ADDS completed:true to an existing base ticket is DENIED → exit 2', () => {
+  // base has T1 WITHOUT completed; the PR tries to mark it complete to unfreeze it.
+  // assertBaseTicketContractsPreserved denies any change to an existing base ticket.
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => {
+      writeFileSync(join(d, 'src', 'critical', 'auth.mjs'), 'changed\n');
+      writeFileSync(join(d, '.adlc', 'tickets.json'),
+        JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'] }] }));
+    },
+  });
+  assert.equal(code, 2, 'a non-admin cannot forge completion on an existing ticket');
+});
+
+test('T36 AC4 no self-unfreeze: even marking it complete AND removing its rail in the PR is DENIED → exit 2', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => {
+      writeFileSync(join(d, 'src', 'critical', 'auth.mjs'), 'changed\n');
+      writeFileSync(join(d, '.adlc', 'tickets.json'),
+        JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: [] }] }));
+    },
+  });
+  assert.equal(code, 2, 'contract preservation blocks the self-serve completion+unfreeze');
+});
+
+test('T36 AC4: a NEW ticket a PR authors with completed:true cannot unfreeze ANOTHER ticket’s rails → exit 2', () => {
+  // A PR may add new tickets. An attacker adds T99 completed:true — but that only
+  // skips T99's own (empty) rails; T1 (in-flight) still freezes src/critical.
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => {
+      writeFileSync(join(d, 'src', 'critical', 'auth.mjs'), 'changed\n');
+      writeFileSync(join(d, '.adlc', 'tickets.json'), JSON.stringify({ tickets: [
+        { id: 'T1', rails: ['src/critical/**'] },
+        { id: 'T99', completed: true, rails: ['src/critical/**'] }, // attacker's new "completed" ticket
+      ] }));
+    },
+  });
+  assert.equal(code, 2, 'a completed NEW ticket cannot lift a still-in-flight ticket’s rails');
+});
+
+test('T36 safety: a path frozen by BOTH a completed and an in-flight ticket STAYS frozen → exit 2', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [
+      { id: 'T1', completed: true, rails: ['src/critical/**'] },
+      { id: 'T2', rails: ['src/critical/**', 'src/other/**'] }, // in-flight — still freezes the shared path
+    ] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: editT1Rail,
+  });
+  assert.equal(code, 2, 'completing T1 must not unfreeze a path T2 still freezes');
+});
+
+test('T36 safety: completing T1 lifts ONLY T1-exclusive rails; T2 in-flight rails still enforce → exit 2 on T2 path', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [
+      { id: 'T1', completed: true, rails: ['src/a/**'] },
+      { id: 'T2', rails: ['src/b/**'] },
+    ] }),
+    seedFiles: ['src/a/x.mjs', 'src/b/y.mjs'],
+    mutate: (d) => writeFileSync(join(d, 'src', 'b', 'y.mjs'), 'changed\n'),
+  });
+  assert.equal(code, 2);
+});
+
+test('T36 safety: after completing T1, editing its now-expired rail AND a non-rail file → exit 0', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [
+      { id: 'T1', completed: true, rails: ['src/a/**'] },
+      { id: 'T2', rails: ['src/b/**'] },
+    ] }),
+    seedFiles: ['src/a/x.mjs', 'src/b/y.mjs'],
+    mutate: (d) => { writeFileSync(join(d, 'src', 'a', 'x.mjs'), 'changed\n'); writeFileSync(join(d, 'unrelated.mjs'), 'z\n'); },
+  });
+  assert.equal(code, 0, 'T1 expired rail is editable; nothing else frozen was touched');
+});
+
+// ---- T36 guardrails (codex round-1 review) ----
+
+test('T36 guardrail #1: a completed ticket is STILL contract-preserved — a PR editing it is DENIED → exit 2', () => {
+  // Completing a ticket expires its RAILS only; its contract stays immutable, so
+  // a PR cannot mutate/delete a completed base ticket.
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => writeFileSync(join(d, '.adlc', 'tickets.json'),
+      JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'], injected: 'x' }] })),
+  });
+  assert.equal(code, 2, 'a completed ticket contract is still frozen');
+});
+
+test('T36 guardrail #1: a PR that REMOVES a completed base ticket is DENIED → exit 2', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [
+      { id: 'T1', completed: true, rails: ['src/critical/**'] },
+      { id: 'T2', rails: ['src/other/**'] },
+    ] }),
+    seedFiles: ['src/critical/auth.mjs', 'src/other/x.mjs'],
+    mutate: (d) => writeFileSync(join(d, '.adlc', 'tickets.json'),
+      JSON.stringify({ tickets: [{ id: 'T2', rails: ['src/other/**'] }] })), // T1 dropped
+  });
+  assert.equal(code, 2, 'a completed base ticket cannot be removed');
+});
+
+test('T36 guardrail #5: an ALL-COMPLETED repo (rails empty) still protects trust roots via baseHasConfig → exit 2', () => {
+  // Every ticket completed → rails union is empty. Trust-root protection must
+  // still run (it keys on baseHasConfig, independent of the rail union).
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs', '.adlc/config.json'],
+    seedFileContents: { '.adlc/config.json': JSON.stringify({ securityMode: 'unsigned-fallback', acknowledgedNewRailBypass: true, trustedCodeownersAttested: true }) },
+    mutate: (d) => writeFileSync(join(d, '.adlc', 'config.json'),
+      JSON.stringify({ securityMode: 'unsigned-fallback', acknowledgedNewRailBypass: true, trustedCodeownersAttested: true, tampered: true })),
+  });
+  assert.equal(code, 2, 'trust roots stay protected even when all rails have expired');
+});
+
+test('T36 guardrail #5: all-completed repo, editing a now-expired rail path → exit 0 (rails genuinely lifted)', () => {
+  const code = runScenario({
+    baseTickets: JSON.stringify({ tickets: [{ id: 'T1', completed: true, rails: ['src/critical/**'] }] }),
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => writeFileSync(join(d, 'src', 'critical', 'auth.mjs'), 'changed\n'),
+  });
+  assert.equal(code, 0);
+});

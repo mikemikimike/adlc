@@ -267,8 +267,25 @@ try {
 }
 const baseTickets = validateTicketsEnvelope(data, 'base');
 
+// T36 — rails completion lifecycle. A completed ticket's build-time rails
+// auto-expire (stop freezing sibling paths), so a merged ticket no longer needs
+// a manual admin rail lift.
+//
+// TRUST ANCHOR: a `completed: true` field on the ticket in the BASE
+// tickets.json. This is forge-resistant WITHOUT trusting the manifest — which
+// this gate CANNOT verify (it has no manifest signing key, and append-only does
+// not stop a two-PR append of a fake completion entry). Instead it reuses the
+// gate's OWN enforced trust: `assertBaseTicketContractsPreserved` (below) DENIES
+// any PR that adds or changes a field on an EXISTING base ticket, so a non-admin
+// cannot set `completed` on a still-frozen ticket — only the protected-base
+// admin ceremony can — and it is read from the BASE ref, never HEAD, so a
+// builder cannot self-unfreeze in their own PR. FAIL CLOSED: only a strict
+// boolean `=== true` lifts (not "true"/1/truthy); a new ticket a PR authors can
+// only skip ITS OWN rails, never another ticket's. A path frozen by any
+// still-in-flight ticket stays frozen (union of the rest).
 const rails = [];
 for (const t of baseTickets) {
+  if (t.completed === true) continue; // done → its rails auto-expire (T36); admin-set + contract-protected
   for (const r of t.rails ?? []) {
     rails.push(r);
   }
