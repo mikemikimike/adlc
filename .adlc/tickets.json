@@ -768,12 +768,7 @@
         "apps/docs/test/resend-sink.test.mjs",
         "apps/docs/test/sink-select.test.mjs"
       ],
-      "rails": [
-        "apps/docs/test/contact-schema.test.mjs",
-        "apps/docs/test/attio-sink.test.mjs",
-        "apps/docs/test/resend-sink.test.mjs",
-        "apps/docs/test/sink-select.test.mjs"
-      ],
+      "rails": [],
       "edges": [],
       "duration": 2,
       "category": "feature",
@@ -789,9 +784,7 @@
         "apps/docs/app/api/contact/route.ts",
         "apps/docs/test/contact-route.test.mjs"
       ],
-      "rails": [
-        "apps/docs/test/contact-route.test.mjs"
-      ],
+      "rails": [],
       "edges": [
         {
           "to": "T-CC1",
@@ -818,9 +811,7 @@
         "apps/docs/test/privacy-page.test.mjs",
         "apps/docs/test/env-example.test.mjs"
       ],
-      "rails": [
-        "apps/docs/test/enterprise-contact.test.mjs"
-      ],
+      "rails": [],
       "edges": [
         {
           "to": "T-CC2",
