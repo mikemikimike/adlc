@@ -54,7 +54,10 @@ jobs:
         # npm >= 11.5.1 is required to mint a registry token from the GitHub
         # id-token (the `id-token: write` permission above). Without this the
         # publish falls through to needing NODE_AUTH_TOKEN and fails ENEEDAUTH.
-        run: npm install -g npm@latest
+        # Pinned to the 11.x line (NOT @latest): npm 12 dropped Node 20 support
+        # (requires node ^22.22 || ^24.15 || >=26), so `npm@latest` fails
+        # EBADENGINE on this runner. 11.x has OIDC and supports Node 20.
+        run: npm install -g npm@11
 
       - name: Resolve version
         id: ver

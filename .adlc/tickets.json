@@ -619,17 +619,7 @@
         "package.json",
         "package-lock.json"
       ],
-      "rails": [
-        "plugins/adlc-opencode/**",
-        "plugins/adlc-codex/**",
-        "plugins/adlc-claude-code/**",
-        "plugins/adlc-cursor/**",
-        "plugins/adlc-antigravity/**",
-        "packages/**",
-        ".github/workflows/ci.yml",
-        ".github/workflows/publish.yml",
-        "docs/ci/**"
-      ],
+      "rails": [],
       "edges": [],
       "duration": 4,
       "category": "feature",
