@@ -1,6 +1,6 @@
 {
   "name": "@adlc/opencode-package",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "ADLC integration for the OpenCode terminal coding agent",
   "type": "module",
   "main": "index.mjs",
@@ -40,13 +40,20 @@
     }
   },
   "dependencies": {
-    "@adlc/build-gate": "^1.2.0",
-    "@adlc/core": "^1.2.0",
-    "@adlc/flail-detector": "^1.2.0"
+    "@adlc/build-gate": "^1.2.1",
+    "@adlc/core": "^1.2.1",
+    "@adlc/flail-detector": "^1.2.1"
   },
   "publishConfig": {
     "access": "public",
     "provenance": true
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voodootikigod/adlc.git",
+    "directory": "plugins/adlc-opencode"
+  },
+  "homepage": "https://github.com/voodootikigod/adlc/tree/main/plugins/adlc-opencode#readme",
+  "bugs": "https://github.com/voodootikigod/adlc/issues"
 }

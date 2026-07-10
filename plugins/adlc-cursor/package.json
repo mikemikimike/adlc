@@ -1,6 +1,6 @@
 {
   "name": "@adlc/cursor-package",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "ADLC native integration for the Cursor agent (rails-guard hooks + discovery rule)",
   "type": "module",
@@ -14,8 +14,8 @@
     "adlc-cursor-scaffold": "./lib/scaffold-cli.mjs"
   },
   "dependencies": {
-    "@adlc/build-gate": "^1.2.0",
-    "@adlc/core": "^1.2.0",
-    "@adlc/flail-detector": "^1.2.0"
+    "@adlc/build-gate": "^1.2.1",
+    "@adlc/core": "^1.2.1",
+    "@adlc/flail-detector": "^1.2.1"
   }
 }
