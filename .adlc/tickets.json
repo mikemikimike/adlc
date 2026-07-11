@@ -866,7 +866,8 @@
       "edges": [],
       "duration": 3,
       "category": "feature",
-      "budget": "frontier"
+      "budget": "frontier",
+      "completed": true
     }
   ]
 }
