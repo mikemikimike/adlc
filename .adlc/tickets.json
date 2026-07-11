@@ -756,6 +756,7 @@
     },
     {
       "id": "T-CC1",
+      "completed": true,
       "title": "Contact capture: Lead validator + pluggable sink core (Attio + Resend)",
       "body": "Implement the dependency-free lead validator and the pluggable ContactSink core per .adlc/specs/enterprise-contact-capture.md. parseLead(input) returns {ok,value,errors}; ContactSink.submit(lead) with AttioSink (Attio v2 PUT /objects/people/records?matching_attribute=email_addresses, assert-by-email, grounded shape per PM-A) and ResendSink (email notification, from CONTACT_FROM_EMAIL, fails loud per PM-E); selectSink(env) chooses by CONTACT_SINK and throws typed sink_unconfigured when the secret is absent. No zod (hand-rolled validator, .mjs). All external HTTP mocked. Verification: cd apps/docs && node --test test/contact-schema.test.mjs test/attio-sink.test.mjs test/resend-sink.test.mjs test/sink-select.test.mjs. Satisfies AC1-AC4. allow-suppression: none",
       "scope": [
@@ -776,6 +777,7 @@
     },
     {
       "id": "T-CC2",
+      "completed": true,
       "title": "Contact capture: POST /api/contact route (handleContact core + Vercel BotID wrapper)",
       "body": "Implement handleContact({req,deps}) with the ordered gates honeypot -> same-origin allowlist -> rate limit -> BotID -> sink, returning the shared envelope {ok:true}|{ok:false,error,fields?} per PM-G. Rate limiter keys on x-forwarded-for first hop and evicts expired windows (PM-B). BotID isBot=true -> 403; checkBot throwing fails open through remaining gates (PM-C/AC13). No PII or secret in logs/response (PM-D/AC8). Thin app/api/contact/route.ts wires real checkBotId + selectSink. Verification: cd apps/docs && node --test test/contact-route.test.mjs. Satisfies AC5-AC8, AC13-AC15. allow-suppression: none",
       "scope": [
@@ -797,6 +799,7 @@
     },
     {
       "id": "T-CC3",
+      "completed": true,
       "title": "Contact capture: /enterprise form + /privacy page + BotID wiring + .env.example",
       "body": "Replace the mailto-only CTA on /enterprise with an on-brand contact form (client component) that POSTs to /api/contact, shows success/error states, and KEEPS the mailto link as a visible fallback (AC10). Wire Vercel BotID: withBotId() in next.config.mjs and initBotId({protect:[{path:/api/contact,method:POST}]}) in instrumentation-client.ts. Ship /privacy (draft disclosing both processors Attio+Resend, purpose, retention, contact-to-delete; PM-F) linked from /enterprise and the home footer (AC9). Add .env.example documenting every var with no real values (AC11). Verification: cd apps/docs && npm run build && node --test test/enterprise-contact.test.mjs test/privacy-page.test.mjs test/env-example.test.mjs && npm run types:check. Satisfies AC9-AC12. allow-suppression: none",
       "scope": [
