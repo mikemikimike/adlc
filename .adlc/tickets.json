@@ -923,7 +923,8 @@
       "edges": [],
       "duration": 4,
       "category": "feature",
-      "budget": "frontier"
+      "budget": "frontier",
+      "completed": true
     }
   ]
 }
