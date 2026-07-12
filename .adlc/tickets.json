@@ -1002,7 +1002,8 @@
       "edges": [],
       "duration": 1,
       "category": "bugfix",
-      "budget": "direct"
+      "budget": "direct",
+      "completed": true
     }
   ]
 }
