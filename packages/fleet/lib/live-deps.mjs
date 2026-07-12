@@ -13,7 +13,7 @@ import { Sandbox } from './sandbox.mjs';
 import { repoCommandEnv, modelPlaneEnv } from './env-scrub.mjs';
 import { runGatePipeline } from './gate-pipeline.mjs';
 import { runGates, checkFlail } from './gates.mjs';
-import * as adapter from './adapters/claude-code.mjs';
+import { getAdapter } from './adapters/index.mjs';
 import { prosecute as prosecuteGate } from './prosecute.mjs';
 import { makeReviewRunner } from './review-runner.mjs';
 import { builderPrompt, fixPrompt } from './charters.mjs';
@@ -79,6 +79,8 @@ function parseStatusPaths(out) {
  */
 export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunner, io = defaultIo() }) {
   const repoGit = io.git(repo);
+  // Resolve the configured worker harness (T44). Fails closed on an unknown name.
+  const adapter = getAdapter(config.adapter ?? 'claude-code');
   const review = reviewRunner ?? makeReviewRunner({
     reviewBin: config.reviewBin ?? 'adversarial-review',
     provider: config.reviewProvider,
@@ -131,7 +133,9 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       return wt;
     },
 
-    provision: ({ worktree }) => adapter.provision({ worktree, config, writeJson: io.writeJson }),
+    // provision is OPTIONAL per the WorkerAdapter contract (§4): only claude-code
+    // writes a settings file; codex/agy/opencode/pi/cursor have none (adversarial-review A1).
+    provision: ({ worktree }) => adapter.provision?.({ worktree, config, writeJson: io.writeJson }),
 
     dispatch: async ({ ticket, worktree, strike, deadEnds = [] }) => {
       const prompt = strike > 1 ? fixPrompt(ticket, config.gate, deadEnds) : builderPrompt(ticket, config.gate);
@@ -142,6 +146,11 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       const res = await adapter.dispatch({
         worktree, prompt, timeoutMs: (config.timeoutMinutes ?? 30) * 60000, env,
         exec: (cmd, args, opts) => io.spawnWorker(cmd, args, opts),
+        // Operator-local binary override (A2) + non-executable data from config.
+        command: config.adapterCommand ?? undefined,
+        args: config.adapterArgs ?? undefined,
+        model: config.model ?? undefined,
+        useStdin: config.adapterStdin === true, // pi RPC/stdin prompt transport (A3)
       });
       // Commit the worker's changes (orchestrator commits; §6.3 pathspec excludes control dirs).
       if (res.exitCode === 0 && !res.timedOut && !/TICKET-BLOCKED/.test(res.output)) {

@@ -39,6 +39,18 @@ export function resolveRunConfig(config = {}, flags = {}) {
       'SECURITY: .adlc/config.json set fleet.disposableContainer; repo config cannot disable the sandbox (N1) — ignored.'
     );
   }
+  if (config.adapterCommand != null || config.adapterArgs != null) {
+    warnings.push(
+      'SECURITY: .adlc/config.json set fleet.adapterCommand/adapterArgs; the worker binary override is operator-local ' +
+        '(CLI flag) only and CANNOT be set from repo config (A2) — ignored.'
+    );
+  }
+  if (config.adapter != null) {
+    warnings.push(
+      'SECURITY: .adlc/config.json set fleet.adapter; the worker HARNESS is operator-local (--adapter) only — a repo ' +
+        'config must not silently switch the fleet onto a harness with weaker worker containment (K1) — ignored.'
+    );
+  }
   return {
     gate: config.gate ?? null,
     init: config.init ?? null,
@@ -50,6 +62,17 @@ export function resolveRunConfig(config = {}, flags = {}) {
     reviewBin: config.reviewBin ?? null,
     reviewProvider: config.reviewProvider ?? null,
     modelAuthKey: config.modelAuthKey ?? null,
+    // Worker harness selection (T44). OPERATOR-LOCAL only (adversarial-review K1):
+    // a repo-committed config must not silently switch the fleet onto a harness
+    // with weaker worker containment (only claude-code installs a per-worktree
+    // permission allowlist). Default 'claude-code' — fully contained. The worker
+    // BINARY override (adapterCommand/adapterArgs, A2) is likewise CLI-only.
+    // `model`/`adapterStdin` are non-executable data and stay repo-config-safe.
+    adapter: flags.adapter ?? 'claude-code',
+    model: config.model ?? null,
+    adapterStdin: config.adapterStdin === true,
+    adapterCommand: flags.adapterCommand ?? null,
+    adapterArgs: flags.adapterArgs ?? null,
     // operator-local ONLY:
     operatorOverride: flags.disposableContainer === true,
     repoConfigOverride: repoWantedOverride,
