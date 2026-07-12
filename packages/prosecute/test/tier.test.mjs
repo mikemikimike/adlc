@@ -9,6 +9,9 @@
 // Positive AND negative fixtures for every surface class; an ordinary diff is FALSE.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { classifyTrustRootTier } from '../lib/tier.mjs';
 
 const TICKETS = [
@@ -104,5 +107,105 @@ describe('classifyTrustRootTier — hygiene', () => {
     });
     assert.equal(r.isTrustRootTier, true);
     assert.equal(r.reasons.length, 3);
+  });
+});
+
+describe('classifyTrustRootTier — test-only exemption (#154/T41)', () => {
+  it('AC1: a diff touching ONLY test files in a producer/enforcement package is NOT trust-root tier', () => {
+    for (const f of [
+      'packages/ticket-prune/test/roundtrip.test.mjs',      // producer, under test/
+      'packages/ticket-sync/test/pull.test.mjs',            // producer, under test/
+      'packages/prosecute/test/run.test.mjs',               // enforcement, under test/
+      'packages/rails-guard/test/guard.test.mjs',           // enforcement, under test/
+      'packages/build-gate/lib/foo.test.mjs',               // enforcement, *.test.mjs basename (not under test/)
+    ]) {
+      const r = classifyTrustRootTier({ changedFiles: [f], tickets: TICKETS });
+      assert.equal(r.isTrustRootTier, false, `${f} (test-only) must NOT tier`);
+      assert.deepEqual(r.reasons, []);
+    }
+  });
+
+  it('AC2: the same test-only diff PLUS one non-test file in the package DOES tier', () => {
+    const r = classifyTrustRootTier({
+      changedFiles: ['packages/ticket-prune/test/roundtrip.test.mjs', 'packages/ticket-prune/lib/run.mjs'],
+      tickets: TICKETS,
+    });
+    assert.equal(r.isTrustRootTier, true);
+    assert.ok(r.reasons.some((x) => x.includes('packages/ticket-prune/')));
+  });
+
+  it('AC3: a trust-root EXACT file that is itself a TEST path still tiers (rails-guard-workflow-hashes.json)', () => {
+    const r = classifyTrustRootTier({ changedFiles: ['scripts/test/rails-guard-workflow-hashes.json'], tickets: TICKETS });
+    assert.equal(r.isTrustRootTier, true);
+    assert.ok(r.reasons.some((x) => x.includes('rails-guard-workflow-hashes.json')));
+  });
+
+  it('AC4: a TEST path matching a ticket rails deny-path still tiers (rails surface is not exempted)', () => {
+    // T7 rails = test/auth/**; a test file under it is a frozen rail.
+    const r = classifyTrustRootTier({ changedFiles: ['test/auth/login.test.mjs'], tickets: TICKETS });
+    assert.equal(r.isTrustRootTier, true);
+    assert.ok(r.reasons.some((x) => x.includes('rails deny-path of ticket T7')));
+  });
+
+  it('precision: a non-test path that merely CONTAINS "test" (test-utils/) is NOT exempted', () => {
+    const r = classifyTrustRootTier({ changedFiles: ['packages/prosecute/test-utils/helper.mjs'], tickets: TICKETS });
+    assert.equal(r.isTrustRootTier, true, 'test-utils is not a test dir; a real helper edit must still tier');
+  });
+
+  it('precision (boundary): a segment that merely ENDS with "test" (latest/, contest/) is NOT a test dir — the ^|/ left-anchor must hold', () => {
+    // "latest/" and "contest/" both CONTAIN the substring "test/"; a boundary-less
+    // /test\// would wrongly exempt them. The ^|/ anchor requires `test` at a
+    // segment start, so these shipped-code paths must still tier.
+    for (const f of ['packages/prosecute/latest/run.mjs', 'packages/build-gate/contest/x.mjs']) {
+      const r = classifyTrustRootTier({ changedFiles: [f], tickets: TICKETS });
+      assert.equal(r.isTrustRootTier, true, `${f}: ends-with-"test" is not a test dir; must tier`);
+    }
+  });
+
+  it('fail-safe: a non-canonical path with a ".." segment (e.g. test/../lib/...) is NOT exempted — it must tier', () => {
+    // A `/test/` segment that resolves back into production must not exempt the
+    // change. Out-of-contract input (the live caller feeds canonical git-diff
+    // paths), but the exemption fails safe by tiering it.
+    const r = classifyTrustRootTier({ changedFiles: ['packages/prosecute/test/../lib/run.mjs'], tickets: TICKETS });
+    assert.equal(r.isTrustRootTier, true, 'a ..-containing test path must not be exempted');
+  });
+});
+
+// The test-file exemption (#154/T41) is only SAFE if a test-classified path never
+// holds production code imported by a gate. Enforce that invariant so a future
+// convention violation can't silently open a tier bypass.
+describe('trust-root tier — test-exemption assumption is enforced (#154/T41)', () => {
+  const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+  const GATED_PACKAGES = ['rails-guard', 'prosecute', 'gate-manifest', 'build-gate', 'ticket-prune', 'ticket-sync'];
+
+  function walkMjs(dir) {
+    if (!existsSync(dir)) return [];
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...walkMjs(p));
+      else if (entry.name.endsWith('.mjs')) out.push(p);
+    }
+    return out;
+  }
+
+  it('no production lib/bin module in a producer/enforcement package imports a test-classified file', () => {
+    const importsTestPath =
+      /(?:import\s[^;\n]*from|require\s*\()\s*['"`][^'"`]*(?:\.test\.(?:mjs|js|cjs)|\/test\/)[^'"`]*['"`]/;
+    const offenders = [];
+    for (const pkg of GATED_PACKAGES) {
+      for (const sub of ['lib', 'bin']) {
+        for (const file of walkMjs(join(REPO_ROOT, 'packages', pkg, sub))) {
+          if (importsTestPath.test(readFileSync(file, 'utf8'))) {
+            offenders.push(file.slice(REPO_ROOT.length));
+          }
+        }
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      'a production module importing a test-classified file would silently open the T41 test-exemption bypass — route shared code through a non-test path',
+    );
   });
 });
