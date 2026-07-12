@@ -959,7 +959,8 @@
       "edges": [],
       "duration": 2,
       "category": "feature",
-      "budget": "direct"
+      "budget": "direct",
+      "completed": true
     },
     {
       "id": "A142",
