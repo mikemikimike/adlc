@@ -1,6 +1,6 @@
 {
   "name": "@adlc/codex",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Native ADLC plugin for Codex: skills, hooks, MCP tools, and project agent templates.",
   "type": "module",
   "license": "MIT",
@@ -12,7 +12,14 @@
   },
   "homepage": "https://github.com/voodootikigod/adlc/tree/main/plugins/adlc-codex#readme",
   "bugs": "https://github.com/voodootikigod/adlc/issues",
-  "keywords": ["adlc", "codex", "agentic", "hooks", "mcp", "skills"],
+  "keywords": [
+    "adlc",
+    "codex",
+    "agentic",
+    "hooks",
+    "mcp",
+    "skills"
+  ],
   "files": [
     ".codex-plugin/",
     ".mcp.json",
@@ -25,7 +32,7 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@adlc/cli": "1.3.0"
+    "@adlc/cli": "1.4.0"
   },
   "engines": {
     "node": ">=18"

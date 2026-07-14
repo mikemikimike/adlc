@@ -1,6 +1,6 @@
 {
   "name": "@adlc/init",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Idempotent ADLC repository bootstrap, including Codex project agents.",
   "type": "module",
   "license": "MIT",
@@ -12,7 +12,12 @@
   },
   "homepage": "https://github.com/voodootikigod/adlc#readme",
   "bugs": "https://github.com/voodootikigod/adlc/issues",
-  "keywords": ["adlc", "codex", "bootstrap", "agents"],
+  "keywords": [
+    "adlc",
+    "codex",
+    "bootstrap",
+    "agents"
+  ],
   "bin": {
     "adlc-init": "./bin/adlc-init.mjs"
   },
@@ -20,7 +25,13 @@
     ".": "./index.mjs",
     "./package.json": "./package.json"
   },
-  "files": ["bin/", "lib/", "index.mjs", "README.md", "LICENSE"],
+  "files": [
+    "bin/",
+    "lib/",
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
