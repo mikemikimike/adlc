@@ -34,5 +34,11 @@
   "publishConfig": {
     "access": "public",
     "provenance": true
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/voodootikigod/adlc.git",
+    "directory": "packages/tickets"
+  },
+  "homepage": "https://github.com/voodootikigod/adlc/tree/main/packages/tickets#readme"
 }

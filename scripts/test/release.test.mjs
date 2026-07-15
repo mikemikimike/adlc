@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets } from '../release.mjs';
+import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets, findPublishMetadataProblems } from '../release.mjs';
 
 /** Build a throwaway repo with package and Codex-manifest version surfaces. */
 function makeRepo() {
@@ -23,13 +23,17 @@ function makeRepo() {
   mkdirSync(packagesDir);
   mkdirSync(pluginsDir);
   const write = (p, obj) => writeFileSync(p, JSON.stringify(obj, null, 2) + '\n');
+  // Every non-private publish target must carry a repository.url or npm provenance
+  // 422s mid-publish (findPublishMetadataProblems guards this).
+  const repository = { type: 'git', url: 'git+https://github.com/voodootikigod/adlc.git' };
   write(join(root, 'package.json'), { name: 'adlc', version: '1.0.0', private: true });
   mkdirSync(join(packagesDir, 'core'));
-  write(join(packagesDir, 'core', 'package.json'), { name: '@adlc/core', version: '1.0.0' });
+  write(join(packagesDir, 'core', 'package.json'), { name: '@adlc/core', version: '1.0.0', repository });
   mkdirSync(join(packagesDir, 'cli'));
   write(join(packagesDir, 'cli', 'package.json'), {
     name: '@adlc/cli',
     version: '1.0.0',
+    repository,
     dependencies: { '@adlc/core': '1.0.0' }, // packages pin exactly
   });
   mkdirSync(join(pluginsDir, 'adlc-pi'));
@@ -45,6 +49,7 @@ function makeRepo() {
   write(join(pluginsDir, 'adlc-codex', 'package.json'), {
     name: '@adlc/codex',
     version: '1.0.0',
+    repository,
     dependencies: { '@adlc/cli': '1.0.0' },
   });
   write(join(pluginsDir, 'adlc-codex', '.codex-plugin', 'plugin.json'), {
@@ -174,15 +179,50 @@ test('releaseMain --publish invokes publishImpl for plugin packages too', () => 
     mkdirSync(join(pluginsDir, 'adlc-opencode'));
     writeFileSync(join(pluginsDir, 'adlc-opencode', 'package.json'), JSON.stringify({
       name: '@adlc/opencode', version: '1.0.0',
+      repository: { type: 'git', url: 'git+https://github.com/voodootikigod/adlc.git' },
     }, null, 2) + '\n');
     const published = [];
     const rc = releaseMain(['1.2.0', '--publish'], {
       root, packagesDir, pluginsDir,
       regenerateLockfile() {},
-      publishImpl: (dir, name) => published.push(name),
+      publishImpl: (_dir, name) => published.push(name),
     });
     assert.equal(rc, 0);
     assert.ok(published.includes('@adlc/opencode'), `published: ${published}`);
     assert.ok(published.includes('@adlc/core'));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('findPublishMetadataProblems flags a publish target with missing/empty repository.url', () => {
+  const { root, packagesDir, pluginsDir } = makeRepo();
+  try {
+    assert.deepEqual(findPublishMetadataProblems({ packagesDir, pluginsDir }), []);
+    // Empty repository.url — the exact @adlc/tickets condition that 422'd the
+    // v1.4.0 provenance publish mid-flight.
+    writeFileSync(join(packagesDir, 'core', 'package.json'), JSON.stringify({
+      name: '@adlc/core', version: '1.0.0', repository: { url: '' },
+    }, null, 2) + '\n');
+    const problems = findPublishMetadataProblems({ packagesDir, pluginsDir });
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /@adlc\/core/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('releaseMain --publish fails closed and publishes NOTHING when a target lacks repository.url', () => {
+  const { root, packagesDir, pluginsDir } = makeRepo();
+  try {
+    // Strip repository from a non-private target — a partial lockstep publish must
+    // not be possible; the whole suite ships or none of it does.
+    writeFileSync(join(packagesDir, 'core', 'package.json'), JSON.stringify({
+      name: '@adlc/core', version: '1.0.0',
+    }, null, 2) + '\n');
+    const published = [];
+    const rc = releaseMain(['1.2.0', '--publish'], {
+      root, packagesDir, pluginsDir,
+      regenerateLockfile() {},
+      publishImpl: (_dir, name) => published.push(name),
+    });
+    assert.equal(rc, 1);
+    assert.equal(published.length, 0, `nothing should publish; got: ${published}`);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

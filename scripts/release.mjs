@@ -146,6 +146,29 @@ export function findVersionDrift(version, { root = ROOT, packagesDir = PKGS, plu
   return problems;
 }
 
+// Repo slug every publishable package's provenance is built against. npm's
+// sigstore provenance check 422s if package.json repository.url does not resolve
+// to this, aborting the lockstep publish partway through.
+const PROVENANCE_REPO = 'github.com/voodootikigod/adlc';
+
+/**
+ * Every non-private publish target must carry a repository.url that references
+ * the source repo, or npm provenance validation rejects it mid-publish. Returns
+ * the list of offenders (empty = all good).
+ */
+export function findPublishMetadataProblems({ packagesDir = PKGS, pluginsDir = PLUGINS } = {}) {
+  const problems = [];
+  for (const target of publishTargets({ packagesDir, pluginsDir })) {
+    const pkg = readJson(join(target.dir, 'package.json'));
+    const repo = pkg.repository;
+    const url = repo && typeof repo === 'object' ? repo.url : (typeof repo === 'string' ? repo : undefined);
+    if (!url || !String(url).includes(PROVENANCE_REPO)) {
+      problems.push(`${target.name}: repository.url is ${JSON.stringify(url ?? null)} — provenance requires it to reference ${PROVENANCE_REPO}`);
+    }
+  }
+  return problems;
+}
+
 function defaultPublishImpl(dir) {
   execFileSync('npm', ['publish', '--provenance'], { cwd: dir, stdio: 'inherit' });
 }
@@ -215,6 +238,17 @@ export function releaseMain(
   const drift = findVersionDrift(version, { root, packagesDir, pluginsDir });
   if (drift.length > 0) {
     console.error(`version drift after bump — aborting:\n  ${drift.join('\n  ')}`);
+    return 1;
+  }
+
+  // 4. Fail closed on missing publish metadata. npm provenance validation 422s
+  // if a package's repository.url does not match the build's source repo, and it
+  // does so MID-publish (core-first) — stranding a partial release (v1.4.0 shipped
+  // 27 of 34 because @adlc/tickets had no repository field). Catch it at bump time,
+  // before any tag or publish, so the whole suite ships or none of it does.
+  const metadataProblems = findPublishMetadataProblems({ packagesDir, pluginsDir });
+  if (metadataProblems.length > 0) {
+    console.error(`publish metadata invalid — aborting (npm provenance would 422 mid-publish):\n  ${metadataProblems.join('\n  ')}`);
     return 1;
   }
 
