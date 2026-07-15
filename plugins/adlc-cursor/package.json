@@ -1,6 +1,6 @@
 {
   "name": "@adlc/cursor",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "ADLC native integration for the Cursor agent (rails-guard hooks + discovery rule)",
   "type": "module",
   "main": "hooks/adlc-rails-guard.mjs",
@@ -45,8 +45,8 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@adlc/build-gate": "^1.4.0",
-    "@adlc/core": "^1.4.0",
-    "@adlc/flail-detector": "^1.4.0"
+    "@adlc/build-gate": "^1.4.1",
+    "@adlc/core": "^1.4.1",
+    "@adlc/flail-detector": "^1.4.1"
   }
 }
