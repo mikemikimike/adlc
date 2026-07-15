@@ -31,13 +31,15 @@ export const INTEGRATIONS = [
   {
     slug: 'cursor',
     name: 'Cursor',
-    status: 'installer',
-    tagline: 'Hooks, rules, and commands scaffolded straight into .cursor/, no plugin runtime needed.',
+    status: 'source',
+    tagline: 'Native Cursor plugin: marketplace hooks, skills, rules, and /adlc-* commands with CI rail backstop.',
     install: [
+      'git clone https://github.com/voodootikigod/adlc.git && cd adlc',
       'npm install -g @adlc/cli',
-      'npx @adlc/cursor .',
+      'adlc init --harness cursor',
+      '# In Cursor: add this repo as a plugin marketplace, then install adlc-cursor',
     ],
-    note: '@adlc/cursor is published on npm. The scaffold is idempotent — re-run it (or `/adlc-init` inside Cursor) to refresh .adlc/config.json, .cursor/hooks.json, rules, and the /adlc-* command palette.',
+    note: 'Preferred path: add the repo .cursor-plugin marketplace, install the adlc-cursor plugin, then run adlc init --harness cursor for the .adlc/ runtime only. Legacy fallback: npx @adlc/cursor . Wire docs/ci/rails-guard.yml as the unbypassable control. Do not commit a generated .adlc/config.json into a repo that already freezes that path as a trust root.',
   },
   {
     slug: 'opencode',

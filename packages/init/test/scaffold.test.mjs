@@ -23,7 +23,9 @@ test('fresh scaffold creates ADLC config, ignores, and current Codex agent files
   fixture((root) => {
     const result = scaffold({ root });
     assert.equal(result.root, realpathSync(root));
-    assert.equal(JSON.parse(readFileSync(join(root, '.adlc/config.json'))).harnesses.codex.railEnforcement, 'auto');
+    const cfg = JSON.parse(readFileSync(join(root, '.adlc/config.json')));
+    assert.equal(cfg.securityMode, 'unsigned-fallback');
+    assert.equal(cfg.harnesses.codex.railEnforcement, 'auto');
     assert.match(readFileSync(join(root, '.gitignore'), 'utf8'), /!\.adlc\/specs\//);
     for (const name of Object.keys(CODEX_AGENT_TEMPLATES)) {
       const content = readFileSync(join(root, '.codex/agents', name), 'utf8');
@@ -92,5 +94,28 @@ test('scaffold repairs a whole-directory ADLC ignore so committed state can be r
     assert.match(ignore, /^\.adlc\/\*$/m);
     assert.match(ignore, /^!\.adlc\/config\.json$/m);
     assert.match(ignore, /^!\.adlc\/specs\/$/m);
+  });
+});
+
+test('scaffold --harness cursor writes cursor harness config and skips Codex agents', () => {
+  fixture((root) => {
+    const result = scaffold({ root, harness: 'cursor' });
+    const cfg = JSON.parse(readFileSync(join(root, '.adlc/config.json'), 'utf8'));
+    assert.equal(cfg.securityMode, 'unsigned-fallback');
+    assert.equal(cfg.harnesses.cursor.railEnforcement, 'auto');
+    assert.equal(cfg.harnesses.codex, undefined);
+    assert.equal(cfg.acknowledgedNewRailBypass, undefined);
+    assert.equal(existsSync(join(root, '.codex')), false);
+    assert.ok(result.created.includes('.adlc/config.json'));
+  });
+});
+
+test('CLI --harness cursor implies no Codex agents', () => {
+  fixture((root) => {
+    const result = JSON.parse(execFileSync(process.execPath, [BIN, '--root', root, '--harness', 'cursor', '--json'], { encoding: 'utf8' }));
+    assert.equal(result.ok, true);
+    assert.equal(existsSync(join(root, '.codex')), false);
+    const cfg = JSON.parse(readFileSync(join(root, '.adlc/config.json'), 'utf8'));
+    assert.equal(cfg.harnesses.cursor.railEnforcement, 'auto');
   });
 });

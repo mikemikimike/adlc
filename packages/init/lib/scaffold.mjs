@@ -11,10 +11,15 @@ import {
 import { dirname, join, relative, resolve } from 'node:path';
 import { ADLC_GITIGNORE_LINES } from './gitignore-defaults.mjs';
 
-const CONFIG = `${JSON.stringify({
-  version: 1,
-  harnesses: { codex: { railEnforcement: 'auto' } },
-}, null, 2)}\n`;
+function configForHarness(harness) {
+  const harnesses = harness === 'cursor'
+    ? { cursor: { railEnforcement: 'auto' } }
+    : { codex: { railEnforcement: 'auto' } };
+  // securityMode is required for config-integrity once a config is committed;
+  // acknowledgedNewRailBypass must NOT be self-set here — that is a protected-base
+  // ceremony field. Keep generated configs local until that ceremony runs.
+  return `${JSON.stringify({ version: 1, securityMode: 'unsigned-fallback', harnesses }, null, 2)}\n`;
+}
 
 const WHOLE_ADLC_IGNORES = new Set(['.adlc', '.adlc/', '/.adlc', '/.adlc/']);
 
@@ -133,9 +138,10 @@ function ensureGitignore(root, result) {
   record(result, existed ? 'updated' : 'created', relativePath);
 }
 
-export function scaffold({ root = '.', codexAgents = true } = {}) {
+export function scaffold({ root = '.', codexAgents = true, harness = null } = {}) {
   const target = canonicalTarget(root);
   const result = { root: target, created: [], updated: [], unchanged: [], warnings: [] };
+  if (harness === 'cursor') codexAgents = false;
 
   const destinations = ['.adlc/specs', '.adlc/config.json', '.gitignore'];
   if (codexAgents) {
@@ -146,7 +152,7 @@ export function scaffold({ root = '.', codexAgents = true } = {}) {
   rejectSymlinkComponents(target, '.adlc/specs');
   mkdirSync(join(target, '.adlc/specs'), { recursive: true });
   rejectSymlinkComponents(target, '.adlc/specs');
-  writeMissing(target, '.adlc/config.json', CONFIG, result);
+  writeMissing(target, '.adlc/config.json', configForHarness(harness), result);
   ensureGitignore(target, result);
 
   if (codexAgents) {

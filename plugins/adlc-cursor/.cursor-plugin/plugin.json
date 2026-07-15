@@ -1,0 +1,25 @@
+{
+  "name": "adlc-cursor",
+  "version": "1.4.1",
+  "description": "Agentic Development Lifecycle for Cursor — rails-guard hooks, phase skills, and /adlc-* commands backed by @adlc/cli.",
+  "author": {
+    "name": "Chris Williams",
+    "email": "chris@voodootikigod.com"
+  },
+  "homepage": "https://github.com/voodootikigod/adlc/blob/main/docs/integrations/cursor.md",
+  "repository": "https://github.com/voodootikigod/adlc",
+  "license": "MIT",
+  "keywords": [
+    "adlc",
+    "agentic",
+    "lifecycle",
+    "gates",
+    "cursor",
+    "rails"
+  ],
+  "logo": "assets/logo.svg",
+  "rules": "./rules/",
+  "commands": "./command/",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}

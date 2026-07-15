@@ -25,10 +25,9 @@ export const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..'
 const PRETOOL_REL = 'hooks/adlc-pretool.mjs';
 const AUDIT_REL = 'hooks/adlc-audit.mjs';
 const SHELL_ADVISORY_REL = 'hooks/adlc-shell-advisory.mjs';
-// DISABLED BY DEFAULT (T18): the `stop` / `beforeSubmitPrompt` events are NOT
-// pinned against Cursor documentation (ADR 0006), so these two scripts ship in
-// the package but are wired ONLY on explicit opt-in (`wireUnpinned` option /
-// ADLC_CURSOR_WIRE_UNPINNED=1). No invented event is wired as if real.
+// DEFAULT-ON (T47): `stop` / `beforeSubmitPrompt` are documented Cursor events.
+// Opt out with `wireUnpinned: false`, `--no-unpinned`, or
+// ADLC_CURSOR_WIRE_UNPINNED=0.
 const STOP_REL = 'hooks/adlc-stop.mjs';
 const PREFLIGHT_REL = 'hooks/adlc-preflight.mjs';
 // Catch-all (".*"): every tool reaches the dispatcher so the classifier — not an
@@ -56,14 +55,25 @@ function isAdlcHook(entry) {
  * any non-array (non-standard) value is replaced by our canonical entry. */
 const asHookList = (v) => (Array.isArray(v) ? v : []);
 
-/** Build the hook command strings, resolved against the installed plugin. */
-export function buildHookCommands(pluginRoot = PLUGIN_ROOT) {
+/** Build hook command strings for the legacy project-scaffold path.
+ * Prefer project-relative `./node_modules/@adlc/cursor/…` when that package is
+ * installed in the target repo (relocatable; survives npx-cache moves).
+ * Fall back to absolute paths under `pluginRoot` when it is not — otherwise
+ * `npx @adlc/cursor .` would write hooks that cannot resolve (T47 P5 finding).
+ * Marketplace installs use hooks/hooks.json with `./hooks/…` (plugin cwd). */
+const NM_PREFIX = 'node_modules/@adlc/cursor';
+const nmHook = (rel) => `node "./${NM_PREFIX}/${rel}"`;
+const absHook = (pluginRoot, rel) => `node "${join(pluginRoot, rel)}"`;
+
+export function buildHookCommands(pluginRoot = PLUGIN_ROOT, { projectRoot } = {}) {
+  const useNm = Boolean(projectRoot) && existsSync(join(projectRoot, NM_PREFIX));
+  const hook = (rel) => (useNm ? nmHook(rel) : absHook(pluginRoot, rel));
   return {
-    pretool: `node "${join(pluginRoot, PRETOOL_REL)}"`,
-    audit: `node "${join(pluginRoot, AUDIT_REL)}"`,
-    shellAdvisory: `node "${join(pluginRoot, SHELL_ADVISORY_REL)}"`,
-    stop: `node "${join(pluginRoot, STOP_REL)}"`,
-    preflight: `node "${join(pluginRoot, PREFLIGHT_REL)}"`,
+    pretool: hook(PRETOOL_REL),
+    audit: hook(AUDIT_REL),
+    shellAdvisory: hook(SHELL_ADVISORY_REL),
+    stop: hook(STOP_REL),
+    preflight: hook(PREFLIGHT_REL),
   };
 }
 
@@ -77,14 +87,12 @@ export function buildHookCommands(pluginRoot = PLUGIN_ROOT) {
  * (ADR 0006), so rails + buildgate share one entry with rails deciding first.
  * A pre-existing direct adlc-rails-guard.mjs entry is migrated (replaced).
  *
- * `wireUnpinned` (default false, env ADLC_CURSOR_WIRE_UNPINNED=1) additionally
- * wires the UNPINNED `stop` / `beforeSubmitPrompt` events to the disabled-by-
- * default stop-audit / preflight scripts. Without it, any previously wired
- * ADLC entry on those events is REMOVED, restoring the verified-events-only
- * default (preToolUse, afterFileEdit, beforeShellExecution).
+ * `wireUnpinned` (default true; env ADLC_CURSOR_WIRE_UNPINNED=0 disables)
+ * wires `stop` / `beforeSubmitPrompt` to the stop-audit / preflight scripts.
+ * When false, any previously wired ADLC entry on those events is REMOVED.
  */
-export function mergeHooks(existing, pluginRoot = PLUGIN_ROOT, { wireUnpinned = false } = {}) {
-  const cmds = buildHookCommands(pluginRoot);
+export function mergeHooks(existing, pluginRoot = PLUGIN_ROOT, { wireUnpinned = true, projectRoot } = {}) {
+  const cmds = buildHookCommands(pluginRoot, { projectRoot });
   const base = existing && typeof existing === 'object' ? existing : {};
   const hooks = { ...(base.hooks ?? {}) };
 
@@ -115,7 +123,9 @@ export function mergeHooks(existing, pluginRoot = PLUGIN_ROOT, { wireUnpinned = 
 /** Write `.cursor/hooks.json`, merging into any existing config. Returns the action taken. */
 export function ensureCursorHooks(projectRoot, {
   pluginRoot = PLUGIN_ROOT,
-  wireUnpinned = process.env.ADLC_CURSOR_WIRE_UNPINNED === '1',
+  wireUnpinned = process.env.ADLC_CURSOR_WIRE_UNPINNED === '0' ? false
+    : process.env.ADLC_CURSOR_WIRE_UNPINNED === '1' ? true
+    : true,
 } = {}) {
   const cursorDir = join(projectRoot, '.cursor');
   mkdirSync(cursorDir, { recursive: true });
@@ -139,7 +149,7 @@ export function ensureCursorHooks(projectRoot, {
       existing = undefined;
     }
   }
-  const merged = mergeHooks(existing, pluginRoot, { wireUnpinned });
+  const merged = mergeHooks(existing, pluginRoot, { wireUnpinned, projectRoot });
   writeFileSync(hooksPath, `${JSON.stringify(merged, null, 2)}\n`);
   return { path: hooksPath, created: !existing, backedUp };
 }
