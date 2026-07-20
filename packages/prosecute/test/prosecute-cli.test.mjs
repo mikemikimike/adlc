@@ -1,10 +1,10 @@
 // Concern: bin/adlc-prosecute.mjs CLI wiring (subprocess-level smoke tests).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { FIXTURE_REVISION, killedFinding, repoRoot, reviewPacket, tmpAdlc, transcript } from './helpers.mjs';
+import { FIXTURE_REVISION, gitRepo, killedFinding, repoRoot, reviewPacket, tmpAdlc, transcript } from './helpers.mjs';
 
 const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
 
@@ -34,47 +34,76 @@ describe('adlc-prosecute cli', () => {
       ],
     }));
     const bin = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
-    // --base HEAD makes `git diff HEAD...HEAD` empty -> non-trust-root -> the tier
-    // gate stays off, so this test asserts P5 CONVERGENCE hermetically, independent
-    // of whatever the ambient worktree branch happens to touch (T39).
-    const out = execFileSync(process.execPath, [
-      bin,
-      '--input',
-      inputPath,
-      '--ticket',
-      'T1',
-      '--revision',
-      FIXTURE_REVISION,
-      '--base',
-      'HEAD',
-      '--dir',
-      dir,
-      '--json',
-    ], { encoding: 'utf8' });
-    const parsed = JSON.parse(out);
-    assert.equal(parsed.exitCode, 0);
+    // Trust-root tiering is WORKING-TREE-INCLUSIVE by design (see adlc-prosecute.mjs):
+    // it diffs the repo at `cwd` against --base, uncommitted changes included, so an
+    // uncommitted trust-root edit can't evade the gate. That means `--base HEAD` is
+    // ONLY hermetic when `cwd` resolves to a clean repo — inheriting the real repo's
+    // cwd made this test flake against ANY dirty working tree (e.g. a lockstep
+    // version-bump mid-release, which necessarily touches every enforcement package's
+    // package.json). Run in an isolated, freshly-committed throwaway repo instead, so
+    // the diff is empty regardless of what the real ambient repo looks like.
+    const repo = gitRepo();
+    try {
+      writeFileSync(join(repo.dir, '.gitkeep'), '');
+      repo.g('add', '-A');
+      repo.g('commit', '-qm', 'base');
+      const out = execFileSync(process.execPath, [
+        bin,
+        '--input',
+        inputPath,
+        '--ticket',
+        'T1',
+        '--revision',
+        FIXTURE_REVISION,
+        '--base',
+        'HEAD',
+        '--dir',
+        dir,
+        '--json',
+      ], { cwd: repo.dir, encoding: 'utf8' });
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.exitCode, 0);
+    } finally {
+      rmSync(repo.dir, { recursive: true, force: true });
+    }
   });
 
   it('accepts the bundled docs fixture from the repository root', () => {
     const dir = tmpAdlc();
     const bin = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
-    // --base HEAD isolates this convergence assertion from ambient-branch tiering (T39).
-    const out = execFileSync(process.execPath, [
-      bin,
-      '--input',
-      'docs/examples/p5-passes.json',
-      '--ticket',
-      'T1',
-      '--revision',
-      'docs-example-revision',
-      '--base',
-      'HEAD',
-      '--dir',
-      dir,
-      '--json',
-    ], { cwd: repoRoot, encoding: 'utf8' });
-    const parsed = JSON.parse(out);
-    assert.equal(parsed.exitCode, 0);
+    // Isolated repo for the same WORKING-TREE-INCLUSIVE-tiering reason as above.
+    // --input still points at the REAL bundled docs fixture via an absolute path
+    // (read as-is, not cwd-resolved), but the transcript/review_packet paths INSIDE
+    // that fixture are repo-relative and get resolved against `cwd` by run.mjs, and
+    // the ticket lookup reads `<cwd>/.adlc/tickets.json` — so both must be mirrored
+    // into the isolated repo for this fixture to still validate as it does for real.
+    const repo = gitRepo();
+    try {
+      mkdirSync(join(repo.dir, '.adlc'), { recursive: true });
+      cpSync(join(repoRoot, '.adlc/tickets.json'), join(repo.dir, '.adlc/tickets.json'));
+      mkdirSync(join(repo.dir, '.omo/evidence'), { recursive: true });
+      cpSync(join(repoRoot, '.omo/evidence'), join(repo.dir, '.omo/evidence'), { recursive: true });
+      repo.g('add', '-A');
+      repo.g('commit', '-qm', 'base');
+      const out = execFileSync(process.execPath, [
+        bin,
+        '--input',
+        join(repoRoot, 'docs/examples/p5-passes.json'),
+        '--ticket',
+        'T1',
+        '--revision',
+        'docs-example-revision',
+        '--base',
+        'HEAD',
+        '--dir',
+        dir,
+        '--json',
+      ], { cwd: repo.dir, encoding: 'utf8' });
+      const parsed = JSON.parse(out);
+      assert.equal(parsed.exitCode, 0);
+    } finally {
+      rmSync(repo.dir, { recursive: true, force: true });
+    }
   });
 
   describe('--record-finding (P5 → P7 bridge)', () => {

@@ -56,6 +56,28 @@ function makeRepo() {
     name: 'adlc-codex',
     version: '1.0.0',
   });
+  mkdirSync(join(pluginsDir, 'adlc-cursor', '.cursor-plugin'), { recursive: true });
+  write(join(pluginsDir, 'adlc-cursor', 'package.json'), {
+    name: '@adlc/cursor',
+    version: '1.0.0',
+    repository,
+    dependencies: { '@adlc/cli': '1.0.0' },
+  });
+  write(join(pluginsDir, 'adlc-cursor', '.cursor-plugin', 'plugin.json'), {
+    name: 'adlc-cursor',
+    version: '1.0.0',
+  });
+  // Two plugin entries — a marketplace fix that only updates plugins[0] must be
+  // caught, not just a fix that updates *a* entry (see the split drift tests below).
+  mkdirSync(join(root, '.cursor-plugin'), { recursive: true });
+  write(join(root, '.cursor-plugin', 'marketplace.json'), {
+    name: 'adlc',
+    metadata: { description: 'fixture marketplace', version: '1.0.0' },
+    plugins: [
+      { name: 'adlc-cursor', source: './plugins/adlc-cursor', version: '1.0.0' },
+      { name: 'adlc-second', source: './plugins/adlc-second', version: '1.0.0' },
+    ],
+  });
   return { root, packagesDir, pluginsDir };
 }
 
@@ -73,6 +95,12 @@ test('releaseMain bumps packages, versioned plugins, and root in lockstep', () =
     assert.equal(ver(join(pluginsDir, 'adlc-pi', 'package.json')), '1.2.0'); // NOT stranded
     assert.equal(ver(join(pluginsDir, 'adlc-codex', 'package.json')), '1.2.0');
     assert.equal(ver(join(pluginsDir, 'adlc-codex', '.codex-plugin', 'plugin.json')), '1.2.0');
+    assert.equal(ver(join(pluginsDir, 'adlc-cursor', 'package.json')), '1.2.0');
+    assert.equal(ver(join(pluginsDir, 'adlc-cursor', '.cursor-plugin', 'plugin.json')), '1.2.0');
+    const marketplace = JSON.parse(readFileSync(join(root, '.cursor-plugin', 'marketplace.json'), 'utf8'));
+    assert.equal(marketplace.metadata.version, '1.2.0');
+    assert.equal(marketplace.plugins[0].version, '1.2.0');
+    assert.equal(marketplace.plugins[1].version, '1.2.0'); // every entry, not just index 0
     assert.equal(regen, 1); // lockfile regenerated exactly once
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -111,6 +139,60 @@ test('findVersionDrift flags a stale Codex manifest independently of package.jso
     writeFileSync(manifest, '{"name":"adlc-codex","version":"1.1.0"}\n');
     const drift = findVersionDrift('1.2.0', { root, packagesDir, pluginsDir });
     assert.ok(drift.some((entry) => entry.includes('.codex-plugin')));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Regression: a lockstep bump left plugins/adlc-cursor/.cursor-plugin/plugin.json
+// and the root .cursor-plugin/marketplace.json (both entry.version and
+// metadata.version) stranded at the prior version, because releaseMain only ever
+// walked Codex plugin manifests. cursor-install-smoke.mjs's T47 lockstep check
+// caught it; this pins the fix shut the same way the Codex-manifest test does.
+test('findVersionDrift flags a stale Cursor manifest independently of package.json', () => {
+  const { root, packagesDir, pluginsDir } = makeRepo();
+  try {
+    releaseMain(['1.2.0'], { root, packagesDir, pluginsDir, regenerateLockfile() {} });
+    const manifest = join(pluginsDir, 'adlc-cursor', '.cursor-plugin', 'plugin.json');
+    writeFileSync(manifest, '{"name":"adlc-cursor","version":"1.1.0"}\n');
+    const drift = findVersionDrift('1.2.0', { root, packagesDir, pluginsDir });
+    assert.ok(drift.some((entry) => entry.includes('.cursor-plugin')));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Isolates the metadata.version invariant: both plugin entries are current, only
+// metadata.version is stale. A drift check that only walks `plugins[]` (and never
+// looks at `metadata`) would wrongly report no drift here.
+test('findVersionDrift flags a stale marketplace metadata.version even when every plugin entry is current', () => {
+  const { root, packagesDir, pluginsDir } = makeRepo();
+  try {
+    releaseMain(['1.2.0'], { root, packagesDir, pluginsDir, regenerateLockfile() {} });
+    const marketplacePath = join(root, '.cursor-plugin', 'marketplace.json');
+    const marketplace = JSON.parse(readFileSync(marketplacePath, 'utf8'));
+    marketplace.metadata.version = '1.1.0'; // stale metadata; both plugin entries stay at 1.2.0
+    writeFileSync(marketplacePath, JSON.stringify(marketplace, null, 2) + '\n');
+    const drift = findVersionDrift('1.2.0', { root, packagesDir, pluginsDir });
+    assert.ok(drift.some((entry) => entry.includes('marketplace.json') && entry.includes('metadata.version')));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Isolates the per-entry invariant on the SECOND entry specifically: metadata and
+// plugins[0] are current, only plugins[1] is stale. A drift check hardcoded to
+// plugins[0] (an index-0-only regression) would wrongly report no drift here.
+test('findVersionDrift flags a stale non-first marketplace plugin entry with metadata current', () => {
+  const { root, packagesDir, pluginsDir } = makeRepo();
+  try {
+    releaseMain(['1.2.0'], { root, packagesDir, pluginsDir, regenerateLockfile() {} });
+    const marketplacePath = join(root, '.cursor-plugin', 'marketplace.json');
+    const marketplace = JSON.parse(readFileSync(marketplacePath, 'utf8'));
+    marketplace.plugins[1].version = '1.1.0'; // stale second entry; metadata + plugins[0] stay at 1.2.0
+    writeFileSync(marketplacePath, JSON.stringify(marketplace, null, 2) + '\n');
+    const drift = findVersionDrift('1.2.0', { root, packagesDir, pluginsDir });
+    assert.ok(drift.some((entry) => entry.includes('marketplace.json') && entry.includes('adlc-second')));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

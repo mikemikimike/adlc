@@ -9,6 +9,23 @@ version and is published together.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-07-20
+
+### Added
+- **codex/claude-code:** close 5 Codex/Claude Code parity gaps (#201) — port the
+  multi-lens P5 prosecutor fan-out and the risk-tier build gate to Codex, add
+  a Stop-time adversarial-review nudge, bring Codex skill docs up to Claude
+  Code's depth, and give Claude Code an MCP server with compaction hooks.
+- **ci:** report ceremony drift into a tracking issue (#203) (#207)
+- **ticket-prune:** ticket-completion / rail-cleanup lifecycle step (#198) (#200)
+- **cursor:** ship adlc-cursor as Cursor marketplace plugin (T47) (#186)
+
+### Fixed
+- **claude-code:** completion expires a ticket's in-session rails (#162) (#202)
+- **tickets:** make the active-ticket pointer one validated fail-closed contract (#196)
+- **plugins:** ship the generated ticket readers in the npm tarballs (#193) (#195)
+- **codex:** repair MCP startup and npm install docs (#192)
+
 ## [1.4.1] - 2026-07-14
 
 ### Fixed

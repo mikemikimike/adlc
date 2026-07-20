@@ -119,6 +119,21 @@ function codexPluginManifestPaths(pluginsDir = PLUGINS) {
   return paths;
 }
 
+function cursorPluginManifestPaths(pluginsDir = PLUGINS) {
+  if (!existsSync(pluginsDir)) return [];
+  const paths = [];
+  for (const name of readdirSync(pluginsDir)) {
+    const manifest = join(pluginsDir, name, '.cursor-plugin', 'plugin.json');
+    if (existsSync(manifest)) paths.push(manifest);
+  }
+  return paths;
+}
+
+function cursorMarketplacePath(root) {
+  const p = join(root, '.cursor-plugin', 'marketplace.json');
+  return existsSync(p) ? p : null;
+}
+
 /**
  * Deterministic post-bump gate: return a list of every place still NOT at
  * `version` — any versioned package.json (packages/* + plugins/*), the root, and
@@ -135,6 +150,22 @@ export function findVersionDrift(version, { root = ROOT, packagesDir = PKGS, plu
   for (const manifest of codexPluginManifestPaths(pluginsDir)) {
     const v = readJson(manifest).version;
     if (v !== version) problems.push(`${manifest}: ${v} != ${version}`);
+  }
+  for (const manifest of cursorPluginManifestPaths(pluginsDir)) {
+    const v = readJson(manifest).version;
+    if (v !== version) problems.push(`${manifest}: ${v} != ${version}`);
+  }
+  const marketplacePath = cursorMarketplacePath(root);
+  if (marketplacePath) {
+    const marketplace = readJson(marketplacePath);
+    if (marketplace.metadata?.version !== version) {
+      problems.push(`${marketplacePath} metadata.version: ${marketplace.metadata?.version} != ${version}`);
+    }
+    for (const entry of marketplace.plugins ?? []) {
+      if (entry.version !== version) {
+        problems.push(`${marketplacePath} plugin ${entry.name}: ${entry.version} != ${version}`);
+      }
+    }
   }
   const rootV = readJson(join(root, 'package.json')).version;
   if (rootV !== version) problems.push(`${join(root, 'package.json')}: ${rootV} != ${version}`);
@@ -219,6 +250,28 @@ export function releaseMain(
       writeJson(manifest, plugin);
       console.log(`set ${plugin.name}@${version} (Codex manifest)`);
     }
+    for (const manifest of cursorPluginManifestPaths(pluginsDir)) {
+      const plugin = readJson(manifest);
+      plugin.version = version;
+      writeJson(manifest, plugin);
+      console.log(`set ${plugin.name}@${version} (Cursor manifest)`);
+    }
+  }
+
+  // Cursor marketplace.json (root-level) lists each Cursor-packaged plugin's
+  // version separately from its package.json — T47's install-smoke check
+  // locksteps both entry.version and metadata.version against the package, so a
+  // bump that skips this file strands the marketplace listing the same way
+  // plugins/adlc-pi was stranded at 1.0.2 pre-T-drift-gate.
+  const marketplacePath = cursorMarketplacePath(root);
+  if (marketplacePath) {
+    const marketplace = readJson(marketplacePath);
+    if (marketplace.metadata) marketplace.metadata.version = version;
+    for (const entry of marketplace.plugins ?? []) {
+      entry.version = version;
+    }
+    writeJson(marketplacePath, marketplace);
+    console.log(`set .cursor-plugin/marketplace.json@${version} (Cursor marketplace)`);
   }
 
   // Keep the (private) root version in lockstep too.
