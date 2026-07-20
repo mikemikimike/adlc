@@ -44,17 +44,21 @@ export function runTicketPrune(options = {}) {
     ceremony = false,
   } = options;
 
-  // The ceremony COMPLETES rail-freezing shipped tickets, which expires their
-  // rails (T36) — a privilege an ordinary PR's rails-guard gate denies
-  // (assertBaseTicketContractsPreserved). Its output only lands via the
-  // protected-base/admin path, so gate it behind the same recorded override the
-  // gate itself uses (ADLC_RAILS_BYPASS=1) and write nothing without it. Checked
-  // FIRST, before any read, so a misfire never mutates the store.
-  if (ceremony && process.env.ADLC_RAILS_BYPASS !== '1') {
+  // `--ceremony` is DEPRECATED (#208). It was a bulk completion: it took no
+  // ticket ids and recomputed its target set at run time (a TOCTOU window and no
+  // per-ticket filter), wrote tickets.json directly via writeJsonAtomic without
+  // recording manifest evidence, and had no directory-store implementation. The
+  // canonical per-ticket path fixes all of that. Fail closed with a redirect,
+  // FIRST, before any read — so any already-shipped instruction that still calls
+  // `--ceremony` gets pointed at the safe command instead of silently mutating.
+  if (ceremony) {
     return {
       ok: false,
       error:
-        'ticket-prune --ceremony completes rail-freezing tickets (expiring their rails), a protected-base admin action; set ADLC_RAILS_BYPASS=1 to run it. Refusing and writing nothing.',
+        'ticket-prune --ceremony is deprecated (#208): it was a bulk, evidence-less, ' +
+        'legacy-store-only completion. Complete each reviewed ticket individually with ' +
+        '`adlc ticket complete <id> --write --authorize --json` — per-ticket (no TOCTOU), ' +
+        'records manifest evidence, and works on both the legacy and directory stores.',
     };
   }
 
@@ -114,10 +118,33 @@ export function runTicketPrune(options = {}) {
     if (ceremony) {
       return { ok: false, error: 'ticket-prune --ceremony is not supported for the directory ticket store yet; complete rail-freezing tickets through the protected-base admin ceremony directly.' };
     }
+    // Archive ONLY tombstone-eligible tickets — same boundary the legacy path
+    // enforces. A rail-freezing or preexisting-completed-field ticket must NOT be
+    // auto-archived: archiving removes it from the active store and so unfreezes
+    // its rails without the per-ticket review the contract reserves for that. They
+    // are reported under needsCeremony and completed per-ticket via
+    // `adlc ticket complete`, exactly as on the legacy backend.
     const archivedEntries = [];
-    try {
-      for (const item of stale) {
+    const needsCeremony = [];
+    for (const item of stale) {
+      try {
+        // Re-read and re-classify against the CURRENT snapshot, then pass THAT
+        // snapshot's hash to archiveTicket, so the disposition and the CAS come
+        // from the same view. Taking the disposition from the initial load but
+        // the hash from a later load would let a concurrent edit (rails added,
+        // status changed, completed:false set) slip a reclassified ticket through
+        // the CAS. This mirrors the legacy path's under-lock re-read.
         const current = canonicalStore.load();
+        const ticket = current.get(item.id);
+        if (!ticket) continue; // vanished under us since the first pass
+        const reclassified = classifyTicket(ticket, trackedFiles);
+        if (!reclassified.stale) continue; // un-staled since the first pass
+        const disposition = ceremonyDisposition(ticket, reclassified.reason);
+        if (disposition.disposition === 'done') continue;
+        if (disposition.disposition === 'ceremony') {
+          needsCeremony.push(disposition.entry); // rails-freeze / preexisting-completed-field → reported, not archived
+          continue;
+        }
         const result = archiveTicket(canonicalStore, resolve(cwd, '.adlc/ticket-archive'), item.id, {
           root: cwd,
           expectedSnapshotHash: current.hash,
@@ -125,11 +152,15 @@ export function runTicketPrune(options = {}) {
           authorized: true,
         });
         archivedEntries.push(result.archived);
+      } catch (error) {
+        // Each archive is its own committed transaction. On failure mid-batch,
+        // report what ALREADY archived (and which id failed) alongside the error,
+        // so the caller can recover rather than see a bare {ok:false} after an
+        // in-place mutation already landed.
+        return { ok: false, error: error.message, archived: archivedEntries, needsCeremony, failedId: item.id };
       }
-      return { ok: true, baseRef, write, ceremony, stale, active, archived: archivedEntries };
-    } catch (error) {
-      return { ok: false, error: error.message };
     }
+    return { ok: true, baseRef, write, ceremony, stale, active, archived: archivedEntries, needsCeremony };
   }
 
   const locked = acquireLock(cwd);
@@ -173,13 +204,14 @@ export function runTicketPrune(options = {}) {
     // (never physical removal — the rails-guard CI gate hard-denies that; the
     // in-place add-only annotation it accepts for a rails-less ticket, so the
     // prune output merges through an ordinary PR).
-    // #198: under --ceremony (admin-gated above), ALSO complete rail-freezing
-    // stale tickets in place — the one action reserved for the protected-base
-    // admin ceremony (completing them expires their rails, T36). Both share the
-    // same add-only completed:true edit and the same re-classification guard.
+    // The only in-place write this tool performs is TOMBSTONING rails-less stale
+    // tickets under --write (add-only `completed: true`). Completing rail-freezing
+    // tickets is NOT done here anymore — that was `--ceremony`, deprecated above
+    // (#208); rail-freezing entries are always just reported under needsCeremony,
+    // to be completed per-ticket via `adlc ticket complete`. `ceremonyCompleted`
+    // is retained in the result shape (always empty) for consumer compatibility.
     const tombstoneIds = new Set();
     const tombstoned = [];
-    const completeIds = new Set();
     const ceremonyCompleted = [];
     const needsCeremony = [];
     for (const ticket of staleCandidates) {
@@ -194,33 +226,21 @@ export function runTicketPrune(options = {}) {
         }
         continue;
       }
-      // disposition === 'ceremony'
-      if (ceremony && disposition.entry.blocker === 'rails-freeze') {
-        // The protected-base action this whole flow exists for: complete the
-        // rail-freezing shipped ticket so its rails expire. Only the
-        // 'rails-freeze' blocker is completed — a 'preexisting-completed-field'
-        // ticket would need a field MUTATION (overwriting a deliberately-set
-        // value), a distinct, riskier operation kept out of scope; it stays
-        // reported under needsCeremony.
-        completeIds.add(ticket.id);
-        ceremonyCompleted.push({ id: ticket.id, reason: reclassified.reason, rails: disposition.entry.rails });
-      } else {
-        needsCeremony.push(disposition.entry);
-      }
+      // disposition === 'ceremony' — reported, never completed in-place here.
+      needsCeremony.push(disposition.entry);
     }
 
-    const writeIds = new Set([...tombstoneIds, ...completeIds]);
+    const writeIds = tombstoneIds;
     if (writeIds.size === 0) {
       // Nothing writable this pass (all stale ids were un-staled, already
-      // completed, tombstone-only under a ceremony-only run, or need a ceremony
-      // this run isn't performing). tickets.json is left untouched.
+      // completed, or are rail-freezing/preexisting-completed-field entries this
+      // tool only reports). tickets.json is left untouched.
       return { ok: true, baseRef, write, ceremony, stale, active, tombstoned, ceremonyCompleted, needsCeremony };
     }
 
-    // Add ONLY `completed: true` to each written ticket — the exact single-field
-    // annotation the gate accepts for a rails-less tombstone, and the minimal
-    // diff PR #199 used for the admin ceremony; touching any other field would
-    // make an ordinary-PR tombstone diff un-mergeable.
+    // Add ONLY `completed: true` to each tombstoned ticket — the exact single-field
+    // annotation the gate accepts for a rails-less tombstone; touching any other
+    // field would make an ordinary-PR tombstone diff un-mergeable.
     const updatedTickets = freshTickets.map((t) =>
       writeIds.has(t.id) ? { ...t, completed: true } : t);
 

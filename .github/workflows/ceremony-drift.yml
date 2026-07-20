@@ -1,0 +1,78 @@
+# Ceremony drift — surface shipped tickets whose rails never expired.
+#
+# A ticket that ships while freezing rails must be marked `completed: true` for
+# its rails to expire (T36). Nothing performed or surfaced that step, so drift
+# accumulated silently and stale rails kept freezing unrelated future work (the
+# failure that blocked PR #196). `ticket-prune` made the drift visible and gave
+# it a remedy; this closes the loop so detection no longer depends on someone
+# remembering to look.
+#
+# DELIBERATELY NOT A BLOCKING GATE, and not run on pull_request. An ordinary PR
+# structurally cannot clear this set — rails-guard-ci's
+# assertBaseTicketContractsPreserved denies field changes to existing base
+# tickets — so a PR-level failure would block every contributor on drift none of
+# them can fix, and people would learn to route around it. This reports into a
+# tracking issue and always exits 0. Authoritative rail enforcement stays in the
+# `rails-guard` job in ci.yml.
+name: Ceremony drift
+
+on:
+  push:
+    branches: [main] # drift can only change when something merges
+  schedule:
+    - cron: '17 13 * * *' # daily safety net; off the hour to dodge peak contention
+  workflow_dispatch: # so an operator can re-check right after running the sweep
+
+permissions:
+  contents: read
+  issues: write # the job's only side effect: maintaining its tracking issue
+
+# The push and schedule triggers can overlap. Without this, two runs could each
+# see "no existing issue" and open a duplicate. Queue instead of cancelling —
+# a cancelled run might drop a close-on-clear.
+concurrency:
+  group: ceremony-drift
+  cancel-in-progress: false
+
+jobs:
+  ceremony-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # ALWAYS main, for every trigger. workflow_dispatch can be launched
+          # against any branch or tag, and checkout defaults to the triggering
+          # ref — which would load that branch's ticket store while the tracker
+          # being rewritten is repository-wide. Someone dispatching from a
+          # feature branch could then close or rewrite the authoritative issue
+          # from a non-authoritative snapshot.
+          ref: main
+          fetch-depth: 0 # full history so scope-vs-tracked-files resolves
+          # Do NOT leave the job's issues:write token in .git/config. Anything
+          # that runs later in the job (notably dependency install scripts) could
+          # otherwise recover it and mutate issues as github-actions[bot].
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+
+      - name: Install
+        # `ci` for a lockfile-exact tree, `--ignore-scripts` so no dependency
+        # lifecycle script executes in a job that holds issues:write. The five
+        # packages in this lockfile with install scripts (esbuild, sharp,
+        # protobufjs, ...) are not needed here: this job only imports
+        # @adlc/core and @adlc/tickets, which npm links itself without scripts.
+        run: npm ci --ignore-scripts
+
+      - name: Report ceremony drift
+        env:
+          # The ONLY step given the token. Nothing before it can reach one.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # HEAD *is* main here (checkout is pinned above), so drift is computed
+          # against exactly the snapshot that was checked out — no mixing a
+          # branch ticket store with a main base ref.
+          BASE_REF: HEAD
+        run: node scripts/ceremony-drift.mjs

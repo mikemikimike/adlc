@@ -7,7 +7,7 @@ import { renderReport, toJson } from '../lib/format.mjs';
 // literal strings (e.g. "completed:true", the empty-state lines, the ceremony
 // section) can't silently drift into a display lie.
 
-test('renderReport (write): a mixed result shows the tombstoned line, the completed:true wording, and the not-auto-tombstonable ceremony section for both blockers', () => {
+test('renderReport (write): rails-freeze entries get the completion command; preexisting-completed-field entries are steered to a manual decision, NOT the command', () => {
   const text = renderReport({
     baseRef: 'HEAD',
     write: true,
@@ -22,13 +22,20 @@ test('renderReport (write): a mixed result shows the tombstoned line, the comple
 
   assert.match(text, /Tombstoned 1 rails-less stale ticket\(s\) with completed:true in place:/);
   assert.match(text, /- T1: shipped scope/);
-  assert.match(text, /Stale but not auto-tombstonable — needs the protected-base admin ceremony \(2\):/);
-  // rails-freeze blocker renders the frozen globs...
+
+  // rails-freeze: gets the per-ticket completion command.
+  assert.match(text, /Shipped but still freezing rails — complete each per-ticket .*adlc ticket complete <id> --write --authorize --json` \(1\):/);
   assert.match(text, /- T2: shipped scope \[freezes: test\/a\/\*\*, test\/b\/\*\*\]/);
-  // ...preexisting-completed-field blocker renders the field explanation, not "freezes:".
-  assert.match(text, /- T3: shipped scope \[already has a completed field\]/);
-  assert.doesNotMatch(text, /- T3:.*freezes:/);
-  // Active section still present.
+
+  // preexisting-completed-field: steered to a manual decision, explicitly NOT the command.
+  const manualIdx = text.indexOf('Already carry a `completed` field');
+  assert.ok(manualIdx !== -1, 'manual-decision section present');
+  assert.match(text.slice(manualIdx), /NOT `adlc ticket complete`/);
+  assert.match(text.slice(manualIdx), /- T3: shipped scope/);
+  // T3 must not sit under the "complete each" command heading.
+  const cmdIdx = text.indexOf('Shipped but still freezing rails');
+  assert.doesNotMatch(text.slice(cmdIdx, manualIdx), /T3/);
+
   assert.match(text, /Active tickets \(1\):/);
   assert.match(text, /- T9: still building/);
 });
@@ -43,7 +50,7 @@ test('renderReport (write): with nothing tombstoned and no ceremony items, it sa
     needsCeremony: [],
   });
 
-  assert.match(text, /No stale tickets tombstoned\./);
+  assert.match(text, /No stale tickets tombstoned or archived\./);
   assert.doesNotMatch(text, /completed:true/);
   assert.doesNotMatch(text, /admin ceremony/);
   assert.match(text, /Active tickets \(0\):/);
@@ -80,6 +87,7 @@ test('toJson projects exactly the machine-readable fields, defaulting the new ar
     stale: [],
     active: [],
     tombstoned: [{ id: 'T1', reason: 'x' }],
+    archived: [],
     ceremonyCompleted: [],
     needsCeremony: [],
   });
@@ -96,22 +104,6 @@ test('#198 renderReport (dry-run): a railed shipped ticket is listed under the c
     ceremonyCompleted: [],
     needsCeremony: [{ id: 'T7', reason: 'shipped scope', rails: ['test/codec/**'], blocker: 'rails-freeze' }],
   });
-  assert.match(text, /needs the protected-base admin ceremony \(1\):/);
+  assert.match(text, /complete each per-ticket on the protected-base path with `adlc ticket complete <id> --write --authorize --json` \(1\):/);
   assert.match(text, /- T7: shipped scope \[freezes: test\/codec\/\*\*\]/);
-});
-
-test('#198 renderReport (ceremony): completed rail-freezing tickets render under the "Completed … via the admin ceremony" section', () => {
-  const text = renderReport({
-    baseRef: 'origin/main',
-    write: false,
-    ceremony: true,
-    stale: [{ id: 'T7', reason: 'shipped scope' }],
-    active: [],
-    tombstoned: [],
-    ceremonyCompleted: [{ id: 'T7', reason: 'shipped scope', rails: ['test/codec/**'] }],
-    needsCeremony: [],
-  });
-  assert.match(text, /\(ceremony\)/);
-  assert.match(text, /Completed 1 rail-freezing ticket\(s\) via the admin ceremony \(rails now expire, T36\):/);
-  assert.match(text, /- T7: freezes test\/codec\/\*\*/);
 });

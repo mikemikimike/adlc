@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runTicketPrune } from '../lib/run.mjs';
+import { renderReport, toJson } from '../lib/format.mjs';
 import { acquireLock } from '../lib/store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -508,162 +509,94 @@ test('#198 AC1: dry-run surfaces a rails-less preexisting-completed-field ticket
   });
 });
 
-test('#198 AC2: --ceremony without ADLC_RAILS_BYPASS=1 writes nothing and returns ok:false', () => {
-  withEnv('ADLC_RAILS_BYPASS', undefined, () => {
-    withScratchRepo((dir) => {
-      writeTickets(dir, [
-        {
-          id: 'T1',
-          title: 'Ship the widget',
-          scope: ['plugins/adlc-widget/**'],
-          rails: ['test/adlc-widget/**'],
-        },
-      ]);
-      const before = readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8');
+// ---- #208: --ceremony is deprecated (was #198's ceremony-completion path) ----
+//
+// It completed rail-freezing tickets in place: bulk (no ids, recomputed set —
+// TOCTOU + blast radius), evidence-less (writeJsonAtomic, no manifest), and
+// legacy-store-only. The canonical `adlc ticket complete <id> --write --authorize
+// --json` replaces it. runTicketPrune now fails closed on ceremony:true, and the
+// tests below cover the deprecation plus the behavior that REMAINS: --write still
+// tombstones rails-less stale tickets, and rail-freezing / preexisting-completed
+// entries are reported (never completed here).
 
-      const result = runTicketPrune({ cwd: dir, ceremony: true });
-
-      assert.equal(result.ok, false);
-      assert.match(result.error, /ADLC_RAILS_BYPASS/);
-      assert.equal(readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8'), before);
-    });
-  });
-});
-
-test('#198 AC3: --ceremony with ADLC_RAILS_BYPASS=1 completes a railed shipped ticket add-only and reports it under ceremonyCompleted; an active railed ticket is untouched', () => {
-  withEnv('ADLC_RAILS_BYPASS', '1', () => {
-    withScratchRepo((dir) => {
-      writeTickets(dir, [
-        {
-          id: 'T1',
-          title: 'Ship the widget',
-          scope: ['plugins/adlc-widget/**'],
-          rails: ['test/adlc-widget/**'],
-        },
-        {
-          id: 'T2',
-          title: 'Still building',
-          scope: ['packages/never-built/**'], // NOT shipped → active
-          rails: ['test/never-built/**'],
-        },
-      ]);
-
-      const result = runTicketPrune({ cwd: dir, ceremony: true });
-
-      assert.equal(result.ok, true);
-      assert.deepEqual(result.ceremonyCompleted.map((c) => c.id), ['T1']);
-      assert.deepEqual(result.needsCeremony, []); // T1 moved out of needsCeremony
-
-      const after = readTickets(dir);
-      // T1 gained EXACTLY completed:true (add-only), nothing else changed.
-      assert.deepEqual(after.tickets[0], {
-        id: 'T1',
-        title: 'Ship the widget',
-        scope: ['plugins/adlc-widget/**'],
-        rails: ['test/adlc-widget/**'],
-        completed: true,
+test('#208: runTicketPrune with ceremony:true fails closed and mutates nothing, regardless of ADLC_RAILS_BYPASS', () => {
+  for (const bypass of [undefined, '1']) {
+    withEnv('ADLC_RAILS_BYPASS', bypass, () => {
+      withScratchRepo((dir) => {
+        writeTickets(dir, [
+          { id: 'T1', title: 'Ship the widget', scope: ['plugins/adlc-widget/**'], rails: ['test/adlc-widget/**'] },
+        ]);
+        const before = readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8');
+        const result = runTicketPrune({ cwd: dir, ceremony: true });
+        assert.equal(result.ok, false);
+        assert.match(result.error, /deprecated/);
+        assert.match(result.error, /adlc ticket complete <id> --write --authorize --json/);
+        assert.doesNotMatch(result.error, /ADLC_RAILS_BYPASS/); // the old gate is gone
+        assert.equal(readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8'), before);
       });
-      // T2 (active, not shipped) is untouched — no completed field.
-      assert.equal(after.tickets[1].completed, undefined);
     });
+  }
+});
+
+test('#208: --write still tombstones a rails-less stale ticket; a railed one is only reported under needsCeremony', () => {
+  withScratchRepo((dir) => {
+    mkdirSync(join(dir, 'packages', 'second-widget'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'second-widget', 'index.mjs'), '// shipped later\n');
+    git(['add', '-A'], dir);
+    git(['commit', '-q', '-m', 'ship the second widget'], dir);
+
+    writeTickets(dir, [
+      { id: 'T1', title: 'rails-less shipped', scope: ['plugins/adlc-widget/**'] },
+      { id: 'T2', title: 'railed shipped', scope: ['packages/second-widget/**'], rails: ['test/second-widget/**'] },
+    ]);
+
+    const result = runTicketPrune({ cwd: dir, write: true });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.tombstoned.map((t) => t.id), ['T1']);           // rails-less → tombstoned
+    assert.deepEqual(result.ceremonyCompleted, []);                          // nothing completed in-place
+    assert.deepEqual(result.needsCeremony.map((c) => c.id), ['T2']);         // railed → only reported
+    assert.equal(result.needsCeremony[0].blocker, 'rails-freeze');
+
+    const after = readTickets(dir);
+    assert.equal(after.tickets[0].completed, true);   // T1 tombstoned
+    assert.equal(after.tickets[1].completed, undefined); // T2 untouched — completed via `adlc ticket complete`
   });
 });
 
-test('#198 AC4: after the ceremony completes a railed ticket, the base-rail union (skip completed===true) no longer includes its rails', () => {
-  withEnv('ADLC_RAILS_BYPASS', '1', () => {
-    withScratchRepo((dir) => {
-      writeTickets(dir, [
-        {
-          id: 'T1',
-          title: 'Ship the widget',
-          scope: ['plugins/adlc-widget/**'],
-          rails: ['test/adlc-widget/**'],
-        },
-      ]);
-      // The rails-guard union: every non-completed ticket's rails.
-      const railUnion = (tickets) =>
-        tickets.filter((t) => t.completed !== true).flatMap((t) => t.rails ?? []);
+test('#208: a preexisting-completed-field ticket is reported under needsCeremony and never rewritten', () => {
+  withScratchRepo((dir) => {
+    writeTickets(dir, [
+      { id: 'T1', title: 'Ship the widget', scope: ['plugins/adlc-widget/**'], completed: false },
+    ]);
+    const before = readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8');
 
-      assert.deepEqual(railUnion(readTickets(dir).tickets), ['test/adlc-widget/**']); // frozen before
+    const result = runTicketPrune({ cwd: dir, write: true });
 
-      const result = runTicketPrune({ cwd: dir, ceremony: true });
-      assert.equal(result.ok, true);
-
-      assert.deepEqual(railUnion(readTickets(dir).tickets), []); // expired after
-    });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.needsCeremony.map((c) => c.id), ['T1']);
+    assert.equal(result.needsCeremony[0].blocker, 'preexisting-completed-field');
+    assert.equal(readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8'), before); // completed:false stays
   });
 });
 
-test('#198 AC5: --ceremony does NOT touch a rails-less preexisting-completed-field ticket; it stays reported under needsCeremony', () => {
-  withEnv('ADLC_RAILS_BYPASS', '1', () => {
-    withScratchRepo((dir) => {
-      writeTickets(dir, [
-        { id: 'T1', title: 'Ship the widget', scope: ['plugins/adlc-widget/**'], completed: false },
-      ]);
-      const before = readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8');
-
-      const result = runTicketPrune({ cwd: dir, ceremony: true });
-
-      assert.equal(result.ok, true);
-      assert.deepEqual(result.ceremonyCompleted, []);
-      assert.deepEqual(result.needsCeremony.map((c) => c.id), ['T1']);
-      assert.equal(result.needsCeremony[0].blocker, 'preexisting-completed-field');
-      // Not rewritten: completed:false stays false, byte-identical.
-      assert.equal(readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8'), before);
-    });
-  });
-});
-
-test('#198: --write --ceremony together tombstone the rails-less and complete the railed shipped tickets in one pass', () => {
-  withEnv('ADLC_RAILS_BYPASS', '1', () => {
-    withScratchRepo((dir) => {
-      mkdirSync(join(dir, 'packages', 'second-widget'), { recursive: true });
-      writeFileSync(join(dir, 'packages', 'second-widget', 'index.mjs'), '// shipped later\n');
-      git(['add', '-A'], dir);
-      git(['commit', '-q', '-m', 'ship the second widget'], dir);
-
-      writeTickets(dir, [
-        { id: 'T1', title: 'rails-less shipped', scope: ['plugins/adlc-widget/**'] },
-        {
-          id: 'T2',
-          title: 'railed shipped',
-          scope: ['packages/second-widget/**'],
-          rails: ['test/second-widget/**'],
-        },
-      ]);
-
-      const result = runTicketPrune({ cwd: dir, write: true, ceremony: true });
-
-      assert.equal(result.ok, true);
-      assert.deepEqual(result.tombstoned.map((t) => t.id), ['T1']);
-      assert.deepEqual(result.ceremonyCompleted.map((t) => t.id), ['T2']);
-
-      const after = readTickets(dir);
-      assert.equal(after.tickets[0].completed, true);
-      assert.equal(after.tickets[1].completed, true);
-    });
-  });
-});
-
-test('#198: bin --ceremony without the bypass env exits 1 (operational error) and writes nothing', () => {
+test('#208: bin --ceremony exits 1 with the deprecation redirect and writes nothing', () => {
   withScratchRepo((dir) => {
     writeTickets(dir, [
       { id: 'T1', title: 'Ship the widget', scope: ['plugins/adlc-widget/**'], rails: ['test/x/**'] },
     ]);
     const before = readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8');
-    // Run the bin with ADLC_RAILS_BYPASS explicitly cleared from the child env.
-    const env = { ...process.env };
-    delete env.ADLC_RAILS_BYPASS;
     let code = 0;
     let stderr = '';
     try {
-      execFileSync(process.execPath, [BIN, '--ceremony', '--json'], { cwd: dir, encoding: 'utf8', env });
+      execFileSync(process.execPath, [BIN, '--ceremony', '--json'], { cwd: dir, encoding: 'utf8', env: process.env });
     } catch (err) {
       code = err.status ?? 1;
       stderr = err.stderr?.toString() ?? '';
     }
     assert.equal(code, 1);
-    assert.match(stderr, /ADLC_RAILS_BYPASS/);
+    assert.match(stderr, /deprecated/);
+    assert.match(stderr, /adlc ticket complete/);
     assert.equal(readFileSync(join(dir, '.adlc', 'tickets.json'), 'utf8'), before);
   });
 });
@@ -729,5 +662,136 @@ test('bin: missing tickets file exits 1 (operational error)', () => {
     const { code, stderr } = runBin([], dir);
     assert.equal(code, 1);
     assert.match(stderr, /tickets file not found/);
+  });
+});
+
+// ---- #208: directory backend respects the ceremony boundary under --write ----
+//
+// A prior version archived EVERY stale ticket on the directory store with
+// authorized:true — including rail-freezing ones. Archiving removes a ticket from
+// the active store, so that silently unfroze its rails without the per-ticket
+// review the legacy path (and the contract) require. --write must archive only
+// tombstone-eligible tickets and report the rest under needsCeremony.
+import { ticketFilename } from '@adlc/tickets';
+
+function writeDirectoryStore(dir, tickets) {
+  const store = join(dir, '.adlc', 'tickets');
+  mkdirSync(store, { recursive: true });
+  writeFileSync(join(store, '.store.json'), JSON.stringify({ format: 'adlc-ticket-directory', version: 1 }));
+  for (const t of tickets) writeFileSync(join(store, ticketFilename(t.id)), JSON.stringify(t));
+}
+
+test('#208: directory --write archives only rails-less stale tickets; a rail-freezing one is reported, not archived', () => {
+  withScratchRepo((dir) => {
+    // withScratchRepo seeds a legacy tickets.json; remove it and use a directory store.
+    rmSync(join(dir, '.adlc', 'tickets.json'), { force: true });
+    mkdirSync(join(dir, 'packages', 'util'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'util', 'b.mjs'), '// shipped\n');
+    git(['add', '-A'], dir);
+    git(['commit', '-q', '-m', 'ship util'], dir);
+    writeDirectoryStore(dir, [
+      { id: 'RAILED', title: 'railed shipped', scope: ['plugins/adlc-widget/**'], rails: ['test/adlc-widget/**'] },
+      { id: 'RAILLESS', title: 'rails-less shipped', scope: ['packages/util/**'] },
+    ]);
+
+    const result = runTicketPrune({ cwd: dir, write: true });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual((result.archived ?? []).map((a) => a?.id ?? a), ['RAILLESS']);
+    assert.deepEqual((result.needsCeremony ?? []).map((e) => e.id), ['RAILED']);
+    assert.equal(result.needsCeremony[0].blocker, 'rails-freeze');
+    // The rail-freezing ticket's shard must still exist — its rails are intact.
+    assert.ok(existsSync(join(dir, '.adlc', 'tickets', ticketFilename('RAILED'))),
+      'rail-freezing ticket must NOT be archived by --write');
+  });
+});
+
+test('#208: directory --write does not archive a deliberately completed:false ticket', () => {
+  withScratchRepo((dir) => {
+    rmSync(join(dir, '.adlc', 'tickets.json'), { force: true });
+    writeDirectoryStore(dir, [
+      { id: 'KEEP', title: 'kept incomplete', scope: ['plugins/adlc-widget/**'], completed: false },
+    ]);
+
+    const result = runTicketPrune({ cwd: dir, write: true });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual((result.archived ?? []).map((a) => a?.id ?? a), []);
+    assert.deepEqual((result.needsCeremony ?? []).map((e) => e.id), ['KEEP']);
+    assert.equal(result.needsCeremony[0].blocker, 'preexisting-completed-field');
+    assert.ok(existsSync(join(dir, '.adlc', 'tickets', ticketFilename('KEEP'))));
+  });
+});
+
+test('#208: directory --write surfaces archived ids in the result (observability)', () => {
+  withScratchRepo((dir) => {
+    rmSync(join(dir, '.adlc', 'tickets.json'), { force: true });
+    writeDirectoryStore(dir, [
+      { id: 'RAILLESS', title: 'rails-less shipped', scope: ['plugins/adlc-widget/**'] },
+    ]);
+    const result = runTicketPrune({ cwd: dir, write: true });
+    assert.equal(result.ok, true);
+    // The mutation must be visible in both the result and the public formatters.
+    assert.deepEqual((result.archived ?? []).map((a) => a?.id ?? a), ['RAILLESS']);
+    assert.deepEqual(toJson(result).archived.map((a) => a?.id ?? a), ['RAILLESS']);
+    assert.match(renderReport(result), /Archived 1 rails-less stale ticket\(s\) out of the active directory store:/);
+  });
+});
+
+test('#208: a directory batch that fails mid-way reports what already archived and which id failed', () => {
+  withScratchRepo((dir) => {
+    rmSync(join(dir, '.adlc', 'tickets.json'), { force: true });
+    // A and B are both rails-less shipped (archivable). B is referenced by active
+    // ticket C via an edge, so archiveTicket rejects B with ARCHIVE_INBOUND_EDGE.
+    // A must archive first, then B fails — a partial batch.
+    mkdirSync(join(dir, 'packages', 'a2'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'a2', 'x.mjs'), '// a\n');
+    mkdirSync(join(dir, 'packages', 'b2'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'b2', 'x.mjs'), '// b\n');
+    git(['add', '-A'], dir);
+    git(['commit', '-q', '-m', 'ship a2 b2'], dir);
+    writeDirectoryStore(dir, [
+      { id: 'AAA', title: 'rails-less shipped', scope: ['packages/a2/**'] },
+      { id: 'BBB', title: 'rails-less shipped', scope: ['packages/b2/**'] },
+      { id: 'CCC', title: 'still building', scope: ['packages/never-built/**'], edges: [{ to: 'BBB', kind: 'depends' }] },
+    ]);
+
+    const result = runTicketPrune({ cwd: dir, write: true });
+
+    assert.equal(result.ok, false);
+    assert.match(result.error, /BBB|inbound|referenced/i);
+    // The already-committed archive of AAA is reported, not lost behind the error.
+    assert.deepEqual((result.archived ?? []).map((a) => a?.id ?? a), ['AAA']);
+    assert.equal(result.failedId, 'BBB');
+  });
+});
+
+test('#208: bin --write --json surfaces partial-batch data (archived + failedId) on a mid-batch failure', () => {
+  withScratchRepo((dir) => {
+    rmSync(join(dir, '.adlc', 'tickets.json'), { force: true });
+    mkdirSync(join(dir, 'packages', 'a3'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'a3', 'x.mjs'), '// a\n');
+    mkdirSync(join(dir, 'packages', 'b3'), { recursive: true });
+    writeFileSync(join(dir, 'packages', 'b3', 'x.mjs'), '// b\n');
+    git(['add', '-A'], dir);
+    git(['commit', '-q', '-m', 'ship a3 b3'], dir);
+    writeDirectoryStore(dir, [
+      { id: 'AAA', title: 'rails-less', scope: ['packages/a3/**'] },
+      { id: 'BBB', title: 'rails-less', scope: ['packages/b3/**'] },
+      { id: 'CCC', title: 'active', scope: ['packages/never-built/**'], edges: [{ to: 'BBB', kind: 'depends' }] },
+    ]);
+    let out = '';
+    let code = 0;
+    try {
+      out = execFileSync(process.execPath, [BIN, '--write', '--json'], { cwd: dir, encoding: 'utf8', env: process.env });
+    } catch (err) {
+      code = err.status ?? 1;
+      out = (err.stdout?.toString() ?? '') + (err.stderr?.toString() ?? '');
+    }
+    assert.equal(code, 1);
+    // The committed archive of AAA and the failed id must be visible, not hidden behind the bare error.
+    assert.match(out, /"archived"/);
+    assert.match(out, /AAA/);
+    assert.match(out, /"failedId": ?"BBB"/);
   });
 });
