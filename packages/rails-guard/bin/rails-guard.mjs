@@ -18,7 +18,7 @@ import {
 } from '@adlc/core';
 import { appendManifestEntry } from '@adlc/gate-manifest';
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, lstatSync } from 'node:fs';
 
 import { runChecks } from '../lib/check.mjs';
 import { formatViolations, buildResult } from '../lib/output.mjs';
@@ -136,9 +136,103 @@ function isFenced(file, lineNo) {
   return fenced.has(lineNo);
 }
 
+// --- manifest revision accessor for the #228 version-only exemption ---
+// `before` is the freeze baseline blob; `after` is the working tree, which is what
+// `git diff <base>` compared against. Any failure — file absent at base, deleted at
+// HEAD, unreadable — returns null and the edit stays a violation (fails closed).
+const contentCache = new Map();
+function resolveContents(file) {
+  if (contentCache.has(file)) return contentCache.get(file);
+  let contents = null;
+  try {
+    // A FILENAME IS NOT A PATHSPEC. `changedFiles` returns raw paths, but
+    // `ls-tree` takes a PATHSPEC, and git reads a leading `:(...)` as pathspec
+    // MAGIC. A file literally named `:(top)victim/package.json` made `ls-tree`
+    // report the mode of a completely different path, so a symlink passed the
+    // mode check. `--literal-pathspecs` on that call is the fix.
+    //
+    // A second guard refusing any leading `:` was tried and REMOVED: it and the
+    // literal flag shadowed each other, so no test could pin either one. One
+    // defence that is provably exercised beats two that are not. (`check-attr`
+    // takes pathNAMES, not pathspecs, so it needs no flag.)
+
+    // A FILENAME MUST ALSO SURVIVE ITS OWN DECODE. Paths arrive already decoded
+    // as UTF-8, and that decode is not injective, so two distinct paths on disk
+    // can arrive as one string — and the content cache would then answer for the
+    // wrong file. Refuse any name that does not re-encode to itself.
+    if (Buffer.from(file, 'utf8').toString('utf8') !== file) {
+      throw new Error(`filename is not round-trip UTF-8: ${file}`);
+    }
+    // MODE FIRST. `git show` returns the blob; readFileSync FOLLOWS SYMLINKS. A
+    // manifest replaced by a symlink to identical text therefore compared equal
+    // and was exempted, while git recorded a typechange (T) — the link target
+    // then lives outside the rail and can be swapped without touching the railed
+    // path again. Require a regular file at HEAD and an unchanged mode at base.
+    if (!lstatSync(file).isFile()) throw new Error('not a regular file');
+
+    // CONTENT FILTERS DESYNC THE COMPARISON. `git diff <base>` applies clean
+    // filters and `ident` expansion; readFileSync returns raw working-tree bytes.
+    // A .gitattributes filter can therefore rewrite `"main"` on the way into the
+    // index while this comparator sees only an innocent version edit — the diff
+    // and the committed blob disagree. Refuse to reason about any path carrying a
+    // content-altering attribute.
+    // `working-tree-encoding` belongs in this list. It re-encodes the file
+    // between the working tree and the index, so a manifest holding `é` in
+    // ISO-8859-1 on disk is committed as `Ã©` — a real change to a value like
+    // `main`, invisible to a comparator that only reads the working tree.
+    // Reproduced end-to-end at exit 0 before this was added.
+    const attrs = git(['check-attr', 'filter', 'ident', 'working-tree-encoding', '--', file],
+      { stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of attrs.split('\n')) {
+      if (!line.trim()) continue;
+      const value = line.slice(line.lastIndexOf(': ') + 2).trim();
+      if (value !== 'unspecified' && value !== 'unset') throw new Error(`content filter on ${file}`);
+    }
+
+    // NOTE on the staged-vs-worktree split: cross-model review flagged that a
+    // manifest staged as X but restored to Y in the working tree is committed as
+    // X while this comparator sees Y. That is real, but it is NOT specific to the
+    // exemption — `changedFiles(base)` is base-vs-worktree for EVERY rail check,
+    // so the same gap already applies to ordinary rail edits. Requiring index and
+    // worktree to agree here would reject the normal flow (edit, run the gate,
+    // then stage) and is the wrong layer. Recorded as a guard-wide issue instead.
+
+    const baseMode = git(['--literal-pathspecs', 'ls-tree', base, '--', file], { stdio: ['ignore', 'pipe', 'ignore'] })
+      .trim().split(/\s+/)[0];
+    if (baseMode !== '100644' && baseMode !== '100755') throw new Error('base is not a regular file');
+    const headExecutable = (lstatSync(file).mode & 0o111) !== 0;
+    if ((baseMode === '100755') !== headExecutable) throw new Error('file mode changed');
+
+    // READ RAW BYTES AND PROVE THE DECODE IS LOSSLESS.
+    //
+    // UTF-8 decoding is NOT injective: every invalid byte becomes U+FFFD. Reading
+    // these as utf8 strings meant a baseline containing raw 0x80 and a working
+    // tree containing raw 0x81 arrived here as the SAME string, so a genuine
+    // byte-level difference compared equal and the edit was exempted. Reproduced
+    // end-to-end against this binary.
+    //
+    // Decoding and re-encoding must reproduce the original buffer exactly. This
+    // has to happen at the byte boundary — a string that already contains U+FFFD
+    // re-encodes to itself perfectly, so no downstream check can recover the
+    // information that was lost here.
+    const decode = (buf) => {
+      const text = buf.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(buf)) throw new Error('not valid UTF-8');
+      return text;
+    };
+    const before = decode(git(['show', `${base}:${file}`], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'buffer' }));
+    const after = decode(readFileSync(file));
+    contents = { before, after };
+  } catch {
+    contents = null;
+  }
+  contentCache.set(file, contents);
+  return contents;
+}
+
 // --- run checks ---
 const { railGlobs, railGlobError, violations, railsDiffEmpty, suppressionsClean } =
-  runChecks({ changedFiles: files, diffText: diff, cliRails, ticket, isFenced });
+  runChecks({ changedFiles: files, diffText: diff, cliRails, ticket, isFenced, resolveContents });
 
 const result = buildResult({
   violations,
