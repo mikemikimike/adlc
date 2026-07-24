@@ -3,10 +3,41 @@
 // root — never the main checkout. Cached per directory; failures resolve to
 // null (pane excluded from the map, never a crash).
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join, delimiter } from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
+import { join, delimiter, dirname, resolve } from 'node:path';
 
 const cache = new Map(); // dir -> { root, at }
+
+/**
+ * Resolve a repo root from a starting directory by a PURE upward filesystem
+ * walk — the first ancestor containing `.adlc` or `.git`, or null. Unlike
+ * `resolveRepoRoot` (which shells out to `git` INSIDE the directory), this
+ * spawns no subprocess, so it is safe to run against an UNTRUSTED cwd: a
+ * malicious `.git/config` (e.g. an fsmonitor hook) can't be triggered by a
+ * plain existence check. Use this for event-driven paths where the cwd comes
+ * from an event payload. Bounded to `maxLevels` ancestors (required; counts
+ * the start directory itself as the first level) so it always terminates.
+ */
+export function repoRootFromCwd(startDir, maxLevels) {
+  if (typeof startDir !== 'string' || startDir.length === 0) return null;
+  if (!Number.isFinite(maxLevels) || maxLevels < 1) return null;
+  let dir;
+  try {
+    // realpath so the upward walk follows PHYSICAL parents — a symlinked cwd
+    // (e.g. ~/my-repo → /mnt/work/repo) would otherwise `dirname` up the
+    // logical path and miss the real repo root. (A pure read; no subprocess.)
+    dir = realpathSync(resolve(startDir));
+  } catch {
+    return null; // nonexistent/unreadable start → fail closed
+  }
+  for (let level = 0; level < maxLevels; level += 1) {
+    if (existsSync(join(dir, '.adlc')) || existsSync(join(dir, '.git'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break; // filesystem root
+    dir = parent;
+  }
+  return null;
+}
 
 // Positive resolutions are cached permanently (a git toplevel does not move).
 // NEGATIVE resolutions are cached only briefly: long enough that a burst of

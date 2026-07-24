@@ -4,9 +4,70 @@
 // the trusted `adlc` CLI, never from workspace imports (the installed plugin
 // is a bare clone with no node_modules).
 import {
-  readFileSync, existsSync, rmSync, mkdtempSync, openSync, readSync, fstatSync, closeSync, statSync,
+  readFileSync, existsSync, rmSync, mkdtempSync, openSync, readSync, fstatSync, closeSync, statSync, opendirSync,
+  constants as fsConstants,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, isAbsolute } from 'node:path';
+
+/**
+ * List up to `maxEntries` names in a directory via a streaming `opendirSync`
+ * iterator — never allocates an array of ALL entries, so an attacker-supplied
+ * directory with millions of files can't OOM the process. Returns [] on any
+ * error (missing dir, not a dir, etc.).
+ */
+export function readdirBounded(dir, maxEntries) {
+  let handle;
+  try {
+    handle = opendirSync(dir);
+    try {
+      const names = [];
+      while (names.length < maxEntries) {
+        const entry = handle.readSync();
+        if (entry === null) break; // directory exhausted
+        names.push(entry.name);
+      }
+      return names;
+    } finally {
+      handle.closeSync();
+    }
+  } catch {
+    return [];
+  }
+}
+
+// Hard cap on shard-directory entries scanned (DoS bound for an untrusted root).
+const MAX_SHARD_ENTRIES = 100_000;
+
+/**
+ * Read up to `maxBytes` of a REGULAR file, safely, from a possibly-untrusted
+ * path. Opens with O_NONBLOCK so opening a FIFO/device never blocks, then
+ * checks the type on the OPEN fd (no stat→read TOCTOU: the fd is bound to the
+ * inode even if the path is swapped) and reads a bounded amount. Returns null
+ * for a non-regular file or any error.
+ */
+function readRegularFileBounded(path, maxBytes) {
+  let fd;
+  try {
+    // open is OUTSIDE the inner try: if it throws, the outer catch handles it
+    // and there is no descriptor to close (so no `fd !== undefined` guard to
+    // get flipped). Inside, fd is always valid, so close is unconditional.
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile()) return null; // FIFO/dir/device → don't read
+      const length = Math.min(st.size, maxBytes);
+      const buf = Buffer.allocUnsafe(length);
+      // One bounded read — a regular file of this size fills in a single call;
+      // a (pathological) short read just yields partial JSON that fails to parse.
+      const n = readSync(fd, buf, 0, length, 0);
+      return buf.toString('utf8', 0, n);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { readActiveTicketPointer } from './generated-active-ticket.mjs';
@@ -91,6 +152,55 @@ export function makeKeyedCache(keyFn, readFn) {
     cache = { key, hasValue: true, value };
     return value;
   };
+}
+
+/**
+ * Ticket ids present in a repo's store, read DIRECTLY from the filesystem —
+ * never by spawning a subprocess with the (untrusted, event-supplied) repo as
+ * cwd. Reading directory entries and files is a pure read: an attacker who
+ * controls the directory cannot gain code execution from it (unlike running a
+ * config-loading CLI there). Sharded store: `<id>--<hash>.json` filenames.
+ * Legacy store: the `tickets` array in the flat `tickets.json`. Fails soft to
+ * []. (The store path is assembled with `join`, never written as a literal, so
+ * this reader stays clear of the ticket-store writer-boundary heuristic.)
+ */
+export function ticketIdsFromStore(repoRoot) {
+  // Require an ABSOLUTE path: a relative one (''/'.'/'./x') from an untrusted
+  // event payload would `join` against the process CWD and leak the HOST's
+  // store, not the worktree's. herdr supplies absolute worktree roots.
+  if (typeof repoRoot !== 'string' || !isAbsolute(repoRoot)) return [];
+  const ids = new Set();
+  const shardDir = join(repoRoot, '.adlc', 'tickets');
+  // `readdirBounded` fails soft to [] (missing/oversized dir), and every loop
+  // operation below acts on a string entry name, so this scan cannot throw —
+  // no try/catch needed around it (a dead catch would be an equivalent mutant).
+  for (const name of readdirBounded(shardDir, MAX_SHARD_ENTRIES)) {
+    if (!name.endsWith('.json')) continue;
+    // `<id>--<64-hex-hash>.json`. The id may itself contain '--' (e.g.
+    // `bug--login`), and a hand-copied file may have NO hash at all
+    // (`bug--login.json`). Disambiguate by shape: the trailing segment is
+    // the separator's hash ONLY if it's a 64-hex sha256; otherwise the whole
+    // base name (minus .json) is the id.
+    const base = name.slice(0, -'.json'.length);
+    const sep = base.lastIndexOf('--');
+    const id = sep >= 0 && /^[0-9a-f]{64}$/.test(base.slice(sep + 2)) ? base.slice(0, sep) : base;
+    if (id) ids.add(id);
+  }
+  const legacy = join(repoRoot, '.adlc', 'tickets.json');
+  try {
+    // Non-blocking, type-checked-on-fd, size-bounded read: an attacker-supplied
+    // FIFO can't block us and can't be swapped in via a stat→read TOCTOU, and a
+    // giant file can't exhaust memory.
+    const text = readRegularFileBounded(legacy, 8 * 1024 * 1024);
+    if (text !== null) {
+      const parsed = JSON.parse(text);
+      const list = Array.isArray(parsed?.tickets) ? parsed.tickets : [];
+      for (const t of list) if (typeof t?.id === 'string') ids.add(t.id);
+    }
+  } catch {
+    // malformed legacy store → ignore
+  }
+  return [...ids];
 }
 
 /** Read the active-ticket pointer through the repo's generated reader — the

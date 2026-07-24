@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { groupBacklog, readLedgerTail, readLedgerByTicket, readLatestPhase, readTicketsViaExport, storeCacheKey, makeKeyedCache } from '../lib/adlc-state.mjs';
+import { groupBacklog, readLedgerTail, readLedgerByTicket, readLatestPhase, readTicketsViaExport, storeCacheKey, makeKeyedCache, ticketIdsFromStore, readdirBounded } from '../lib/adlc-state.mjs';
 import { renderBoard } from '../lib/board-render.mjs';
 
 let repo;
@@ -120,6 +120,67 @@ test('readTicketsViaExport fails soft on exporter failure or a bad envelope', as
   assert.equal(await readTicketsViaExport(repo, { runExport: badExport }), null);
   const wrongShape = async (_r, outPath) => { writeFileSync(outPath, JSON.stringify([1])); return true; };
   assert.equal(await readTicketsViaExport(repo, { runExport: wrongShape }), null);
+});
+
+// ---- ticketIdsFromStore (filesystem read — the RCE-safe worktree.created path) ----
+
+test('ticketIdsFromStore reads ids from sharded shard filenames (hash-shape aware)', () => {
+  const h = 'a'.repeat(64); // a real shard hash is 64-hex
+  mkdirSync(join(repo, '.adlc', 'tickets'), { recursive: true });
+  writeFileSync(join(repo, '.adlc', 'tickets', `t-a--${h}.json`), '{}');
+  writeFileSync(join(repo, '.adlc', 'tickets', `t-b--${h}.json`), '{}');
+  writeFileSync(join(repo, '.adlc', 'tickets', 'notjson.txt'), 'x'); // ignored
+  writeFileSync(join(repo, '.adlc', 'tickets', 't-c.json'), '{}'); // no '--' → strip .json
+  writeFileSync(join(repo, '.adlc', 'tickets', `bug--login--${h}.json`), '{}'); // id has '--', real hash → id kept
+  writeFileSync(join(repo, '.adlc', 'tickets', 'feat--copy.json'), '{}'); // hand-copied, '--' in id, NO hash → whole id
+  assert.deepEqual(ticketIdsFromStore(repo).sort(), ['bug--login', 'feat--copy', 't-a', 't-b', 't-c']);
+});
+
+test('ticketIdsFromStore falls back to the legacy tickets.json array', () => {
+  writeAdlc('tickets.json', JSON.stringify({ tickets: [{ id: 'T1' }, { id: 'T2' }, { nope: true }] }));
+  assert.deepEqual(ticketIdsFromStore(repo).sort(), ['T1', 'T2']);
+});
+
+test('ticketIdsFromStore fails soft to [] on a missing store, a bad root, or malformed legacy json', () => {
+  assert.deepEqual(ticketIdsFromStore(repo), []); // no store yet
+  assert.deepEqual(ticketIdsFromStore(null), []);
+  assert.deepEqual(ticketIdsFromStore(join(repo, 'does-not-exist')), []);
+  writeAdlc('tickets.json', '{not json');
+  assert.deepEqual(ticketIdsFromStore(repo), []);
+});
+
+test('ticketIdsFromStore rejects any RELATIVE root — must not read a store from the process cwd', () => {
+  // Empty, '.', './x' would all `join` against the cwd and leak the host store.
+  for (const rel of ['', '.', './x', 'relative/path', '..']) {
+    assert.deepEqual(ticketIdsFromStore(rel), [], `${JSON.stringify(rel)} must fail closed`);
+  }
+});
+
+test('ticketIdsFromStore skips a legacy store that is not a regular file (FIFO/dir → no blocking read)', () => {
+  // A non-regular file at tickets.json (here: a directory) must be skipped, not
+  // read — a synchronous read of a FIFO would hang the event process.
+  mkdirSync(join(repo, '.adlc', 'tickets.json'), { recursive: true });
+  assert.deepEqual(ticketIdsFromStore(repo), []);
+});
+
+// ---- readdirBounded (DoS bound on an untrusted shard directory) ----
+
+test('readdirBounded stops at maxEntries — a huge dir can never be fully materialized', () => {
+  const d = join(repo, 'many');
+  mkdirSync(d, { recursive: true });
+  for (let i = 0; i < 5; i += 1) writeFileSync(join(d, `f${i}`), '');
+  // 5 files on disk, but a cap of 3 must return exactly 3 (never 4/5): pins the
+  // `names.length < maxEntries` bound so a mutation to <= or removal is caught.
+  assert.equal(readdirBounded(d, 3).length, 3);
+  // A cap at/above the count returns them all.
+  assert.equal(readdirBounded(d, 10).length, 5);
+});
+
+test('readdirBounded fails soft to [] for a missing or non-directory path', () => {
+  assert.deepEqual(readdirBounded(join(repo, 'nope'), 100), []);
+  const f = join(repo, 'afile');
+  writeFileSync(f, 'x');
+  assert.deepEqual(readdirBounded(f, 100), []); // a file is not a directory
 });
 
 // ---- storeCacheKey (mtime-gate for the board's export cache) ----
