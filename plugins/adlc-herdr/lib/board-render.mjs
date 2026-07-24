@@ -11,15 +11,24 @@ const RESET = '\x1b[0m';
 
 const clampWidth = (width) => Math.max(20, Math.min(Number.isFinite(width) ? width : 80, 400));
 
+/** The board's footer hint line (with its own SGR). Pure so the refresh-seconds
+ *  arithmetic is testable rather than buried in the stdout glue. */
+export function boardFooter(refreshMs) {
+  return `${DIM}↑↓/jk select · ↵ focus pane · q quit · refreshes every ${refreshMs / 1000}s${RESET}`;
+}
+
 /** Render the full board frame as a string of newline-joined rows. When
  *  `height` is given, the output is clamped to that many lines — the redraw
  *  uses cursor-home (not an alternate screen), so a frame taller than the pane
  *  would scroll and duplicate every refresh. A truncated frame ends with a
  *  "…N more" marker. */
-export function renderBoard({ width, height, repoRoot, active, phase, groups, paneRows, ledger }) {
+export function renderBoard({ width, height, repoRoot, active, phase, groups, paneRows, ledger, selected }) {
   const w = clampWidth(width);
   const cut = (text) => sanitizeToken(String(text), w);
   const lines = [];
+  // `selected` is the flat index of the highlighted ticket row across all three
+  // sections (t-herdr-7); a non-integer or out-of-range value marks nothing.
+  let ti = 0;
 
   const ticketLabel = active?.state === 'active' ? active.id : 'none';
   lines.push(`${BOLD}${cut(`ADLC board · repo ${repoRoot} · ticket ${ticketLabel}${phase ? ` · ${phase}` : ''}`)}${RESET}`);
@@ -37,7 +46,10 @@ export function renderBoard({ width, height, repoRoot, active, phase, groups, pa
     for (const [name, list] of sections) {
       lines.push(`${BOLD}${cut(`${name} (${list.length})`)}${RESET}`);
       for (const ticket of list) {
-        lines.push(cut(`  ${ticket.id} · ${ticket.title ?? ''}`));
+        const isSel = Number.isInteger(selected) && ti === selected;
+        const line = cut(`${isSel ? '> ' : '  '}${ticket.id} · ${ticket.title ?? ''}`);
+        lines.push(isSel ? `${BOLD}${line}${RESET}` : line);
+        ti += 1;
       }
     }
   }

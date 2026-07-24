@@ -6,7 +6,8 @@
 // actions do, gather via the tested libs, redraw every few seconds and on
 // resize, quit on q / Ctrl-C.
 import { appendFileSync } from 'node:fs';
-import { runHerdrJson, paneInfoArgs } from '../lib/herdr.mjs';
+import { emitKeypressEvents } from 'node:readline';
+import { runHerdr, runHerdrJson, paneInfoArgs } from '../lib/herdr.mjs';
 import { resolveRepoRoot } from '../lib/repo-root.mjs';
 import { parseContext, resolveTarget } from '../lib/actions.mjs';
 import {
@@ -14,9 +15,19 @@ import {
   readTicketsViaExport, storeCacheKey, makeKeyedCache,
 } from '../lib/adlc-state.mjs';
 import { buildPaneMap } from '../lib/panemap.mjs';
-import { renderBoard } from '../lib/board-render.mjs';
+import { renderBoard, boardFooter } from '../lib/board-render.mjs';
+import { flattenGroups, nextSelectedId, focusSelected, classifyKey, redrawBoard } from '../lib/board-nav.mjs';
 
 const REFRESH_MS = 3_000;
+
+// Row-selection state (t-herdr-7). The selection is tracked by stable ticket
+// *id* (`selectedId`), NOT by row index — the 3s background refresh can reorder
+// or drop tickets, and a raw index would then point at a different ticket (and
+// confirm on the wrong one). The render index is re-derived from the id on every
+// draw. `lastProps` is the last gathered frame so input handlers resolve rows
+// without re-gathering. `flatTickets` mirrors renderBoard's section order.
+let selectedId = null;
+let lastProps = null;
 
 // mtime-gate the ticket-store export: the board redraws every 3s, but
 // `readTicketsViaExport` spawns an `adlc` process, so re-exporting on every
@@ -70,7 +81,7 @@ function draw(body) {
   // Probed 2026-07-23: \x1b[2J leaves a herdr pane blank AND unreadable via
   // `pane read` — redraw with cursor-home + per-line erase-to-EOL + erase-
   // below instead of a full clear.
-  const footer = `\x1b[2mq to quit · refreshes every ${REFRESH_MS / 1000}s\x1b[0m`;
+  const footer = boardFooter(REFRESH_MS);
   const frameText = `${body}\n\n${footer}`.split('\n').map((line) => `${line}\x1b[K`).join('\n');
   process.stdout.write(`\x1b[H${frameText}\n\x1b[0J`);
 }
@@ -85,19 +96,46 @@ async function frame(repoRoot) {
   if (framing) return;
   framing = true;
   try {
-    draw(renderBoard(await gather(repoRoot)));
+    lastProps = await gather(repoRoot);
+    redraw();
+  } catch (err) {
+    // A transient gather failure (an adlc/herdr subprocess hiccup) must never
+    // tear down the pane — keep the last good frame and retry next tick. This
+    // also covers the first, awaited frame, which would otherwise exit the board.
+    trace(`frame error: ${err}`);
   } finally {
     framing = false;
   }
 }
 
+// Redraw from the cached frame (no re-gather) — instant selection feedback.
+// redrawBoard suppresses the draw until the first frame has loaded, so an early
+// keypress can't wipe the "loading…" screen.
+function redraw() {
+  redrawBoard({ props: lastProps, selectedId, render: renderBoard, draw });
+}
+
+function move(direction) {
+  selectedId = nextSelectedId(selectedId, direction, flattenGroups(lastProps?.groups));
+  redraw();
+}
+
 function armInput(onQuit) {
+  // readline keypress events parse ANSI escape sequences and coalesced chunks
+  // into atomic keys — a raw `data` chunk can carry several keystrokes (paste,
+  // fast typing, SSH) and whole-chunk equality would drop them. classifyKey owns
+  // the routing decision and focusSelected owns the run decision (both tested);
+  // this glue only maps a command name to its effect.
+  emitKeypressEvents(process.stdin);
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();
-  process.stdin.on('data', (chunk) => {
-    const key = chunk.toString();
-    if (key === 'q' || key === 'Q' || key === '\x03') onQuit();
-  });
+  const commands = {
+    quit: onQuit,
+    up: () => move('up'),
+    down: () => move('down'),
+    focus: () => focusSelected({ selectedId, groups: lastProps?.groups, paneRows: lastProps?.paneRows, run: runHerdr }),
+  };
+  process.stdin.on('keypress', (str, key) => { commands[classifyKey(str, key)]?.(); });
 }
 
 // Last-start breadcrumb into the plugin's state dir — the supportability
