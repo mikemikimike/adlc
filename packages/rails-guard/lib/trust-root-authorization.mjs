@@ -76,22 +76,59 @@ export function classifyTrustRootAuthorization({
   };
 }
 
-// Minimal CODEOWNERS pattern matcher (gitignore-style), used to resolve the
-// owners of a changed trust-root path. A leading `/` anchors to the repo root;
-// `*` does not cross `/`; `**` crosses; a trailing `/` matches a directory
-// subtree; an un-anchored pattern also matches by basename (CODEOWNERS
-// semantics). Over-matching only WIDENS the owner set — an added owner must
-// still produce a real approving review — while under-matching removes owners
-// and denies, so both directions fail safe for authorization.
+// Minimal CODEOWNERS pattern matcher (gitignore-style), used both to resolve the OWNERS
+// of a changed trust-root path and — since #140 — to answer COVERAGE ("does anyone own the
+// deployed workflow?").
+//
+// Those two uses have OPPOSITE safety directions, which is what makes this function
+// delicate. For owner resolution, over-matching only widens the owner set (an added owner
+// must still produce a real approving review) and under-matching just denies. For COVERAGE,
+// over-matching is a fail-OPEN: a path GitHub treats as ownerless gets reported as
+// protected. So every rule below is written to the stricter reading.
+//
+// Supported: a leading `/` anchors to the repo root; `?` matches exactly one non-`/`
+// character; `*` does not cross `/`; `**` crosses `/` ONLY when it is a whole slash-
+// delimited segment (`**/x`, `a/**/b`, `a/**`) — elsewhere it degrades to `*`, per
+// gitignore; a trailing `/` matches paths UNDER that directory and never the directory
+// path itself; an un-anchored pattern also matches by basename.
+//
+// KNOWN LIMIT — this is deliberately NOT a complete gitignore implementation, and the
+// remaining gaps all UNDER-match (character classes `[a-z]`, a bare unanchored `dir/`
+// matching at any depth, `\` escapes). Under-matching fails CLOSED in both uses: coverage
+// reports "ownerless" and refuses to enable, owner resolution drops an owner and denies.
+// Widening it is tracked separately, because a more permissive matcher risks reintroducing
+// exactly the over-match fail-opens this function has already had.
 export function codeownersMatch(pattern, path) {
   let p = String(pattern ?? '');
   const anchored = p.startsWith('/');
   if (anchored) p = p.slice(1);
   const dir = p.endsWith('/');
   if (dir) p = p.slice(0, -1);
-  const rx = p
+
+  // `?` and `*` are wildcards, not regex syntax. `?` in particular must CONSUME a
+  // character: left unescaped it acted as a quantifier making the preceding character
+  // optional, so `<workflow>?` matched `<workflow>` and falsely attested coverage.
+  const segmentToRegex = (segment) => segment
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*|\*/g, (m) => (m === '**' ? '.*' : '[^/]*'));
-  const re = new RegExp(dir ? `^${rx}(?:/.*)?$` : `^${rx}$`);
+    .replace(/\*+|\?/g, (m) => (m === '?' ? '[^/]' : '[^/]*'));
+
+  // Build per SEGMENT so `**` only crosses `/` where gitignore says it does. Treating any
+  // `**` as `.*` let `.github**adlc-rails-guard.yml` match the workflow three directories
+  // away — an over-match, and therefore a coverage fail-open.
+  const segments = p.split('/');
+  let rx = '';
+  segments.forEach((segment, index) => {
+    const last = index === segments.length - 1;
+    if (segment === '**') {
+      // Trailing `/**` is "everything below"; an interior or leading `**/` is "zero or
+      // more directories", so the separator lives INSIDE the group and none is appended.
+      rx += last ? '.*' : '(?:[^/]+/)*';
+      return;
+    }
+    rx += segmentToRegex(segment);
+    if (!last) rx += '/';
+  });
+
+  const re = new RegExp(dir ? `^${rx}/.*$` : `^${rx}$`);
   return re.test(path) || (!anchored && re.test(String(path ?? '').split('/').pop()));
 }
