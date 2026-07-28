@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DirectoryTicketStore, LegacyTicketStore, TicketService, pendingTransactions, ticketFilename } from '../index.mjs';
+import { DirectoryTicketStore, LegacyTicketStore, TicketService, deepClone, pendingTransactions, ticketFilename } from '../index.mjs';
 import { ticket, writeDirectory, writeLegacy } from './helpers.mjs';
 
 test('service plans are dry, hash-bound, intent-specific, and preserve unrelated shard bytes', () => {
@@ -179,4 +179,145 @@ test('#235 — completing a legacy ticket with a manifest rail is unaffected', (
     const after = service.apply(plan);
     assert.equal(after.get('A').completed, true);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/** A service over a scratch directory store, with cleanup. */
+function withService(tickets, fn) {
+  const root = mkdtempSync(join(tmpdir(), 'adlc-tickets-lifecycle-'));
+  try {
+    const service = new TicketService(new DirectoryTicketStore(writeDirectory(root, tickets)), { root });
+    return fn(service);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
+
+test('update treats a lifecycle change as sensitive, so it carries evidence', () => {
+  // planComplete records `completed` as an evidence-bearing lifecycle change.
+  // Generic update replaces the WHOLE ticket, so setting that field through it
+  // slipped past the lifecycle path entirely: a scheduler then skips unfinished
+  // work with no completion record in the manifest. This reuses the existing
+  // sensitivity mechanism rather than inventing a second one — rail-narrowing
+  // and scope-widening already work exactly this way.
+  withService([ticket('T1')], (service) => {
+    const hash = service.snapshot().ticketHashes.T1;
+    assert.throws(
+      () => service.planUpdate('T1', { ...ticket('T1'), completed: true }, { expect: hash }),
+      (error) => error.code === 'AUTHORIZATION_REQUIRED' && /lifecycle-change/.test(error.message),
+      'setting completed through update must require authorization',
+    );
+    const authorized = service.planUpdate('T1', { ...ticket('T1'), completed: true }, { expect: hash, authorized: true });
+    assert.ok(authorized.sensitive.includes('lifecycle-change'));
+    assert.equal(authorized.evidenceRequired, true, 'and must be evidence-bearing');
+  });
+});
+
+test('clearing or dropping completed is the same lifecycle change', () => {
+  // Reopening finished work, and silently losing the flag by omitting it from a
+  // replacement document, are the same transition in the other direction. The
+  // omission case is the one an author hits by accident.
+  withService([ticket('T1', { completed: true })], (service) => {
+    const hash = service.snapshot().ticketHashes.T1;
+    for (const input of [{ ...ticket('T1'), completed: false }, ticket('T1')]) {
+      assert.throws(
+        () => service.planUpdate('T1', input, { expect: hash }),
+        (error) => error.code === 'AUTHORIZATION_REQUIRED' && /lifecycle-change/.test(error.message),
+      );
+    }
+  });
+});
+
+test('an update that leaves completed alone stays unsensitive', () => {
+  // The guard must not tax ordinary edits: a title change on a completed ticket
+  // carries the flag through untouched and needs no authorization.
+  withService([ticket('T1', { completed: true })], (service) => {
+    const hash = service.snapshot().ticketHashes.T1;
+    const plan = service.planUpdate('T1', { ...ticket('T1'), completed: true, title: 'renamed' }, { expect: hash });
+    assert.deepEqual(plan.sensitive, []);
+  });
+});
+
+test('lifecycle detection matches how consumers actually read the flag', () => {
+  // Every downstream reader uses `completed === true` — coldstart, fleet,
+  // merge-forecast, model-router, ticket-prune. A Boolean() comparison here
+  // therefore missed a real transition: `"completed":"false"` is truthy, so
+  // Boolean() saw no change, while every scheduler saw the ticket become
+  // UNCOMPLETED and queued finished work again, with no lifecycle evidence.
+  const truthyNotTrue = ['false', 'no', 0, 1, {}, [], 'true'];
+  withService([ticket('T1', { completed: true })], (service) => {
+    const hash = service.snapshot().ticketHashes.T1;
+    for (const value of truthyNotTrue) {
+      assert.throws(
+        () => service.planUpdate('T1', { ...ticket('T1'), completed: value }, { expect: hash }),
+        (error) => error.code === 'AUTHORIZATION_REQUIRED' && /lifecycle-change/.test(error.message),
+        `completed: ${JSON.stringify(value)} must count as leaving the completed state`,
+      );
+    }
+  });
+});
+
+test('absent and false are the same non-completed state, not a transition', () => {
+  withService([ticket('T1')], (service) => {
+    const hash = service.snapshot().ticketHashes.T1;
+    const plan = service.planUpdate('T1', { ...ticket('T1'), completed: false }, { expect: hash });
+    assert.deepEqual(plan.sensitive, [], 'absent -> false is not a lifecycle change');
+  });
+});
+
+test('deepClone refuses values JSON cannot round-trip', () => {
+  // The declaration says `<T extends JsonValue>(value: T): T`, so a consumer
+  // cloning numeric data keeps the `number` type. JSON turns NaN and the
+  // infinities into null, so that promise was still false for them and a
+  // following `.toFixed()` compiled and threw. Fail closed at the boundary
+  // instead, which makes the declared contract true for everything that returns.
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    assert.throws(() => deepClone({ value: bad }), /non-finite/i, `deepClone must reject ${bad}`);
+    assert.throws(() => deepClone([bad]), /non-finite/i);
+    assert.throws(() => deepClone(bad), /non-finite/i);
+  }
+});
+
+test('deepClone still clones ordinary JSON data unchanged', () => {
+  // NB: no -0 here. JSON serializes it as 0, but TypeScript has no -0 type, so
+  // that round-trip does not violate the declaration the way NaN -> null does.
+  const source = { a: 1, b: [2, 3.5, 0], c: { d: 'x', e: null, f: true } };
+  const clone = deepClone(source);
+  assert.deepEqual(clone, source);
+  assert.notEqual(clone, source, 'it must be a copy, not the same reference');
+  assert.notEqual(clone.c, source.c, 'and a deep one');
+});
+
+test('deepClone refuses array positions JSON turns into null', () => {
+  // A sparse or undefined-bearing array survives JSON as [null], so a consumer
+  // holding a `number[]` got null and threw on the first numeric method — the
+  // declared type was still number[]. Object properties are deliberately NOT
+  // covered: JSON drops an undefined property, and dropping an OPTIONAL
+  // property is type-compatible.
+  assert.throws(() => deepClone(new Array(1)), /array index/, 'a hole must be rejected');
+  assert.throws(() => deepClone([1, undefined, 3]), /array index/);
+  assert.throws(() => deepClone([() => {}]), /array index/);
+  assert.throws(() => deepClone([Symbol('x')]), /array index/);
+  assert.deepEqual(deepClone({ optional: undefined, kept: 1 }), { kept: 1 }, 'a dropped optional property is fine');
+});
+
+test('deepClone refuses arrays carrying non-index properties', () => {
+  // JSON serializes only an array's INDEX properties, so this value loses
+  // `meta` while keeping its declared type — the clone type-checks and the
+  // property is simply gone at runtime.
+  const tagged = Object.assign([1, 2], { meta: 'kept' });
+  assert.throws(() => deepClone(tagged), /non-index array/);
+  assert.deepEqual(deepClone([1, 2]), [1, 2], 'a plain array is unaffected');
+  assert.deepEqual(deepClone({ list: [1, 2] }), { list: [1, 2] }, 'and so is a nested one');
+});
+
+test('deepClone rejects numeric-looking keys JSON does not treat as indices', () => {
+  // "01" and "4294967295" pass a naive /^\d+$/ index test but are NOT canonical
+  // array indices, so JSON.stringify drops them. Symbol keys are dropped too and
+  // Object.keys cannot even see them.
+  for (const key of ['01', '4294967295', '1e2', ' 1']) {
+    const tagged = Object.assign([1, 2], { [key]: 'metadata' });
+    assert.throws(() => deepClone(tagged), /non-index array key/, `key ${JSON.stringify(key)} must be rejected`);
+  }
+  const symbolTagged = Object.assign([1, 2], { [Symbol('meta')]: 'x' });
+  assert.throws(() => deepClone(symbolTagged), /non-index array key/, 'a symbol key must be rejected');
+  // Canonical indices are of course fine.
+  assert.deepEqual(deepClone(Object.assign([], { 0: 'a', 1: 'b' })), ['a', 'b']);
 });

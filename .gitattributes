@@ -1,0 +1,42 @@
+# LF everywhere, in the index AND in the working tree on every platform.
+#
+# The first version of this file pinned only packages/tickets/schemas/*.json,
+# because that is the artifact whose drift gate went red on the Windows leg of
+# the ticket-store matrix: git hands that leg CRLF, the byte comparison against
+# the generator sees every line differ, and `npm pack` from such a checkout
+# would ship a schema whose bytes are not the generated ones.
+#
+# That scope was too narrow — it fixes one artifact and leaves the NEXT
+# generated file someone byte-compares to rediscover the same bug (cross-model
+# review, MEDIUM). Repo-wide costs nothing HERE, and that was measured rather
+# than assumed: under this file `git add --renormalize .` rewrites zero tracked
+# files, no tracked file contains a CR byte, and the repo has no .bat/.cmd/.ps1
+# that would want CRLF. `text=auto` still auto-detects binary, so images and
+# archives are left alone.
+#
+# KNOWN LIMIT: git does not retroactively renormalize a working tree that already
+# exists. CI clones fresh, so it is unaffected; a Windows contributor with an
+# older checkout runs `git add --renormalize .` once.
+* text=auto eol=lf
+
+# Declared binary rather than left to the NUL-byte heuristic. Every binary in
+# the tree today is a PNG or an ICO and every one of them contains NUL bytes, so
+# `text=auto` already classifies them correctly — verified, `git add
+# --renormalize .` rewrites zero files. This is for the file added LATER: a
+# binary format with no NUL byte in its first 8k would be read as text and
+# rewritten on checkout, and the rule above is what would do it.
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.gz binary
+*.zip binary
+
+# A fixture whose CRLF is its SUBJECT must opt out here, next to this note —
+# the rule above would otherwise normalize the very bytes under test. None
+# exists today; this is where it goes.

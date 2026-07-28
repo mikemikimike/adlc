@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { readFileSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import {
   DirectoryTicketStore,
   LegacyTicketStore,
@@ -10,6 +8,7 @@ import {
   TicketService,
   TicketStoreError,
   archiveTicket,
+  categoryWarning,
   detectTicketStore,
   doctorTicketStore,
   exitCodeFor,
@@ -17,35 +16,20 @@ import {
   migrateLegacyStore,
   offerLegacyMigration,
   pendingTransactions,
+  planEditSession,
   recoverDirectoryTransaction,
   recoverMigration,
   restoreTicket,
+  renderCommandHelp,
+  renderUsage,
   serializePlan,
+  ticketJsonSchema,
 } from '../index.mjs';
-
-function usage() {
-  console.log(`adlc ticket <command> [options]
-
-Commands:
-  list | show <id>
-  create --input <path|-> [--write]
-  update <id> --input <path|-> --expect <ticket-hash> [--write]
-  edit <id> [--write]
-  discard <id> [--write]
-  complete <id> [--write --authorize]
-  archive <id> [--write --authorize] | restore <id> [--write --authorize]
-  doctor [--archive] | store status
-  store migrate [--write --yes] | store recover (--complete|--rollback)
-  store export --output <path>
-
-All mutations are dry-run by default. New override: --ticket-store/ADLC_TICKET_STORE.
-Legacy --tickets/ADLC_TICKETS remains available through 1.x.`);
-}
 
 function parse(argv) {
   const flags = {};
   const positionals = [];
-  const boolean = new Set(['write', 'json', 'yes', 'authorize', 'archive', 'complete', 'rollback', 'help']);
+  const boolean = new Set(['write', 'json', 'yes', 'authorize', 'archive', 'complete', 'rollback', 'help', 'force']);
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (!value.startsWith('--')) { positionals.push(value); continue; }
@@ -78,9 +62,16 @@ function emit(value, json) {
 
 async function main() {
   const { flags, positionals } = parse(process.argv.slice(2));
-  if (flags.help || positionals.length === 0) { usage(); return; }
-  const root = resolve(flags.root ?? '.');
   const command = positionals[0];
+  // Resolve --help against the command BEFORE anything touches the store, so
+  // `create --help` answers "what shape is the input document?" rather than
+  // reprinting the generic usage, and answers it in a repo with no store yet.
+  if (flags.help || positionals.length === 0) {
+    console.log((command && renderCommandHelp(command)) || renderUsage());
+    return;
+  }
+  if (command === 'schema') { emit(ticketJsonSchema(), true); return; }
+  const root = resolve(flags.root ?? '.');
   const storeCommand = command === 'store' ? positionals[1] : null;
   if (storeCommand === 'migrate') {
     emit(migrateLegacyStore(root, { write: Boolean(flags.write), yes: Boolean(flags.yes) }), flags.json);
@@ -133,24 +124,50 @@ async function main() {
   store = await offerLegacyMigration(store, root, flags, { emit: (value) => emit(value, false) });
   const service = new TicketService(store, { root });
   let plan;
+  // Set only by the edit command. The draft survives a dry run and is removed
+  // after a successful write; anything else prints where it is.
+  let editDraftPath = null;
   if (command === 'create') {
     if (!flags.input) throw new TicketStoreError('invalid', 'INPUT_REQUIRED', 'create requires --input');
-    plan = service.planCreate(await readInput(flags.input));
+    const input = await readInput(flags.input);
+    // Advisory, never fatal: the store accepts any category and the published
+    // schema must stay permissive, but an author who picks a plausible-looking
+    // one only finds out when a later sync fails closed on the remote block.
+    const warning = categoryWarning(input?.category);
+    if (warning) console.error(warning);
+    plan = service.planCreate(input);
   } else if (command === 'update') {
     if (!flags.input) throw new TicketStoreError('invalid', 'INPUT_REQUIRED', 'update requires --input');
-    plan = service.planUpdate(positionals[1], await readInput(flags.input), { expect: flags.expect, authorized: Boolean(flags.authorize) });
+    // update REPLACES the ticket, so a document exported before someone else's
+    // write silently discards their work. Applying that without a hash is
+    // last-writer-wins on a trust root, so --write fails closed. Planning is
+    // deliberately still open: a dry run is how you inspect a change safely.
+    if (flags.write && !flags.expect && !flags.force) {
+      throw new TicketStoreError(
+        'policy',
+        'EXPECT_REQUIRED',
+        'update --write requires --expect <ticketHash> so a concurrent write cannot be silently overwritten. '
+        + 'Take the hash from `adlc ticket show <id> --json`, or pass --force to replace whatever is there now.',
+      );
+    }
+    const updateInput = await readInput(flags.input);
+    const updateWarning = categoryWarning(updateInput?.category);
+    if (updateWarning) console.error(updateWarning);
+    // --force means "replace whatever is there now", so it must also DROP a
+    // hash the caller supplied. Passing it through left the documented override
+    // doing nothing: the rerun failed STALE_TICKET on the same stale hash.
+    plan = service.planUpdate(positionals[1], updateInput, {
+      expect: flags.force ? undefined : flags.expect,
+      authorized: Boolean(flags.authorize),
+    });
   } else if (command === 'edit') {
-    const ticket = service.snapshot().get(positionals[1]);
-    if (!ticket) throw new TicketStoreError('invalid', 'TICKET_NOT_FOUND', `ticket not found: ${positionals[1]}`);
-    const directory = mkdtempSync(join(tmpdir(), 'adlc-ticket-edit-'));
-    const path = join(directory, `${basename(positionals[1])}.json`);
-    try {
-      writeFileSync(path, `${JSON.stringify(ticket, null, 2)}\n`);
-      const editor = process.env.EDITOR || process.env.VISUAL;
-      if (!editor) throw new TicketStoreError('operational', 'EDITOR_NOT_SET', 'set $EDITOR or $VISUAL');
-      execFileSync(editor, [path], { stdio: 'inherit' });
-      plan = service.planUpdate(ticket.id, JSON.parse(readFileSync(path, 'utf8')), { expect: service.snapshot().ticketHashes[ticket.id], authorized: Boolean(flags.authorize) });
-    } finally { rmSync(directory, { recursive: true, force: true }); }
+    const session = planEditSession(service, positionals[1], {
+      authorized: Boolean(flags.authorize),
+      editor: process.env.EDITOR || process.env.VISUAL,
+      onEdited: (edited) => { const w = categoryWarning(edited?.category); if (w) console.error(w); },
+    });
+    plan = session.plan;
+    editDraftPath = session.draftPath;
   } else if (command === 'discard') plan = service.planDiscard(positionals[1]);
   else if (command === 'complete') plan = service.planComplete(positionals[1], { authorized: Boolean(flags.authorize) });
   else if (command === 'archive' || command === 'restore') {
@@ -165,8 +182,28 @@ async function main() {
   }
   emit({ ...serializePlan(plan), dryRun: !flags.write }, flags.json);
   if (flags.write) {
-    const applied = service.apply(plan);
+    let applied;
+    try {
+      applied = service.apply(plan);
+    } catch (error) {
+      // Everything after planEditSession returns is outside its protection, and
+      // apply is where a concurrent writer or a held lock actually bites —
+      // STALE_SNAPSHOT, LOCK_TIMEOUT, a transaction failure. The draft survives
+      // in a randomly named temp directory, so an error that does not name it
+      // loses the author's work just as thoroughly as deleting it would.
+      if (editDraftPath && error && typeof error.message === 'string') {
+        error.message = `${error.message} (your edit is preserved at ${editDraftPath})`;
+      }
+      throw error;
+    }
     emit({ applied: true, storeHash: applied.hash, ticketHash: plan.ticketId ? applied.ticketHashes[plan.ticketId] : null }, flags.json);
+    // Applied: the edit is in the store, so the draft has served its purpose.
+    if (editDraftPath) rmSync(dirname(editDraftPath), { recursive: true, force: true });
+  } else if (editDraftPath) {
+    // Dry run — `edit` without --write is the DEFAULT invocation. The plan was
+    // only previewed, so the edited document is the author's sole copy; saying
+    // where it is turns "my work vanished" into "re-run with --input".
+    console.error(`edit not applied (dry run); your edited ticket is at ${editDraftPath}`);
   }
 }
 
