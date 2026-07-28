@@ -166,12 +166,66 @@ author identity now comes from the prosecution invocation (not a self-report), a
 is an auditable, revision-bound, append-only, distinct-provider, author-anchored entry. See
 [ADR-0007](../../docs/adr/0007-multimodel-adversarial-review.md).
 
+## Truncation anti-rollback anchor (opt-in, #355)
+
+**This is a hardening mode for this repo's own dogfooding. It is NOT a required ADLC
+capability — no adopter needs or is expected to use it.**
+
+The cross-model gate above closes **forgery** (signatures cover the entry) and **rewrite**
+(the hash chain + per-entry signature reject an edited-in-place line) — see the HONEST LIMIT
+comment in `lib/cross-model.mjs`. One gap remained: an author who controls the PR branch can
+**truncate** the manifest, dropping a signed `needs-attention` revocation entirely and leaving
+a valid, shorter, validly-signed chain ending in an earlier genuine `approve`. Because the
+revision hash excludes manifest paths (so recording an attestation doesn't change what it's
+attesting to), the dropped revocation is invisible to a required check alone — it evaluates
+only the truncated tree.
+
+`lib/attestation-store.mjs` closes it with a protected-ref mirror: an orphan branch
+(`adlc-attestations`, ruleset-protected — see
+`docs/github-rulesets/adlc-attestations-ruleset.json`) holds every signed cross-model entry a
+trusted CI run has ever observed, appended by the new `mirror-attestations` subcommand. `tier-check`
+gains an optional `--attestation-store <path>` flag; when passed, a signed entry the store has
+seen that is missing from the PR's own manifest fails the gate closed with a distinct
+"ROLLBACK/TRUNCATION DETECTED" message (separate from "no attestation" and "chain broken").
+**Omitting the flag reproduces today's behavior exactly** — this is why the mechanism is
+opt-in rather than baked into the shared library's default path. Only this repo's own
+`.github/workflows/cross-model-gate.yml` is wired to use it (that workflow has never been a
+distributed template, unlike `docs/ci/*.yml`).
+
+**Documented residual limit**: a revocation is protected only once a trusted CI run has
+observed it (pushed to the PR and the workflow ran at least once before truncation). A
+recorded-but-never-pushed revocation is invisible to everyone — the same exposure as an
+unsubmitted review. This is strictly better than the forgery/rewrite-only gate above, not a
+claim of completeness.
+
+**A tampered or key-rotated store entry FAILS CLOSED, not silently ignored.** `readObservedAttestations`
+and `mirrorObservedAttestations` both throw if any store entry's signature does not verify —
+this is either an `ADLC_MANIFEST_KEY` rotation (every historical store entry needs migrating
+onto the new key, the same treatment the main manifest chain already requires) or tampering by
+whoever has bypass-level write access to `adlc-attestations`. Rotating the signing key is
+therefore a migration event for this store too: rebootstrap or re-sign it, don't expect
+`tier-check --attestation-store` to keep working across a rotation without that step.
+
+**Observed entries are scoped by `(revision, authorProvider)`, not by PR/branch identity — deliberately.**
+Two different PRs that coincidentally produce a byte-identical reviewed change (same base, same
+diff — a duplicate branch, for instance) share observed-entry history, so a revocation mirrored
+from one can block the other. This is intentional, not a gap: `revision` (the change-set identity
+from #365) already means "the identity of the reviewed change," and #365's own carry-forward
+feature treats an identical change-set digest as grounds to carry a verdict *forward*. Treating an
+identical digest as grounds to carry a *revocation* forward too is the symmetric, consistent
+consequence — adding a PR-unique discriminator to avoid this would let an attacker dodge a revoked
+review by opening a new PR with byte-identical content. See
+[the design doc](../../docs/superpowers/specs/2026-07-28-cross-model-truncation-anchor-design.md)
+for the full threat model, the premortem/parallax findings that shaped the final design, and
+why the store path must live outside the tree being tiered.
+
 ## Exit codes
 
 - `0`: two consecutive dry passes were recorded (or a finding/attestation was recorded)
 - `1`: operational error
 - `2`: verified/needs-human findings remain, the convergence budget ended before two dry
-  passes, or a trust-root-tier change lacks a matching cross-model attestation
+  passes, a trust-root-tier change lacks a matching cross-model attestation, or (with
+  `--attestation-store`) a rollback/truncation was detected
 
 ## Core gaps
 

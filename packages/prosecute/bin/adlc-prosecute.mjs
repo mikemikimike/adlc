@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { parseArgs, printJson, opError, recordFinding, git, repoRoot, changedFiles, splitNulPaths, untrackedNonIgnoredPaths } from '@adlc/core';
+import { parseArgs, printJson, opError, recordFinding, git, repoRoot, changedFiles, splitNulPaths, untrackedNonIgnoredPaths, readEntries } from '@adlc/core';
 import { detectTicketStore, GitTreeTicketStore } from '@adlc/tickets';
 import { runProsecution, resolveProsecutionRevision, revisionIgnorePaths } from '../lib/run.mjs';
 import { classifyTrustRootTier } from '../lib/tier.mjs';
-import { recordCrossModelReview, carryForwardCrossModelReview, hasCrossModelApproveForRevision, manifestChainTrustworthy, manifestChainBreakReason } from '../lib/cross-model.mjs';
+import { recordCrossModelReview, carryForwardCrossModelReview, hasCrossModelApproveForRevision, manifestChainTrustworthy, manifestChainBreakReason, CROSS_MODEL_GATE, scopeObservedEntriesToAuthor } from '../lib/cross-model.mjs';
+import { readObservedAttestations, assertNoTruncation, mirrorObservedAttestations } from '../lib/attestation-store.mjs';
 import { getKey } from '@adlc/gate-manifest/lib/sign.mjs';
 import { loadManifestKeyFromEnvLocal } from '../lib/load-env-local.mjs';
 
@@ -165,6 +166,10 @@ const { values, positionals } = parseArgs({
     // revision-binding carry-forward — carry an EXISTING approve forward onto a moved base without a fresh review,
     // when the reviewed change itself is unchanged (see carryForwardCrossModelReview).
     'carry-forward': { type: 'string' },
+    // #355 truncation anti-rollback anchor: OPTIONAL direct file path to the
+    // protected-ref attestation store. Omitted → tier-check behaves exactly as
+    // before (#354). Used by both `tier-check` and `mirror-attestations`.
+    'attestation-store': { type: 'string' },
     // --record-finding mode: land one CONFIRMED prosecution finding in the
     // findings ledger so P7 lesson-foundry can cluster it (closes the P5→P7 loop).
     'record-finding': { type: 'boolean', default: false },
@@ -213,6 +218,21 @@ ADLC P5 review-evidence recorder.
       a FRESH distinct-provider review is required. --provider/--author-provider/--verdict
       are not accepted here: the carried entry keeps the ORIGINAL review's identity.
 
+  tier-check ... [--attestation-store PATH]
+      OPTIONAL: pass a direct file path to a protected-ref attestation store to
+      also detect a dropped signed entry (TRUNCATION) that the manifest alone
+      cannot see. Omitting this flag reproduces prior behavior exactly — this is
+      opt-in hardening, not a required capability. The store path MUST be
+      OUTSIDE the tree being tiered (like the ./_pr sibling-worktree pattern), or
+      its own presence perturbs the working-tree revision hash.
+
+  mirror-attestations --attestation-store PATH [--dir .adlc]
+      Append every valid (signature-verified) cross-model entry from the
+      manifest under --dir not already in the store at PATH, deduped by
+      signature. Requires ADLC_MANIFEST_KEY. Intended for the trusted CI
+      workflow, run BEFORE tier-check, against a base-controlled store path —
+      never a PR-controlled one.
+
   --record-finding --file <path> --desc "<prose>" [--category <lens>] [--severity <s>] [--line <n>] [--verdict <v>] [--dir .adlc]
       Record ONE confirmed prosecution finding to <dir>/findings.jsonl for P7
       (lesson-foundry). Call once per surviving finding on a NOT-CLEAR verdict.
@@ -224,6 +244,7 @@ Exit codes:
   1  operational error (e.g. a finding missing --file/--desc — fails closed)
   2  verified findings remain, dry-pass convergence failed, or a trust-root-tier
      change lacks a matching cross-model attestation
+     (with --attestation-store: also a rollback/truncation being detected)
 `);
   process.exit(0);
 }
@@ -355,6 +376,49 @@ if (positionals[0] === 'record-cross-model') {
   process.exit(0);
 }
 
+// --- mirror-attestations subcommand (#355: append newly-observed cross-model entries to
+// the protected-ref attestation store) ---
+// Called by the trusted workflow ONLY, BEFORE the gate step, against a base-controlled
+// store path (never a PR-controlled one). Only ever mirrors CROSS_MODEL_GATE entries —
+// this store exists solely to anchor that one gate's history outside the PR-controlled tree.
+if (positionals[0] === 'mirror-attestations') {
+  if (!values['attestation-store']) opError('mirror-attestations requires --attestation-store PATH');
+  const key = getKey();
+  if (!key) opError('mirror-attestations requires ADLC_MANIFEST_KEY to verify which entries are trustworthy to mirror');
+  // #355 round-3 cross-model review (codex): each entry's OWN signature is still
+  // verified inside mirrorObservedAttestations, but that alone is not enough — a
+  // signed entry copied out of context from an unrelated, legitimate manifest is
+  // individually valid yet says nothing trustworthy about THIS manifest. Refuse to
+  // write to the shared, permanent store from a manifest whose chain does not
+  // verify; the later gate step will reject this PR anyway, but the store must
+  // never be poisoned with entries from an untrustworthy read. A malformed/
+  // unparseable line is ALREADY covered here, not a separate case: verify()
+  // (called by manifestChainTrustworthy) returns invalid on the first line it
+  // cannot JSON.parse, before readEntries' tolerant `skipped` collection could
+  // ever matter — checking `skipped` again here would be unreachable dead code.
+  if (!manifestChainTrustworthy(values.dir)) {
+    opError(`mirror-attestations: the manifest chain at ${values.dir} does not verify — refusing to mirror from an untrustworthy manifest into the shared attestation store`);
+  }
+  const { entries } = readEntries('manifest', values.dir);
+  const crossModelEntries = entries.filter((entry) => (entry.gate ?? entry.type) === CROSS_MODEL_GATE);
+  let appended;
+  try {
+    appended = mirrorObservedAttestations({ prEntries: crossModelEntries, storePath: values['attestation-store'], key });
+  } catch (err) {
+    // #355 round-5 cross-model review (codex): the store itself can be tampered with
+    // (or the key rotated) — mirrorObservedAttestations fails closed rather than
+    // silently continuing onto a corrupted store. Surface it through the CLI's
+    // normal error path, not an uncaught exception.
+    opError(err.message);
+  }
+  if (values.json) {
+    printJson({ appended });
+  } else {
+    console.log(`mirror-attestations: appended ${appended} new cross-model attestation(s) to ${values['attestation-store']}`);
+  }
+  process.exit(0);
+}
+
 // --- tier-check subcommand (#326: the CI trust-root cross-model gate) ---
 // Classify the change; if trust-root tier, REQUIRE a distinct-provider cross-model
 // approve bound to the reviewed revision (fail closed). Always surfaces the tier
@@ -410,7 +474,24 @@ if (positionals[0] === 'tier-check') {
     process.exit(2);
   }
 
-  const satisfied = hasCrossModelApproveForRevision({ dir: values.dir, revision, authorProvider, key });
+  // #355 truncation anti-rollback anchor — OPTIONAL. Reading the store here (rather than
+  // inside hasCrossModelApproveForRevision) lets this CLI attribute a truncation failure
+  // distinctly from "no attestation" below; passing `undefined` when the flag is absent
+  // makes hasCrossModelApproveForRevision behave exactly as it did before this existed.
+  const attestationStorePath = values['attestation-store'];
+  let observedEntries;
+  if (attestationStorePath) {
+    try {
+      observedEntries = readObservedAttestations(attestationStorePath, { key });
+    } catch (err) {
+      // #355 round-5 cross-model review (codex): a tampered/rotated-key store entry
+      // now fails closed (see attestation-store.mjs) instead of being silently
+      // dropped. Surface it through the CLI's normal error path.
+      opError(`tier-check: ${err.message}`);
+    }
+  }
+
+  const satisfied = hasCrossModelApproveForRevision({ dir: values.dir, revision, authorProvider, key, observedEntries });
   // #364 — WHY it failed, not just THAT it failed. hasCrossModelApproveForRevision checks the
   // chain before examining any entry, so "the chain does not verify" and "no entry matches this
   // revision" arrive here as the same `false`. Reporting both as a missing attestation sends the
@@ -423,8 +504,19 @@ if (positionals[0] === 'tier-check') {
   // it would re-read and re-verify the whole ledger on the PASS path for an answer already
   // known (cross-model review finding, MEDIUM). The || keeps the failing path exact.
   const chainTrustworthy = satisfied || manifestChainTrustworthy(values.dir);
+  // Same short-circuit logic for the THIRD cause (#355): only worth re-deriving on the
+  // failing path, and only meaningful when a store was actually supplied.
+  let truncationDetected = false;
+  if (!satisfied && chainTrustworthy && observedEntries !== undefined) {
+    const { entries: prEntries } = readEntries('manifest', values.dir);
+    // Same author-scoping hasCrossModelApproveForRevision applies internally (round-4
+    // finding): recomputing this with UNSCOPED observedEntries would misreport a
+    // cross-author revision collision as truncation instead of a missing attestation.
+    const authorScopedObserved = scopeObservedEntriesToAuthor(observedEntries, authorProvider);
+    truncationDetected = !assertNoTruncation({ prEntries, observedEntries: authorScopedObserved, revision, key }).ok;
+  }
   if (values.json) {
-    printJson({ trustRootTier: true, reasons: tier.reasons, crossModelRequired: true, satisfied, revision, chainTrustworthy });
+    printJson({ trustRootTier: true, reasons: tier.reasons, crossModelRequired: true, satisfied, revision, chainTrustworthy, truncationDetected });
     process.exit(satisfied ? 0 : 2);
   }
   if (satisfied) {
@@ -454,6 +546,13 @@ if (positionals[0] === 'tier-check') {
       // — the plain strict form would instead break at this ledger's own honest
       // legacy prefix (seq 1), masking the actual break point named above.
       `Diagnose with: adlc gate-manifest verify --allow-legacy-unsigned`
+    );
+    process.exit(2);
+  }
+  if (truncationDetected) {
+    console.error(
+      `tier-check: ROLLBACK/TRUNCATION DETECTED for revision ${revision} — the attestation store at ${attestationStorePath} holds a signed cross-model entry for this revision that is MISSING from this tree's manifest. This required check FAILS CLOSED.\n` +
+      `This is NOT a missing attestation and recording a new one will not clear it: a signed entry (commonly a needs-attention revocation) was dropped from .adlc/manifest.jsonl after a trusted run observed it. Restore the dropped entry rather than overwriting it.`
     );
     process.exit(2);
   }

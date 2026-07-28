@@ -8,7 +8,10 @@ JSON so the configuration lives in version control instead of only in the GitHub
 
 - `main-branch-ruleset.json` — protects the default branch (`main`).
 - `release-tag-ruleset.json` — protects `v*` release tags (the publish trigger).
-- `apply.sh` — applies both via `gh api` (requires admin auth).
+- `adlc-attestations-ruleset.json` — protects the `adlc-attestations` orphan branch (the
+  cross-model truncation anti-rollback anchor, #355 — **opt-in hardening specific to this
+  repo's own dogfooding, not a required ADLC capability**).
+- `apply.sh` — applies all three via `gh api` (requires admin auth).
 
 ## What the main-branch ruleset enforces
 
@@ -39,6 +42,35 @@ The **`npm-publish` protected environment** (below) is the second layer — a re
 human approval plus a deployment-ref allowlist on top of the tag gate. The npm
 credential must be an **environment-scoped secret** so it is unreadable outside that
 environment.
+
+## What the adlc-attestations ruleset enforces
+
+`creation` + `update` + `deletion` + `non_fast_forward` on `refs/heads/adlc-attestations`.
+**`update` is load-bearing, not redundant with `non_fast_forward`**: `non_fast_forward`
+alone only blocks force-pushes/history rewrites — it does NOT stop a normal, ordinary
+fast-forward commit that simply edits `attestations.jsonl` to drop a previously mirrored
+line (a cross-model review round caught this: that gap would let any collaborator with
+push access silently rewrite the anchor via an everyday commit, no force-push needed).
+`update` restricts ALL pushes to bypass-only, closing that. The **GitHub Actions app**
+(`actor_id: 15368`, `actor_type: Integration` — the real, API-verified ID of GitHub's own
+first-party `github-actions` app, not a guess) is the only bypass actor. This is the
+protected-ref mirror `.github/workflows/cross-model-gate.yml`
+appends signed cross-model attestations to as they are observed, so a PR author cannot
+truncate a signed revocation from `.adlc/manifest.jsonl` and have the gate miss it — see
+`packages/prosecute/lib/attestation-store.mjs` and
+`docs/superpowers/specs/2026-07-28-cross-model-truncation-anchor-design.md`.
+
+**Residual scope note**: the bypass is granted to the GitHub Actions app broadly, not
+scoped to the `cross-model-gate.yml` workflow specifically — GitHub rulesets do not
+support per-workflow bypass scoping today. Any OTHER workflow in this repo using the
+default `GITHUB_TOKEN` with `contents: write` could in principle also push to this
+branch. This is an accepted tradeoff for a single dogfood repo (a scoped fine-grained
+PAT would close it at the cost of a secret to provision and rotate) — not a claim that
+the branch is isolated from every workflow, only from PR-controlled code.
+
+**This is opt-in, this-repo-only hardening** — no other ADLC adopter needs or is
+expected to apply this ruleset; `cross-model-gate.yml` itself has never been a
+distributed template (unlike `docs/ci/rails-guard.yml` etc.).
 
 ## Applying
 

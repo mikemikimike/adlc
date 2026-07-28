@@ -11,7 +11,7 @@
 //   - a tiered change with no --author-provider fails closed (exit 1).
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -453,5 +453,203 @@ describe('adlc-prosecute tier-check — chain failure vs missing attestation (#3
       assert.doesNotMatch(r.stderr, /lapsed/i, 'must NOT blame a signing lapse for raw corruption');
       assert.match(r.stderr, /prev hash mismatch/i, 'must name the actual break reason');
     } finally { cleanup(dir); }
+  });
+});
+
+// AC5/AC6 — the truncation anti-rollback anchor (#355, #354 F1 follow-up), end-to-end at
+// the process boundary. `mirror-attestations` appends newly-observed cross-model entries
+// to a protected-ref store; `tier-check --attestation-store <path>` uses that store to
+// detect a dropped signed entry the tree alone cannot see. Both flags are OPTIONAL — a
+// bare `tier-check` (no `--attestation-store`) must behave exactly as it does today.
+describe('adlc-prosecute mirror-attestations + tier-check --attestation-store (#355 truncation anchor)', () => {
+  const tierChange = (d) => {
+    mkdirSync(join(d, 'packages', 'prosecute', 'lib'), { recursive: true });
+    writeFileSync(join(d, 'packages', 'prosecute', 'lib', 'x.mjs'), 'export const z = 1;\n');
+  };
+
+  // The store must live OUTSIDE the repo's own working tree (a sibling directory, mirroring
+  // the existing ./_pr sibling-worktree pattern) — a store nested INSIDE the checkout would
+  // itself become an untracked file, perturbing the working-tree-based revision hash the
+  // gate binds to (revisionIgnorePaths only excludes .adlc/manifest.jsonl, not an arbitrary
+  // store path).
+  function attestationStoreDir() {
+    return mkdtempSync(join(tmpdir(), 'adlc-attestations-'));
+  }
+
+  it('mirror-attestations appends a new cross-model entry and is idempotent', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const rev = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], dir).stdout).revision;
+      const rec = runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', rev, '--dir', '.adlc'], dir);
+      assert.equal(rec.status, 0);
+
+      const first = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(first.status, 0);
+      assert.match(first.stdout, /appended 1/);
+      assert.ok(existsSync(storePath));
+
+      const second = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(second.status, 0);
+      assert.match(second.stdout, /appended 0/);
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
+  });
+
+  it('mirror-attestations requires --attestation-store and a signing key', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    try {
+      const noStore = runBin(['mirror-attestations', '--dir', '.adlc'], dir);
+      assert.equal(noStore.status, 1);
+      assert.match(noStore.stderr, /--attestation-store/);
+
+      const noKey = runBin(['mirror-attestations', '--attestation-store', join(storeDir, 'attestations.jsonl'), '--dir', '.adlc'], dir, { ADLC_MANIFEST_KEY: '' });
+      assert.equal(noKey.status, 1);
+      assert.match(noKey.stderr, /ADLC_MANIFEST_KEY/);
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
+  });
+
+  it('tier-check --attestation-store passes on a missing (bootstrap) store and on a store that matches the tree', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const rev = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], dir).stdout).revision;
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', rev, '--dir', '.adlc'], dir);
+
+      // Bootstrap: the store does not exist yet — must not spuriously fail.
+      const bootstrap = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--attestation-store', storePath], dir);
+      assert.equal(bootstrap.status, 0);
+
+      // Mirror, then re-check: still passes (the store now matches the tree exactly).
+      runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      const afterMirror = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--attestation-store', storePath], dir);
+      assert.equal(afterMirror.status, 0);
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
+  });
+
+  it('AC1 end-to-end: --attestation-store catches a truncated revocation that a plain tier-check would miss', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const rev = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], dir).stdout).revision;
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', rev, '--dir', '.adlc'], dir);
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'needs-attention', '--revision', rev, '--dir', '.adlc'], dir);
+
+      // Trusted CI observes both entries and mirrors them BEFORE truncation.
+      const mirrorResult = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(mirrorResult.status, 0);
+      assert.match(mirrorResult.stdout, /appended 2/);
+
+      // Sanity: the revocation already stands even without the anchor.
+      const sanity = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc'], dir);
+      assert.equal(sanity.status, 2);
+
+      // Attacker truncates the manifest: drop the needs-attention line, keep the approve.
+      const manifestPath = join(dir, '.adlc', 'manifest.jsonl');
+      const firstLine = readFileSync(manifestPath, 'utf8').split('\n').find((l) => l.trim());
+      writeFileSync(manifestPath, `${firstLine}\n`);
+
+      // THE GAP (#354 F1): without the anchor, the truncated tree wrongly PASSES.
+      const withoutAnchor = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc'], dir);
+      assert.equal(withoutAnchor.status, 0);
+
+      // THE FIX: with the anchor, truncation is caught — fails closed with a distinct message.
+      const withAnchor = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--attestation-store', storePath], dir);
+      assert.equal(withAnchor.status, 2);
+      assert.match(withAnchor.stderr, /truncat/i);
+
+      // --json distinguishes truncation from a genuinely missing attestation.
+      const withAnchorJson = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--attestation-store', storePath, '--json'], dir);
+      assert.equal(withAnchorJson.status, 2);
+      assert.equal(JSON.parse(withAnchorJson.stdout).truncationDetected, true);
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
+  });
+
+  it('round-3 codex finding: mirror-attestations refuses to write from a manifest whose chain is not trustworthy', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const rev = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], dir).stdout).revision;
+      const rec = runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', rev, '--dir', '.adlc'], dir);
+      assert.equal(rec.status, 0);
+
+      // Corrupt the manifest's signature (present-but-invalid), matching the #354 F1
+      // tamper pattern: the chain is no longer trustworthy even though the line parses.
+      const manifestPath = join(dir, '.adlc', 'manifest.jsonl');
+      const entry = JSON.parse(readFileSync(manifestPath, 'utf8').trim());
+      entry.sig = `${entry.sig.slice(0, -4)}dead`;
+      writeFileSync(manifestPath, `${JSON.stringify(entry)}\n`);
+
+      const mirrorResult = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(mirrorResult.status, 1, 'must fail closed rather than mirror from an untrustworthy manifest');
+      assert.match(mirrorResult.stderr, /chain/i);
+      assert.ok(!existsSync(storePath), 'the store must not be created/modified from a broken-chain manifest');
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
+  });
+
+  it('round-4 codex finding: a cross-author revision collision reports MISSING attestation, not truncation, in --attestation-store attribution', () => {
+    // Two unrelated PRs (author anthropic vs author openai) that happen to produce an
+    // identical tree — same baseTickets + same mutate() applied to a fresh scratch repo
+    // yields the same revision hash, since .adlc/manifest.jsonl is excluded from it.
+    const prA = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const prB = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const revA = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], prA.dir).stdout).revision;
+      const revB = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'openai', '--dir', '.adlc', '--json'], prB.dir).stdout).revision;
+      assert.equal(revA, revB, 'precondition: the two scratch repos must collide on revision for this test to be meaningful');
+
+      // PR A (author anthropic): approve, then revoke. Mirror both into the store.
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', revA, '--dir', '.adlc'], prA.dir);
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'needs-attention', '--revision', revA, '--dir', '.adlc'], prA.dir);
+      const mirrorResult = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], prA.dir);
+      assert.equal(mirrorResult.status, 0);
+      assert.match(mirrorResult.stdout, /appended 2/);
+
+      // PR B (author openai): no attestation recorded at all yet — a completely
+      // ordinary, not-yet-reviewed trust-root PR from a DIFFERENT author.
+      const prBResult = runBin(['tier-check', '--base', 'main', '--author-provider', 'openai', '--dir', '.adlc', '--attestation-store', storePath, '--json'], prB.dir);
+      assert.equal(prBResult.status, 2);
+      const prBJson = JSON.parse(prBResult.stdout);
+      assert.equal(prBJson.truncationDetected, false, 'PR B never truncated anything — author A\'s revocation is not about PR B');
+
+      const prBText = runBin(['tier-check', '--base', 'main', '--author-provider', 'openai', '--dir', '.adlc', '--attestation-store', storePath], prB.dir);
+      assert.match(prBText.stderr, /NO SIGNATURE-VERIFIED cross-model attestation/);
+      assert.doesNotMatch(prBText.stderr, /ROLLBACK\/TRUNCATION DETECTED/);
+    } finally {
+      cleanup(prA.dir);
+      cleanup(prB.dir);
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('round-5 codex finding: a tampered store entry fails tier-check AND mirror-attestations closed, not silently ignored', () => {
+    const { dir } = scratchRepo({ baseTickets: [T({ rails: [] })], mutate: tierChange });
+    const storeDir = attestationStoreDir();
+    const storePath = join(storeDir, 'attestations.jsonl');
+    try {
+      const rev = JSON.parse(runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--json'], dir).stdout).revision;
+      runBin(['record-cross-model', '--ticket', 'T1', '--provider', 'openai', '--author-provider', 'anthropic', '--verdict', 'approve', '--revision', rev, '--dir', '.adlc'], dir);
+      const mirrorResult = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(mirrorResult.status, 0);
+
+      // Tamper the mirrored store entry in place: content changed, stale sig kept.
+      const stored = JSON.parse(readFileSync(storePath, 'utf8').trim());
+      stored.data = { ...stored.data, verdict: 'needs-attention' };
+      writeFileSync(storePath, `${JSON.stringify(stored)}\n`);
+
+      const tierCheckResult = runBin(['tier-check', '--base', 'main', '--author-provider', 'anthropic', '--dir', '.adlc', '--attestation-store', storePath], dir);
+      assert.equal(tierCheckResult.status, 1, 'a tampered store must fail closed (operational error), not silently pass or silently ignore the tampered line');
+      assert.match(tierCheckResult.stderr, /signature does not verify/);
+
+      const secondMirror = runBin(['mirror-attestations', '--attestation-store', storePath, '--dir', '.adlc'], dir);
+      assert.equal(secondMirror.status, 1, 'mirror-attestations must also refuse to write onto a store it cannot fully verify');
+      assert.match(secondMirror.stderr, /signature does not verify/);
+    } finally { cleanup(dir); rmSync(storeDir, { recursive: true, force: true }); }
   });
 });
