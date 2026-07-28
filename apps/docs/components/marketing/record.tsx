@@ -59,7 +59,7 @@ export function Masthead() {
             the short form still teaches itself. */}
         <Link
           href="/"
-          className="rec-mono flex items-center gap-2.5 text-[12.5px] font-bold tracking-[0.1em]"
+          className="rec-mono flex items-center gap-2.5 text-[12.5px] font-bold tracking-[0.05em]"
           style={{ color: '#cbcdd2' }}
         >
           <span aria-hidden className="block h-[9px] w-[9px] shrink-0 rounded-[1px]" style={{ background: '#78bd65' }} />
@@ -81,16 +81,33 @@ export function Masthead() {
             <GitHubMark />
           </a>
         </nav>
-        {/* Small screens keep the record reachable without a drawer: the nav is
-            seven flat destinations, so it wraps into the rail below instead. */}
-        <nav className="flex items-center gap-4 text-[12px] font-medium md:hidden">
-          <Link href="/lifecycle" style={{ color: '#9599a6' }}>
-            Lifecycle
-          </Link>
-          <Link href="/docs" style={{ color: '#9599a6' }}>
-            Docs
-          </Link>
-        </nav>
+        {/* Small screens get every route, not a two-link sample: a no-JS
+            disclosure on the terminal ground. A mobile visitor who lands on an
+            interior page must still be able to reach the install path. */}
+        <details className="relative md:hidden">
+          <summary
+            className="rec-mono flex cursor-pointer list-none items-center border px-2.5 py-1 text-[11px] tracking-[0.1em] [&::-webkit-details-marker]:hidden"
+            style={{ color: '#9599a6', borderColor: '#34363d' }}
+          >
+            MENU
+          </summary>
+          <nav
+            className="absolute right-0 top-[calc(100%+9px)] z-50 flex w-52 flex-col"
+            style={{ background: '#1c1d21', border: '1px solid #34363d' }}
+            aria-label="All pages"
+          >
+            {NAV.map((n) => (
+              <Link
+                key={n.href}
+                href={n.href}
+                className="px-4 py-2.5 text-[13px] font-medium"
+                style={{ color: '#cbcdd2', borderBottom: '1px solid #2c2e34' }}
+              >
+                {n.label}
+              </Link>
+            ))}
+          </nav>
+        </details>
       </div>
     </header>
   );
@@ -104,7 +121,7 @@ export function RecordRail({ items }: { items: { k: string; v: ReactNode; open?:
         {items.map((it, i) => (
           <span
             key={it.k}
-            className="rec-mono whitespace-nowrap text-[10px] uppercase tracking-[0.1em]"
+            className="rec-mono whitespace-nowrap text-[11px] uppercase tracking-[0.1em]"
             style={{
               color: 'var(--rec-ink-2)',
               paddingRight: 18,
@@ -354,10 +371,10 @@ export function Exhibit({
       </figcaption>
       <div className="rec-capture" style={{ background: '#1c1d21', border: '1px solid #34363d' }}>
         <div
-          className="rec-capture-bar rec-mono flex items-center justify-between gap-3 px-3.5 py-2 text-[10px] tracking-[0.1em]"
-          style={{ borderBottom: '1px solid #2c2e34', color: '#686b78' }}
+          className="rec-capture-bar rec-mono flex items-center justify-between gap-3 px-3.5 py-2 text-[11px] tracking-[0.1em]"
+          style={{ borderBottom: '1px solid #2c2e34', color: '#9093a0' }}
         >
-          <span className="truncate">{command}</span>
+          <span className="truncate text-[12px] tracking-normal">{command}</span>
           <span className="whitespace-nowrap" style={{ color: verdict === 'fail' ? '#eb3d54' : '#78bd65' }}>
             {status}
           </span>
@@ -400,10 +417,10 @@ export function Capture({ title, status, fail, children }: { title: string; stat
   return (
     <div className="rec-capture" style={{ background: '#1c1d21', border: '1px solid #34363d' }}>
       <div
-        className="rec-capture-bar rec-mono flex items-center justify-between gap-3 px-3.5 py-2 text-[10px] tracking-[0.1em]"
-        style={{ borderBottom: '1px solid #2c2e34', color: '#686b78' }}
+        className="rec-capture-bar rec-mono flex items-center justify-between gap-3 px-3.5 py-2 text-[11px] tracking-[0.1em]"
+        style={{ borderBottom: '1px solid #2c2e34', color: '#9093a0' }}
       >
-        <span className="truncate">{title}</span>
+        <span className="truncate text-[12px] tracking-normal">{title}</span>
         <span className="whitespace-nowrap" style={{ color: fail ? '#eb3d54' : '#78bd65' }}>
           {status}
         </span>
