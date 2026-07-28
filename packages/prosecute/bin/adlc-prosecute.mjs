@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { parseArgs, printJson, opError, recordFinding, git, repoRoot, changedFiles, splitNulPaths } from '@adlc/core';
+import { parseArgs, printJson, opError, recordFinding, git, repoRoot, changedFiles, splitNulPaths, untrackedNonIgnoredPaths } from '@adlc/core';
 import { detectTicketStore, GitTreeTicketStore } from '@adlc/tickets';
-import { runProsecution, resolveProsecutionRevision } from '../lib/run.mjs';
+import { runProsecution, resolveProsecutionRevision, revisionIgnorePaths } from '../lib/run.mjs';
 import { classifyTrustRootTier } from '../lib/tier.mjs';
-import { recordCrossModelReview, hasCrossModelApproveForRevision, manifestChainTrustworthy } from '../lib/cross-model.mjs';
+import { recordCrossModelReview, carryForwardCrossModelReview, hasCrossModelApproveForRevision, manifestChainTrustworthy } from '../lib/cross-model.mjs';
 import { getKey } from '@adlc/gate-manifest/lib/sign.mjs';
 import { loadManifestKeyFromEnvLocal } from '../lib/load-env-local.mjs';
 
@@ -162,6 +162,9 @@ const { values, positionals } = parseArgs({
     // #370: recording with no signing key is refused by default (the entry would be
     // inert and permanent). This makes an unsigned write a deliberate, auditable act.
     'allow-unsigned': { type: 'boolean', default: false },
+    // revision-binding carry-forward — carry an EXISTING approve forward onto a moved base without a fresh review,
+    // when the reviewed change itself is unchanged (see carryForwardCrossModelReview).
+    'carry-forward': { type: 'string' },
     // --record-finding mode: land one CONFIRMED prosecution finding in the
     // findings ledger so P7 lesson-foundry can cluster it (closes the P5→P7 loop).
     'record-finding': { type: 'boolean', default: false },
@@ -200,6 +203,15 @@ ADLC P5 review-evidence recorder.
       would be unsigned, and the gate rejects unsigned attestations. Pass
       --allow-unsigned to write one deliberately anyway (forge-resistance tests);
       the success line is then replaced by a warning. --json reports "signed".
+
+  record-cross-model --ticket id --carry-forward FROM_REVISION [--base main] [--dir .adlc]
+      Carry an EXISTING approve forward onto a moved base WITHOUT a fresh review, when
+      the reviewed change itself is unchanged (the revision-binding carry-forward path).
+      Refuses unless a prior approve is recorded for FROM_REVISION, both identities are
+      change-set form with an EQUAL change-set digest (COMPUTED, never asserted), the
+      base actually moved, and the resulting chain depth stays within the cap — otherwise
+      a FRESH distinct-provider review is required. --provider/--author-provider/--verdict
+      are not accepted here: the carried entry keeps the ORIGINAL review's identity.
 
   --record-finding --file <path> --desc "<prose>" [--category <lens>] [--severity <s>] [--line <n>] [--verdict <v>] [--dir .adlc]
       Record ONE confirmed prosecution finding to <dir>/findings.jsonl for P7
@@ -257,11 +269,57 @@ if (positionals[0] === 'record-cross-model') {
   }
   const revision = resolveProsecutionRevision({
     dir: values.dir,
+    base: values.base,
     revision: values.revision,
     input,
     inputPath: values.input,
   });
   if (!revision) opError('revision could not be resolved; pass --revision or run inside a git worktree');
+
+  // #365 Decision 2 / AC15 — refuse to record an attestation while an untracked-and-NOT-ignored
+  // file is present, for the same reason runProsecution refuses: the change-set identity excludes
+  // untracked files, so without this the tree could hold unaccounted state at the moment this
+  // attestation is minted. Same ignorePaths construction as the identity, so the manifest itself,
+  // --input, and review evidence never trigger it.
+  //
+  // Skipped when --revision is EXPLICIT, matching resolveChangeSetRevision's own short-circuit —
+  // see the identical comment in runProsecution (lib/run.mjs) for why.
+  if (values.revision === undefined || String(values.revision).trim() === '') {
+    let untrackedPaths;
+    try {
+      untrackedPaths = untrackedNonIgnoredPaths({ ignorePaths: revisionIgnorePaths(process.cwd(), values.dir, input, values.input) });
+    } catch (err) {
+      opError(`cannot verify the working tree is free of untracked files: ${err.message}`);
+    }
+    if (untrackedPaths.length > 0) {
+      opError(`refusing to record: untracked, non-ignored file(s) present in the working tree — ${untrackedPaths.join(', ')}`);
+    }
+  }
+
+  // revision-binding carry-forward mode: re-attest an EXISTING approve at the newly-resolved revision
+  // instead of recording a fresh one. Separate branch (not merged with the fresh-record path
+  // below) because it takes NO --provider/--author-provider/--verdict — the carried entry keeps
+  // the ORIGINAL review's identity, since it IS that review, just bound to a moved base.
+  if (values['carry-forward']) {
+    let carried;
+    try {
+      carried = carryForwardCrossModelReview({
+        ticket: values.ticket,
+        fromRevision: values['carry-forward'],
+        revision,
+        dir: values.dir,
+      });
+    } catch (err) {
+      opError(err.message); // fail closed: an unmoved/mismatched/uncapped/missing-prior carry is an operational error, never recorded
+    }
+    if (values.json) {
+      printJson(carried);
+    } else {
+      console.log(`carried forward cross-model ${carried.data.verdict} for ${values.ticket} @ ${revision} (depth ${carried.data.carryDepth}, from ${carried.data.carriedFrom})`);
+    }
+    process.exit(0);
+  }
+
   let entry;
   try {
     entry = recordCrossModelReview({
@@ -335,7 +393,7 @@ if (positionals[0] === 'tier-check') {
   if (!authorProvider) {
     opError('tier-check: trust-root tier but no --author-provider / ADLC_AUTHOR_PROVIDER — distinctness cannot be proven; failing closed');
   }
-  const revision = resolveProsecutionRevision({ dir: values.dir, revision: values.revision });
+  const revision = resolveProsecutionRevision({ dir: values.dir, base: values.base, revision: values.revision });
   if (!revision) opError('tier-check: revision could not be resolved; run inside a git worktree or pass --revision');
 
   // #326 hardening — the attestation is trusted ONLY via its HMAC signature, verified with
@@ -475,6 +533,7 @@ const authorProvider = values['author-provider'] ?? process.env.ADLC_AUTHOR_PROV
 const result = runProsecution(input, {
   ticket: values.ticket,
   target: values.target,
+  base: values.base,
   revision: values.revision,
   inputPath: values.input,
   dir: values.dir,
