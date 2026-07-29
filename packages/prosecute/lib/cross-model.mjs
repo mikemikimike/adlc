@@ -26,6 +26,11 @@ import { record } from '@adlc/gate-manifest/lib/record.mjs';
 import { verify } from '@adlc/gate-manifest/lib/verify.mjs';
 import { getKey, verifyEntrySig } from '@adlc/gate-manifest/lib/sign.mjs';
 import { assertNoTruncation } from './attestation-store.mjs';
+// T-MANIFEST-FOREST slice 2: the gate now walks the whole forest (root + segments),
+// not just root — see readManifestForest's doc for the deterministic ordering that
+// makes "which chain an entry lives in" a non-issue for crossModelSatisfied below
+// (order does not matter to the terminal-revocation rule at all, by design).
+import { readManifestForest } from '@adlc/gate-manifest/lib/forest.mjs';
 
 export const CROSS_MODEL_GATE = 'cross-model-review';
 const VALID_VERDICTS = new Set(['approve', 'needs-attention']);
@@ -176,6 +181,17 @@ export function carryForwardCrossModelReview({ ticket, fromRevision, revision, d
   if (!manifestChainTrustworthy(dir)) {
     throw new Error('carry-forward refused: the manifest hash chain does not verify — a broken chain could be hiding a dropped revocation');
   }
+  // Deliberately root-only for finding the chain's "latest" entry (T-MANIFEST-FOREST
+  // slice 2 covers the GATE's own terminal-revocation walk —
+  // hasCrossModelApprove/hasCrossModelApproveForRevision above — not this ergonomics
+  // feature's depth-cap bookkeeping). latestEntryForTicket's "actual chain head"
+  // concept needs a real total order to mean anything (depth-cap and fromRevision
+  // validation both depend on finding ONE true latest entry), and no writer produces
+  // segments yet (slice 3) nor has this repo migrated (T-MANIFEST-FOREST-MIGRATE) —
+  // root-only is correct for finding "the latest approve to carry" for every repo
+  // this can run against today. The forest-wide revocation check below (after a
+  // genuine prior approve is confirmed) is the exception: it does not need a total
+  // order, only forest-wide membership, so it is NOT root-only.
   const { entries } = readEntries('manifest', dir);
   const prior = latestEntryForTicket(entries, ticket);
   if (!prior) {
@@ -201,6 +217,25 @@ export function carryForwardCrossModelReview({ ticket, fromRevision, revision, d
     throw new Error(
       `carry-forward refused: the prior verdict for ${fromRevision} is ` +
       `"${prior.data?.verdict}", not approve — only an approve can be carried`
+    );
+  }
+
+  // A revocation for this exact (ticket, fromRevision) key can legitimately live in
+  // a SEGMENT even before slice 3's writer exists (spec §6: a migration cutover
+  // seal, or a reviewer's own out-of-band flag, can be hand-written to manifest.d/
+  // the same way the read-side gate's own forest-walk tests do) — carry-forward must
+  // not resurrect an approval that has been revoked anywhere in the forest under a
+  // new revision, so this check walks the WHOLE forest, unlike the root-only "latest
+  // entry" lookup above (adversarial-review finding: root-only carry-forward missed
+  // a segment-recorded revocation of fromRevision and would happily mint a fresh
+  // approve for the new revision).
+  const { entries: forestEntries } = readManifestForest(dir);
+  const revokedFromRevision = forestEntries.some((entry) => revocationCandidate(entry, { ticket, revision: fromRevision }));
+  if (revokedFromRevision) {
+    throw new Error(
+      `carry-forward refused: fromRevision (${fromRevision}) under ticket ${ticket} has a needs-attention ` +
+      'entry recorded against it somewhere in the manifest forest — a revoked verdict cannot be carried ' +
+      'forward; record a fresh distinct-provider review instead'
     );
   }
 
@@ -252,9 +287,11 @@ export function carryForwardCrossModelReview({ ticket, fromRevision, revision, d
 // trust-root change (e.g. an enforcement-package edit) need not map to one ticket,
 // and the revision hash is the anti-stale anchor that stops a prior attestation
 // from clearing a fresh diff.
-// A candidate cross-model review entry for (revision, author, [ticket]) from a
-// DISTINCT reviewer. Returns { provider, verdict } for a valid approve/needs-
-// attention entry, or null. `ticket` optional (the revision gate omits it).
+// A candidate cross-model APPROVE for (revision, author, [ticket]) from a DISTINCT,
+// signature-verified reviewer. Returns { provider } or null. `ticket` optional (the
+// revision gate omits it). needs-attention is NOT handled here — see
+// revocationCandidate below, which deliberately applies weaker trust requirements
+// (spec §6: a revocation counts regardless of its signature state).
 function candidateReview(entry, { ticket, revision, runAuthor, key }) {
   if ((entry.gate ?? entry.type) !== CROSS_MODEL_GATE) return null;
   // #326 hardening — verify the HMAC signature FIRST. The manifest lives in the
@@ -267,7 +304,7 @@ function candidateReview(entry, { ticket, revision, runAuthor, key }) {
   const data = entry.data;
   if (!data || typeof data !== 'object') return null;
   if (data.revision !== revision) return null;
-  if (data.verdict !== 'approve' && data.verdict !== 'needs-attention') return null;
+  if (data.verdict !== 'approve') return null;
   const provider = normalizeProvider(data.provider);
   const entryAuthor = normalizeProvider(data.authorProvider);
   if (provider === '' || entryAuthor === '' || runAuthor === '') return null;
@@ -278,21 +315,58 @@ function candidateReview(entry, { ticket, revision, runAuthor, key }) {
   // normalized so a whitespace/case variant cannot fake distinctness.
   if (provider === runAuthor) return null;
   if (entryAuthor !== runAuthor) return null;
-  return { provider, verdict: data.verdict };
+  return { provider };
 }
 
-// The gate is satisfied iff some distinct-provider reviewer's LATEST verdict for
-// this revision is `approve`. Entries are chronological (append-only manifest), so
-// the last entry per provider wins — a later `needs-attention` REVOKES an earlier
-// `approve` from that provider (#326 P5 finding), while a different provider's
-// standing approve still counts.
+// A candidate REVOCATION for (revision, [ticket]) — spec §6's "same key" is
+// (provider, revision, [ticket]) ONLY, with no authorProvider component, so unlike
+// candidateReview above this deliberately does NOT require a signature, does NOT
+// require author-anchoring, and does NOT exclude a same-provider-as-author entry:
+// - "A revocation counts regardless of its signature state: revocations only ever
+//   block an approve, so trusting them unsigned is fail-closed, while requiring a
+//   signature would let a keyless author's genuine revocation be silently ignored."
+// - Author-anchoring exists on the approve side to stop a same-provider author from
+//   self-approving; a revocation can only ever make the gate MORE restrictive, so
+//   the same risk does not apply — an author flagging their own PR (or the
+//   migration ceremony's cutover seal, §4.6, sealing a standing approve) is a
+//   legitimate revocation, not a bypass to guard against.
+// Returns { provider } or null.
+function revocationCandidate(entry, { ticket, revision }) {
+  if ((entry.gate ?? entry.type) !== CROSS_MODEL_GATE) return null;
+  if (ticket !== undefined && entry.ticket !== ticket) return null;
+  const data = entry.data;
+  if (!data || typeof data !== 'object') return null;
+  if (data.revision !== revision) return null;
+  if (data.verdict !== 'needs-attention') return null;
+  const provider = normalizeProvider(data.provider);
+  if (provider === '') return null;
+  return { provider };
+}
+
+// TERMINAL revocation (spec §6): an approve for (provider, revision, [ticket])
+// satisfies the gate only if NO entry anywhere in the forest carries a
+// needs-attention verdict for that SAME key — not "the latest verdict per
+// provider wins". Once revoked, a provider's approve for that exact tuple can
+// never satisfy the gate again, even a LATER one (D2: a later approve does not
+// "un-revoke" — that would let a writer-claimed order restore trust the reviewer
+// never re-granted against the same reviewed bytes; re-approval requires a new
+// revision, i.e. a real change to review). This is why the algorithm below is a
+// two-set membership test rather than a chronological reduction: ORDER DOES NOT
+// MATTER, which is exactly what makes it safe to evaluate across a forest with no
+// single total order across chains (root vs. segments, see forest.mjs) — unlike
+// the old "latest per provider" reduction, which needed one.
 function crossModelSatisfied(entries, match) {
-  const latestByProvider = new Map();
+  const approvedProviders = new Set();
+  const revokedProviders = new Set();
   for (const entry of entries) {
-    const review = candidateReview(entry, match);
-    if (review) latestByProvider.set(review.provider, review.verdict);
+    const approve = candidateReview(entry, match);
+    if (approve) approvedProviders.add(approve.provider);
+    const revocation = revocationCandidate(entry, match);
+    if (revocation) revokedProviders.add(revocation.provider);
   }
-  for (const verdict of latestByProvider.values()) if (verdict === 'approve') return true;
+  for (const provider of approvedProviders) {
+    if (!revokedProviders.has(provider)) return true;
+  }
   return false;
 }
 
@@ -362,14 +436,10 @@ export function hasCrossModelApprove({ dir, ticket, revision, authorProvider, ke
   // No key → the reader cannot verify any attestation's signature → nothing is trusted.
   if (!ticket || !revision || !authorProvider || !key) return false;
   if (!manifestChainTrustworthy(dir)) return false;
-  // manifestChainTrustworthy already validates the WHOLE forest (root + any
-  // segments) via the forest-aware verify() — a tampered or malformed segment
-  // fails closed here even though this function only reads root entries below.
-  // Deliberately root-only for now (T-MANIFEST-FOREST slice 1): walking
-  // segment-recorded approvals needs the terminal-revocation redesign this
-  // ticket's slice 2 does (spec §6 — "no entry anywhere in the forest" is a
-  // stricter rule than today's "latest per provider", not a drop-in swap).
-  const { entries } = readEntries('manifest', dir);
+  // Walks the whole forest (root + segments) — safe now that crossModelSatisfied
+  // is order-independent (see its comment): there is no single total order
+  // across chains to get wrong.
+  const { entries } = readManifestForest(dir);
   return crossModelSatisfied(entries, { ticket, revision, runAuthor: normalizeProvider(authorProvider), key });
 }
 
@@ -406,9 +476,8 @@ export function hasCrossModelApproveForRevision({ dir, revision, authorProvider,
   // would be redundant and unverifiable — candidateReview is the single enforcement point.
   if (!key) return false;
   if (!manifestChainTrustworthy(dir)) return false;
-  // See hasCrossModelApprove above: root-only is deliberate here too, pending
-  // slice 2's terminal-revocation redesign.
-  const { entries } = readEntries('manifest', dir);
+  // See hasCrossModelApprove above: walks the whole forest.
+  const { entries } = readManifestForest(dir);
   if (observedEntries !== undefined) {
     const authorScopedObserved = scopeObservedEntriesToAuthor(observedEntries, authorProvider);
     const truncationCheck = assertNoTruncation({ prEntries: entries, observedEntries: authorScopedObserved, revision, key });
