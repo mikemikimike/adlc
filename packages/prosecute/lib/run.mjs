@@ -11,13 +11,26 @@ function now() {
   return new Date().toISOString();
 }
 
-function writeEvidence(type, data, dir, key) {
-  return appendManifestEntry({ ts: now(), type, ...data }, dir, { key });
+function writeEvidence(type, data, dir, cwd, key) {
+  return appendManifestEntry({ ts: now(), type, ...data }, dir, { cwd, key });
 }
 
 function manifestArtifactPaths(cwd, dir) {
   const root = resolve(cwd, dir);
-  return [join(root, 'manifest.jsonl'), join(root, 'manifest.lock'), join(root, 'tickets.json')];
+  // manifest.d/ (T-MANIFEST-FOREST slice 3: the segment writer) is the
+  // segmented equivalent of manifest.jsonl/manifest.lock — ledger bookkeeping,
+  // not reviewable code. Without this, a segmented repo's P5 evidence append
+  // would change the tracked tree (new/modified segment file), moving the
+  // very revision the NEXT evidence append (cross-model review, P6) has to
+  // bind to — the same "evidence writes must not move the reviewed revision"
+  // property manifest.jsonl already has, just unreached until a writer
+  // existed to make manifest.d/ files real (adversarial-review finding).
+  // Ignoring the whole directory (not just *.jsonl) also covers the
+  // activation marker (.store.json) and .lineage/.lock, matching how root's
+  // OWN cutover entry is likewise excluded via manifest.jsonl already being
+  // ignored in full — the marker gets no separate reviewability manifest.jsonl's
+  // entries don't already lack.
+  return [join(root, 'manifest.jsonl'), join(root, 'manifest.lock'), join(root, 'manifest.d'), join(root, 'tickets.json')];
 }
 
 function isInsideCwd(cwd, absolute) {
@@ -267,7 +280,7 @@ export function runProsecution(input, {
       ticketHash,
       storeHash,
       bindingScope: 'ticket',
-    }, dir, key);
+    }, dir, cwd, key);
 
     for (const finding of pass.findings) {
       writeEvidence('p5-finding-raw', {
@@ -278,7 +291,7 @@ export function runProsecution(input, {
         lens: pass.lens,
         finding,
         ...binding,
-      }, dir, key);
+      }, dir, cwd, key);
       writeEvidence(`p5-finding-${finding.verified_status}`, {
         ticket,
         target,
@@ -287,7 +300,7 @@ export function runProsecution(input, {
         lens: pass.lens,
         finding,
         ...binding,
-      }, dir, key);
+      }, dir, cwd, key);
     }
 
     const result = classifyPass(pass);
@@ -302,7 +315,7 @@ export function runProsecution(input, {
         consecutiveDry,
         dryEvidence: pass.dry_evidence ?? null,
         ...binding,
-      }, dir, key);
+      }, dir, cwd, key);
     } else {
       consecutiveDry = 0;
       for (const finding of pass.findings) {
@@ -328,7 +341,7 @@ export function runProsecution(input, {
       needsHuman: result.needsHuman.length,
       consecutiveDry,
       ...binding,
-    }, dir, key);
+    }, dir, cwd, key);
 
     passResults.push({
       pass: passNo,
@@ -355,7 +368,7 @@ export function runProsecution(input, {
         pass: passResults.length,
         consecutiveDry,
         dryLenses: Array.from(dryLenses).sort(),
-      }, dir, key);
+      }, dir, cwd, key);
       return {
         status: 'gate-fail',
         exitCode: 2,
@@ -381,7 +394,7 @@ export function runProsecution(input, {
       ticketHash,
       storeHash,
       bindingScope: 'ticket',
-    }, dir, key);
+    }, dir, cwd, key);
     return {
       status: 'pass',
       exitCode: 0,

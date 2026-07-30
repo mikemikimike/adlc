@@ -4,23 +4,39 @@
 // while holding the ledger lock; parsed/re-serialized entries are never used.
 
 import { existsSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { sha256, hashFiles, appendEntries, ADLC_DIR } from '@adlc/core';
 import { signEntry } from './sign.mjs';
 import { verify } from './verify.mjs';
+import { isSegmentedRepo } from './lineage.mjs';
+import { appendToSegment } from './segment-writer.mjs';
+import { discoverSegments } from './forest.mjs';
 import { validateKeyParam } from '@adlc/tickets/lib/key-contract.mjs';
 
 // `segment` is reserved too: forest.mjs's readManifestForest annotates every
 // entry it returns with its source segment (see sign.mjs's canonicalEntryBytes
 // for why that annotation must never be signed) — a caller-supplied `segment`
-// would be indistinguishable from that read-only annotation.
-const RESERVED_CHAIN_FIELDS = ['seq', 'prev', 'sig', 'sigVersion', 'segment'];
+// would be indistinguishable from that read-only annotation. `anchor` is
+// reserved per spec §4.4: only a segment's first entry may carry one, and
+// only the writer itself (segment-writer.mjs) may set it.
+const RESERVED_CHAIN_FIELDS = ['seq', 'prev', 'sig', 'sigVersion', 'segment', 'anchor'];
 
 /**
  * Atomically append an arbitrary top-level evidence entry to the C11 manifest.
  * Sequence allocation and the byte-exact previous-line hash happen under the
  * same ledger lock as the write, so runner and gate evidence share one chain.
+ *
+ * `cwd` (used only for segmented-repo branch resolution, spec §7.1) defaults
+ * to `dirname(dir)`, NOT `process.cwd()` (adversarial-review finding): every
+ * ledger dir in this codebase is `<repo-root>/.adlc`, so the target repo's
+ * root is `dir`'s parent. A caller that runs from one repo but records into
+ * ANOTHER's ledger via an explicit `dir` (e.g. an orchestrator recording into
+ * a worker checkout) would otherwise derive the branch from the WRONG
+ * repository — silently binding a segment to the controller's branch instead
+ * of the target's. `dirname('.adlc')` is `'.'`, which resolves identically to
+ * `process.cwd()` for the common case, so this changes nothing there.
  */
-export function appendManifestEntry(payload, dir = ADLC_DIR, { signatureVersion = 2, key } = {}) {
+export function appendManifestEntry(payload, dir = ADLC_DIR, { signatureVersion = 2, cwd = dirname(dir), key } = {}) {
   const signingKey = validateKeyParam(key);
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new TypeError('manifest payload must be an object');
@@ -31,7 +47,27 @@ export function appendManifestEntry(payload, dir = ADLC_DIR, { signatureVersion 
     }
   }
 
+  // spec §7: once a repo has cut over (marker or a root manifest-cutover
+  // entry — see lineage.mjs), EVERY append routes to the current lineage's
+  // segment instead of root.
+  if (isSegmentedRepo(dir)) {
+    return appendToSegment(payload, dir, { signatureVersion, cwd, key: signingKey });
+  }
+
   const [entry] = appendEntries('manifest', (state) => {
+    // RACE (adversarial-review finding): the isSegmentedRepo check above runs
+    // BEFORE this callback acquires the root ledger lock. The migration
+    // ceremony's own cutover append (spec §8 step 6) serializes on that SAME
+    // lock, so a writer that lost the race — it checked "not segmented",
+    // then blocked on the lock while cutover ran to completion, then finally
+    // got the lock — must not blindly append behind a cutover it never saw.
+    // Re-checking here, now that the lock (and therefore an up-to-date view
+    // of root) is actually held, is spec §7 point 3's "MUST refuse to append
+    // to the root" — the check above handles the common case cheaply; THIS
+    // is the one that is actually race-proof.
+    if (isSegmentedRepo(dir)) {
+      throw new Error('manifest chain is frozen; this repo uses .adlc/manifest.d/ — upgrade adlc if you are seeing this locally');
+    }
     if (state.skipped.length > 0) {
       throw new Error(`manifest contains malformed JSON at line ${state.skipped[0].line}`);
     }
@@ -53,6 +89,23 @@ export function appendManifestEntry(payload, dir = ADLC_DIR, { signatureVersion 
       const integrity = verify(dir, { requireSignatures: false, key: signingKey });
       if (!integrity.valid) {
         throw new Error(`manifest chain is invalid: ${integrity.message}`);
+      }
+    } else {
+      // Adversarial-review finding: a ROOTLESS segmented repo (anchor: null
+      // segments, activated only via .store.json since there is no cutover
+      // entry yet to fall back on — greenfield scaffold / slice 4) has no
+      // OTHER signal once that marker is lost, corrupted, or unreadable:
+      // isSegmentedRepo already returned false above, so this empty-root
+      // branch is the LAST checkpoint before a root gets created for the
+      // first time. Spec §4.4: "anchor: null is unavailable once a root
+      // exists" — silently creating one here would retroactively invalidate
+      // every existing rootless segment's forest membership. Fail closed
+      // instead of corrupting real evidence that was valid a moment ago.
+      const { valid: existingSegments } = discoverSegments(dir);
+      if (existingSegments.length > 0) {
+        throw new Error(
+          `refusing to create the root manifest: manifest.d/ already holds ${existingSegments.length} segment(s) anchored to nothing (anchor: null), legal only in a rootless forest — creating a root now would make every one of them invalid (spec §4.4). This usually means the activation marker (.adlc/manifest.d/.store.json) was lost or corrupted; restore it rather than appending to root.`
+        );
       }
     }
     const previous = state.entries.at(-1);

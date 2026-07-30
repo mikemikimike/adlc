@@ -22,6 +22,48 @@ const SEGMENT_NAME_RE = /^[a-z0-9-]{1,40}-[0-9A-HJKMNP-TV-Z]{26}\.jsonl$/;
 // (spec §4.7); grammar checks skip exactly these two names.
 const RESERVED_NAMES = new Set(['.store.json', '.lineage']);
 
+// A `*.lock` name is ALSO skippable, not reported invalid — but ONLY when its
+// content genuinely looks like `withLedgerLock`'s own owner record
+// (T-MANIFEST-FOREST slice 3, the writer, names its advisory lock
+// `<segment>.jsonl.lock`, which does not match SEGMENT_NAME_RE since it does
+// not end in exactly `.jsonl`). A NAME-ONLY skip was tried first and reverted
+// (adversarial-review finding): it let a malicious branch rename a real
+// segment — one holding a needs-attention revocation, say — to end in
+// `.lock`, silently vanishing it from the forest entirely instead of being
+// caught as bad-filename-grammar, undetectably resurrecting a revoked
+// approve. Requiring the CONTENT to match the lock's own narrow, distinctive
+// shape closes that: a renamed segment's real JSONL content will never match
+// it, so it falls through to the ordinary bad-filename-grammar rejection
+// below instead of disappearing.
+const LOCK_SUFFIX = '.lock';
+const MAX_LOCK_OWNER_BYTES = 512; // withLedgerLock's owner record is ~120 bytes; generous headroom, not a real limit
+function looksLikeGenuineLedgerLock(path, size) {
+  // withLedgerLock creates the lock file (openSync(..., 'wx')) and writes its
+  // owner JSON (writeFileSync) as two SEPARATE syscalls — a genuine lock is
+  // briefly 0 bytes between them (adversarial-review finding). Treating an
+  // empty file as "not a genuine lock" would fail the whole forest for
+  // anyone whose read lands in that split-second window, exactly the
+  // false-positive the earlier NAME-only skip was trying to avoid — just via
+  // a different mechanism. Safe to special-case: an EMPTY file can never
+  // hide a real segment's content (that requires actual bytes), so treating
+  // empty as "transient, skip it" reopens no part of that earlier hole.
+  if (size === 0) return true;
+  if (size >= MAX_LOCK_OWNER_BYTES) return false; // real locks are tiny; at/over the cap is refused, not guessed at (same convention as lineage.mjs's bounded reads)
+  let parsed = null;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8').trim());
+  } catch {
+    // leave parsed at its null default — falls through to the same shape
+    // check below, which already rejects a non-object just as unparseable
+    // content should be rejected. A dedicated `return false` here would be
+    // an equivalent mutant magnet (false and null are identically falsy to
+    // every caller, which only ever checks truthiness) for no benefit.
+  }
+  return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)
+    && typeof parsed.token === 'string' && typeof parsed.pid === 'number'
+    && typeof parsed.hostname === 'string' && typeof parsed.startedAt === 'string';
+}
+
 export function segmentDirPath(dir) {
   return join(dir, SEGMENT_DIRNAME);
 }
@@ -89,6 +131,11 @@ export function discoverSegments(dir) {
     }
     if (!st.isFile()) {
       invalid.push({ name, reason: 'not a regular file' });
+      continue;
+    }
+    if (name.endsWith(LOCK_SUFFIX)) {
+      if (looksLikeGenuineLedgerLock(full, st.size)) continue; // a transient advisory lock, not a segment
+      invalid.push({ name, reason: 'lock-suffixed object is not a genuine advisory lock' });
       continue;
     }
     if (!SEGMENT_NAME_RE.test(name)) {
@@ -217,8 +264,11 @@ function parseLenient(rawLines, segmentLabel) {
   return { entries, skipped };
 }
 
-// spec §4.2: ULID is the last 26 chars before `.jsonl`.
-function ulidOf(segmentName) {
+// spec §4.2: ULID is the last 26 chars before `.jsonl`. Exported so the
+// writer (lineage.mjs, T-MANIFEST-FOREST slice 3) can confirm a `.lineage`
+// token's cached ULID still matches the segment file it names, without
+// re-deriving the slicing logic.
+export function ulidOf(segmentName) {
   return segmentName.slice(segmentName.length - '.jsonl'.length - 26, segmentName.length - '.jsonl'.length);
 }
 

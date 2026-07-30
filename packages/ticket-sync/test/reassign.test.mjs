@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { sha256 } from '@adlc/core';
+import { recordTicketEvidence, resolveOpenSegment, segmentPath, readForestEntries, canonicalJson } from '@adlc/tickets';
 import { reassignId, planManifestMigration, migrateManifestEvidence } from '../lib/reassign.mjs';
 
 // ---- reassignId (pure, store-wide edge rewrite) ----
@@ -132,8 +137,14 @@ test('migrateManifestEvidence chains a multi-gate migration correctly (entry N l
 });
 
 test('migrateManifestEvidence signs re-attestation entries when ADLC_MANIFEST_KEY is set', () => {
-  const lg = fakeLedger([ev('T7', 'prosecution', 1, { verdict: 'clear' })]);
   const KEY = 'secret-key';
+  // The source itself must be validly signed to be a migratable candidate
+  // (adversarial-review finding: planManifestMigration now requires
+  // entrySigValid when a key is present).
+  const source = ev('T7', 'prosecution', 1, { verdict: 'clear' });
+  const sourceCanonical = { seq: source.seq, gate: source.gate, ts: source.ts, ticket: source.ticket, data: source.data, files: source.files, prev: source.prev };
+  source.sig = createHmac('sha256', KEY).update(JSON.stringify(sourceCanonical)).digest('hex');
+  const lg = fakeLedger([source]);
   const r = migrateManifestEvidence('/repo', 'T7', 'gh:r#2', {
     now: '2026-06-27T00:00:00Z', key: KEY, appendBatch: lg.appendBatch,
   });
@@ -173,4 +184,224 @@ test('migrateManifestEvidence derives sequence and prev from state observed insi
   const result = migrateManifestEvidence('/repo', 'T7', 'gh:r#2', { now: 'T', key: null, appendBatch });
   assert.equal(result.entries[0].seq, 3);
   assert.equal(result.entries[0].prev, sha256(JSON.stringify(external)));
+});
+
+// ---- migrateManifestEvidence: segmented repo (T-MANIFEST-FOREST) ----
+// Real filesystem + git repo, unlike the fake-ledger tests above: segment
+// routing shells out to `git rev-parse` to resolve the branch.
+
+function gitRepo(branch = 'feat/reassign-test') {
+  const root = mkdtempSync(join(tmpdir(), 'adlc-reassign-segments-'));
+  const g = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  g('init', '-q', '-b', branch);
+  g('config', 'user.email', 't@t.co');
+  g('config', 'user.name', 'tester');
+  g('config', 'commit.gpgsign', 'false');
+  writeFileSync(join(root, 'README.md'), 'fixture\n');
+  g('add', '.');
+  g('commit', '-q', '-m', 'init');
+  const dir = join(root, '.adlc');
+  mkdirSync(dir, { recursive: true });
+  return { root, dir };
+}
+
+function activate(dir) {
+  mkdirSync(join(dir, 'manifest.d'), { recursive: true });
+  writeFileSync(join(dir, 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+}
+
+test('migrateManifestEvidence routes to the segment writer once segmented — root is never created', () => {
+  const { root, dir } = gitRepo();
+  try {
+    activate(dir);
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+    const result = migrateManifestEvidence(root, 'T7', 'gh:acme/app#7', { now: '2026-06-27T00:00:00Z', key: null });
+    assert.equal(result.migrated, 1);
+    assert.equal(result.entries[0].ticket, 'gh:acme/app#7');
+    assert.equal(result.entries[0].data.migratedFrom, 'T7');
+    assert.equal(existsSync(join(dir, 'manifest.jsonl')), false, 'root must never be created once segmented');
+    const { entries } = { entries: readForestEntries(dir) };
+    assert.equal(entries.filter((e) => e.ticket === 'gh:acme/app#7').length, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Adversarial-review finding: an UNSIGNED source entry (recorded without a key —
+// indistinguishable, on the wire, from an attacker's forgery written by anyone
+// with local filesystem access) must never be trusted as a genuine candidate to
+// re-attest once a signing key IS available at migration time. Without the
+// entrySigValid check, this function would sign the copied data FRESH under the
+// new id, laundering an unsigned claim into a validly HMAC-signed attestation.
+test('migrateManifestEvidence never signs a re-attestation sourced from an UNSIGNED entry, even in this checkout\'s own segment', () => {
+  const { root, dir } = gitRepo();
+  try {
+    activate(dir);
+    // Recorded with NO key active — an honest legacy entry, or indistinguishable
+    // from a forgery planted by anyone with local write access to the checkout.
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+
+    const result = migrateManifestEvidence(root, 'T7', 'gh:acme/app#9', {
+      now: '2026-06-27T00:00:00Z', key: 'migration-time-key',
+    });
+    assert.equal(result.migrated, 0, 'an unsigned source must never be laundered into a freshly signed attestation');
+    const resolved = resolveOpenSegment(dir, { cwd: root });
+    const raw = readFileSync(segmentPath(dir, resolved.name), 'utf8').trim().split('\n');
+    assert.equal(raw.length, 1, 'nothing was appended for the refused migration');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('migrateManifestEvidence in a segmented repo signs the re-attestation and continues the open segment', () => {
+  const { root, dir } = gitRepo();
+  const KEY = 'reassign-segment-key';
+  try {
+    activate(dir);
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: KEY,
+    });
+    const before = resolveOpenSegment(dir, { cwd: root });
+    assert.equal(before.isNew, false);
+    migrateManifestEvidence(root, 'T7', 'gh:r#9', { now: '2026-06-27T00:00:00Z', key: KEY });
+    const after = resolveOpenSegment(dir, { cwd: root });
+    assert.equal(after.name, before.name, 'the re-attestation continues the same open segment, not a new one');
+    const raw = readFileSync(segmentPath(dir, after.name), 'utf8').trim().split('\n');
+    assert.equal(raw.length, 2);
+    const reattestation = JSON.parse(raw[1]);
+    assert.equal(typeof reattestation.sig, 'string');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('migrateManifestEvidence mints a segment whose FIRST entry carries an anchor into root, v2-signed', () => {
+  const { root, dir } = gitRepo();
+  const KEY = 'rootless-anchor-key'; // source evidence must itself be signed to be a migratable candidate
+  try {
+    // Evidence recorded BEFORE cutover lands in root; activation then opens this
+    // branch's first segment, which the re-attestation itself mints and anchors.
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: KEY,
+    });
+    activate(dir);
+
+    const result = migrateManifestEvidence(root, 'T7', 'gh:r#3', {
+      now: '2026-06-27T00:00:00Z', key: KEY,
+    });
+    assert.equal(result.migrated, 1);
+    const resolved = resolveOpenSegment(dir, { cwd: root });
+    const raw = readFileSync(segmentPath(dir, resolved.name), 'utf8').trim().split('\n');
+    const first = JSON.parse(raw[0]);
+    assert.equal(Object.hasOwn(first, 'anchor'), true, 'the segment\'s first entry must carry the anchor');
+    assert.equal(first.data.migratedFrom, 'T7', 'it re-attests the ROOT evidence forward, not a no-op mint');
+    assert.equal(first.sigVersion, 2, 'an anchor-carrying entry must be signed at v2');
+    const { sig: _sig, segment: _segment, ...signed } = first;
+    const expectedSig = createHmac('sha256', KEY).update(canonicalJson(signed)).digest('hex');
+    assert.equal(first.sig, expectedSig, 'sig must be a real v2 HMAC over every field but sig/segment, not a placeholder');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('migrateManifestEvidence never resurrects a stale root verdict over a causally-later segment one (adversarial-review finding)', () => {
+  const { root, dir } = gitRepo();
+  try {
+    // A root approval recorded at a HIGH seq before cutover...
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+    for (let i = 0; i < 20; i += 1) {
+      recordTicketEvidence(root, {
+        transactionId: `tx-pad-${i}`, operation: 'complete', ticketId: `PAD${i}`,
+        ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+      });
+    }
+    activate(dir);
+    // ...then a causally-LATER segment entry for the SAME gate, at a low seq
+    // (segments restart their own seq counter at 1) — this must win.
+    recordTicketEvidence(root, {
+      transactionId: 'tx-2', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'i'.repeat(64), storeHash: 't'.repeat(64), key: null,
+    });
+    const resolvedBefore = resolveOpenSegment(dir, { cwd: root });
+    assert.equal(resolvedBefore.isNew, false, 'precondition: the segment entry already landed');
+
+    const result = migrateManifestEvidence(root, 'T7', 'gh:r#4', { now: '2026-06-27T00:00:00Z', key: null });
+    assert.equal(result.migrated, 1);
+    assert.equal(result.entries[0].data.migratedFrom, 'T7');
+    // The re-attested storeHash must be the SEGMENT entry's, not root's stale one.
+    assert.match(result.entries[0].data.migratedEvidenceHash, /^[0-9a-f]{64}$/);
+    const raw = readFileSync(segmentPath(dir, resolvedBefore.name), 'utf8').trim().split('\n');
+    const carried = JSON.parse(raw.at(-1));
+    assert.equal(carried.data.migratedFrom, 'T7');
+    const segmentSourceLine = JSON.parse(raw[0]);
+    assert.equal(segmentSourceLine.data.storeHash, 't'.repeat(64), 'the segment\'s own T7 entry (causally later) is the one carried forward');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('migrateManifestEvidence ignores an UNRELATED lineage\'s segment — no total order across independent segments', () => {
+  const { root, dir } = gitRepo();
+  try {
+    activate(dir);
+    // A hand-built segment simulating a DIFFERENT branch/lineage's evidence —
+    // never opened via this checkout's .lineage token.
+    const foreignName = 'foreign-01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl';
+    const foreignEntry = {
+      seq: 1, gate: 'ticket-complete', ts: '2026-01-01T00:00:00.000Z', ticket: 'T7',
+      data: { verdict: 'clear' }, files: {}, prev: null, anchor: null,
+    };
+    writeFileSync(join(dir, 'manifest.d', foreignName), `${JSON.stringify(foreignEntry)}\n`);
+
+    const result = migrateManifestEvidence(root, 'T7', 'gh:r#5', { now: '2026-06-27T00:00:00Z', key: null });
+    assert.equal(result.migrated, 0, 'an unrelated lineage\'s evidence must never be picked up — no total order across independent segments');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// P5 prosecution finding: forestChainsIntact must fail closed on a nested
+// directory anywhere under manifest.d/ (spec §5 item 1), matching
+// gate-manifest's own verify() — see manifest-segments.test.mjs's identical
+// test for the direct evidence-recording path.
+test('migrateManifestEvidence refuses to append when a nested directory shadows a segment name under manifest.d/', () => {
+  const { root, dir } = gitRepo();
+  try {
+    activate(dir);
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+    mkdirSync(join(dir, 'manifest.d', 'evil-01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl'), { recursive: true });
+
+    assert.throws(
+      () => migrateManifestEvidence(root, 'T7', 'gh:r#6', { now: '2026-06-27T00:00:00Z', key: null }),
+      /manifest forest is invalid/,
+      'a nested directory anywhere under manifest.d/ must block re-attestation, not be silently skipped'
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('migrateManifestEvidence refuses to append when a segment chain is broken', () => {
+  const { root, dir } = gitRepo();
+  try {
+    activate(dir);
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+    const resolved = resolveOpenSegment(dir, { cwd: root });
+    const segFile = segmentPath(dir, resolved.name);
+    const entry = JSON.parse(readFileSync(segFile, 'utf8').trim());
+    entry.prev = 'f'.repeat(64);
+    writeFileSync(segFile, `${JSON.stringify(entry)}\n`);
+
+    assert.throws(
+      () => migrateManifestEvidence(root, 'T7', 'gh:r#4', { now: '2026-06-27T00:00:00Z', key: null }),
+      /manifest forest is invalid/,
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

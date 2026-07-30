@@ -15,7 +15,10 @@
 import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { withLedgerLock } from '@adlc/core';
-import { ACTIVE_DIRECTORY, DirectoryTicketStore, LEGACY_FILE, detectTicketStore, TicketService, ticketFilename, acquireTicketLock, releaseTicketLock } from '@adlc/tickets';
+import {
+  ACTIVE_DIRECTORY, DirectoryTicketStore, LEGACY_FILE, detectTicketStore, TicketService, ticketFilename,
+  acquireTicketLock, releaseTicketLock, isSegmentedRepo, peekOpenSegment, segmentPath,
+} from '@adlc/tickets';
 import { defaultGit } from './worktrees.mjs';
 
 const MANIFEST_FILE = '.adlc/manifest.jsonl';
@@ -23,6 +26,88 @@ const MANIFEST_FILE = '.adlc/manifest.jsonl';
 /** Repo-relative path of the store artifact a completion of `id` rewrites. */
 function completionStorePath(store, id) {
   return store instanceof DirectoryTicketStore ? `${ACTIVE_DIRECTORY}/${ticketFilename(id)}` : LEGACY_FILE;
+}
+
+function segmentArtifact(dir, name) {
+  return { abs: segmentPath(dir, name), rel: `.adlc/manifest.d/${name}`, pending: false };
+}
+
+/**
+ * Which ledger artifact THIS completion's evidence will actually land in
+ * (T-MANIFEST-FOREST, adversarial-review finding): Fleet used to stage,
+ * commit, and roll back only root's manifest.jsonl unconditionally. Once
+ * TicketService's evidence writer routes to a segment post-cutover, that left
+ * the segment file untracked after a successful commit, and — worse —
+ * un-rolled-back on withdrawal: a withdrawn completion's evidence would
+ * survive in the segment, ready for a later, unrelated commit's `git add` to
+ * sweep it in as false lifecycle evidence.
+ *
+ * Called BEFORE the write. Uses peekOpenSegment (never mints) rather than
+ * resolveOpenSegment: minting has a side effect (writing a fresh .lineage
+ * token pointing at a file that does not exist yet), so resolving for real
+ * here AND letting the actual writer resolve again inside service.apply()
+ * would race — each call would mint a DIFFERENT segment, and this file would
+ * stage/commit/roll back a path the evidence never actually landed in. When
+ * no segment is already open, `pending: true` signals the caller to resolve
+ * for real only AFTER the write, once a file genuinely exists to find.
+ */
+function resolveManifestArtifact(repo) {
+  const dir = join(repo, '.adlc');
+  if (!isSegmentedRepo(dir)) {
+    return { abs: join(repo, MANIFEST_FILE), rel: MANIFEST_FILE, pending: false };
+  }
+  const peeked = peekOpenSegment(dir, { cwd: repo });
+  if (peeked) return segmentArtifact(dir, peeked.name);
+  return { abs: null, rel: null, pending: true };
+}
+
+/**
+ * Re-resolve the artifact after the write. Always re-peeks (not just when
+ * `pending`) so this reflects where the write ACTUALLY landed, not merely a
+ * pre-write guess (adversarial-review finding): an external checkout switch
+ * between resolveManifestArtifact's peek and service.apply's real write can
+ * redirect the evidence into a DIFFERENT segment than the one already open —
+ * the write resolves against whatever branch is CURRENT at write time, same
+ * as any other manifest writer. When that happens, `raced: true` tells the
+ * caller the captured `priorManifest`/`afterManifest` belong to the WRONG
+ * file — it must not attempt a targeted restore against them.
+ */
+function resolveManifestArtifactAfterWrite(repo, artifact, priorLineCount) {
+  const dir = join(repo, '.adlc');
+  if (!isSegmentedRepo(dir)) return artifact; // root never moves
+  const peeked = peekOpenSegment(dir, { cwd: repo }); // safe now: the file genuinely exists
+  if (!peeked) return artifact; // unreachable in practice after a real write; keep the prior guess
+  const resolved = segmentArtifact(dir, peeked.name);
+  if (!artifact.pending) {
+    if (artifact.abs !== resolved.abs) return { ...resolved, raced: true };
+    // `priorManifest` (the caller's rollback preimage) was captured OUTSIDE the
+    // ledger lock (adversarial-review finding): a concurrent recorder can append to
+    // this SAME already-open segment in the unlocked window between that read and
+    // this write's own locked append. The file-identity check above only catches a
+    // DIFFERENT segment (a checkout-switch race); it says nothing about EXTRA lines
+    // landing in the SAME one. If more than exactly the one line this write itself
+    // added is now present, priorManifest is no longer an exact preimage of
+    // "everything except our own entry" — a rollback that restores to it would
+    // delete the concurrent recorder's entry along with ours.
+    const lineCount = existsSync(resolved.abs)
+      ? readFileSync(resolved.abs, 'utf8').split('\n').filter((l) => l.trim() !== '').length
+      : 0;
+    if (lineCount !== priorLineCount + 1) return { ...resolved, raced: true };
+    return resolved;
+  }
+  // artifact.pending assumed no segment was open pre-write, so priorManifest
+  // was captured as null on the theory that the write mints a BRAND NEW file
+  // containing only our own single evidence entry. If the resolved segment
+  // instead has MORE than one entry, the write actually landed in a segment
+  // that already existed — a checkout-switch race redirected us into another
+  // branch's segment (adversarial-review finding). Trusting priorManifest as
+  // null there would make a failed-commit rollback `restoreFile(..., null)`
+  // and delete that pre-existing segment entirely.
+  const lineCount = existsSync(resolved.abs)
+    ? readFileSync(resolved.abs, 'utf8').split('\n').filter((l) => l.trim() !== '').length
+    : 0;
+  if (lineCount > 1) return { ...resolved, raced: true };
+  return resolved;
 }
 
 /**
@@ -67,13 +152,26 @@ function restoreFile(absPath, priorBytes) {
  * concurrent evidence. An extra append-only evidence line is harmless; losing
  * another writer's evidence is not.
  */
-export function revertCompletionCommit({ repo, toSha, shardPath = null, completionSha = null, integrationBranch, git = defaultGit(repo) } = {}) {
+export function revertCompletionCommit({ repo, toSha, shardPath = null, completionSha = null, integrationBranch, ledgerPath = MANIFEST_FILE, raced = false, git = defaultGit(repo) } = {}) {
   // Branch IDENTITY, not just commit identity. A SHA match alone is insufficient:
   // another branch can legitimately point at the completion commit, so if the shared
   // checkout switched to one of those, every SHA precondition below would pass and the
   // `reset --soft` would rewind THAT branch — leaving the rejected completion sitting
   // on the integration branch. Same guard completeTicketOnIntegration uses.
   if (!integrationBranch) throw new Error('revertCompletionCommit requires integrationBranch to verify the checkout before rewinding');
+  // `raced: true` (adversarial-review finding): the completion commit's ledgerPath was
+  // a BRAND NEW file that, at commit time, already held a concurrent recorder's entry
+  // alongside our own — the "ledger unchanged since our commit" check below only
+  // proves nothing ELSE has touched the file SINCE the commit; it cannot see that the
+  // commit itself was never exclusively ours. A `git restore` here would reset
+  // ledgerPath to its pre-commit (nonexistent) state, deleting the concurrent
+  // recorder's entry along with ours. Refuse outright — same "withdrawal is exact or
+  // it does not happen" rule as the two preconditions below — and let the caller
+  // escalate to quarantine, which is the honest outcome: a human must reconcile which
+  // entry is genuine, not this function guessing.
+  if (raced) {
+    throw new Error('refusing to withdraw: the completion commit shares its ledger file with a concurrent recorder\'s entry — a blind restore would delete their evidence too');
+  }
   // Withdrawal is EXACT or it does not happen. Two preconditions, both checked against
   // the shared checkout as it is RIGHT NOW:
   //   1. HEAD is still our completion commit. Otherwise a --soft reset would silently
@@ -100,8 +198,8 @@ export function revertCompletionCommit({ repo, toSha, shardPath = null, completi
   if (completionSha && git('rev-parse', integrationBranch) !== completionSha) {
     throw new Error(`refusing to withdraw: "${integrationBranch}" no longer points at the completion commit ${completionSha}`);
   }
-  const committedManifest = git('show', `${head}:${MANIFEST_FILE}`);
-  const manifestAbs = join(repo, MANIFEST_FILE);
+  const committedManifest = git('show', `${head}:${ledgerPath}`);
+  const manifestAbs = join(repo, ledgerPath);
 
   // The ledger comparison and the restore that acts on it MUST be one critical
   // section. Checking first and restoring after leaves a window in which a recorder
@@ -131,7 +229,7 @@ export function revertCompletionCommit({ repo, toSha, shardPath = null, completi
     // while we hold both locks, so restore both owned paths exactly. Still
     // path-scoped — never a checkout-wide reset --hard.
     git('reset', '-q', '--soft', toSha);
-    const paths = shardPath ? [shardPath, MANIFEST_FILE] : [MANIFEST_FILE];
+    const paths = shardPath ? [shardPath, ledgerPath] : [ledgerPath];
     git('restore', '--staged', '--worktree', '--', ...paths);
     return { reverted: true, toSha };
   });
@@ -161,7 +259,6 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
   const store = detectStore({ root: repo });
   const storePath = completionStorePath(store, ticketId);
   const storeAbs = join(repo, storePath);
-  const manifestAbs = join(repo, MANIFEST_FILE);
 
   // Hold the ticket writer lock across the ENTIRE completion — the read, the
   // transaction, the commit, and any rollback. The transaction alone releases the
@@ -178,17 +275,30 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
     // still records evidence and would leave an empty commit.
     if (existing.completed === true) return { completed: false, alreadyComplete: true };
 
+    // Resolved (read-only — never mints, see resolveManifestArtifact) only once
+    // we know a real completion will happen: the two early returns above must
+    // stay side-effect-free no-ops.
+    let artifact = resolveManifestArtifact(repo);
+
     // Capture pre-completion bytes (BEFORE the transaction writes them) so a failed
-    // commit rolls back precisely.
+    // commit rolls back precisely. A `pending` artifact (no segment open yet) is
+    // guaranteed prior:null — the write is about to mint a fresh file via a random
+    // ULID, astronomically unlikely to collide with anything already on disk.
     const priorStore = existsSync(storeAbs) ? readFileSync(storeAbs) : null;
-    const priorManifest = existsSync(manifestAbs) ? readFileSync(manifestAbs) : null;
+    const priorManifest = artifact.pending ? null : (existsSync(artifact.abs) ? readFileSync(artifact.abs) : null);
+    const priorLineCount = priorManifest === null ? 0 : priorManifest.toString('utf8').split('\n').filter((l) => l.trim() !== '').length;
 
     // rails-guard-ci DENIES a PR that CREATES .adlc/manifest.jsonl with evidence
     // (only a verified migration may); appending to an existing one is allowed. On a
     // repo whose ADLC manifest is not yet bootstrapped, recording completion evidence
     // here would create the ledger and get the whole fleet PR rejected. Skip
-    // auto-completion in that case and degrade to "merged, not yet completed".
-    if (priorManifest === null) return { completed: false, reason: 'no-manifest-baseline' };
+    // auto-completion in that case and degrade to "merged, not yet completed". This
+    // is specifically about ROOT: no equivalent rail exists yet for minting a new
+    // segment (T-MANIFEST-FOREST slice 6, not shipped), and a segmented repo's root
+    // staying absent/frozen is the EXPECTED state, not a signal to skip.
+    if (artifact.abs === join(repo, MANIFEST_FILE) && priorManifest === null) {
+      return { completed: false, reason: 'no-manifest-baseline' };
+    }
 
     // The tip BEFORE the completion commit — the caller re-gates the new commit and
     // rolls back to exactly here if that gate fails.
@@ -196,6 +306,10 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
 
     const service = new TicketService(store, { root: repo, key });
     service.apply(service.planComplete(ticketId), { lock });
+    // Re-resolve now that the write has happened: a `pending` artifact's real
+    // name only exists on disk after this point (see resolveManifestArtifact).
+    artifact = resolveManifestArtifactAfterWrite(repo, artifact, priorLineCount);
+    const manifestAbs = artifact.abs;
     // What the manifest looks like immediately after OUR append — the baseline for
     // detecting a concurrent evidence append before any rollback.
     const afterManifest = existsSync(manifestAbs) ? readFileSync(manifestAbs) : null;
@@ -208,8 +322,8 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
       // between entry and here would otherwise land this lifecycle commit on whatever
       // branch is now current. This narrows the unpreventable window to these calls.
       assertOnBranch(git, integrationBranch, 'before committing');
-      git('add', '--', storePath, MANIFEST_FILE);
-      git('commit', '-q', '-m', `chore(${ticketId}): mark completed after passing merge gate`, '--', storePath, MANIFEST_FILE);
+      git('add', '--', storePath, artifact.rel);
+      git('commit', '-q', '-m', `chore(${ticketId}): mark completed after passing merge gate`, '--', storePath, artifact.rel);
       committed = true;
       // DETECT the switch we cannot prevent. Note this can only fail AFTER the commit
       // landed, which is a materially different situation from a failed commit.
@@ -245,13 +359,26 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
       // Lock order is ticket → manifest here, matching the transaction layer, so this
       // cannot deadlock against a concurrent recorder.
       let ledgerDirty = false;
-      withLedgerLock(manifestAbs, () => {
-        const now = existsSync(manifestAbs) ? readFileSync(manifestAbs) : null;
-        const stillOurTail = now !== null && afterManifest !== null && now.equals(afterManifest);
-        if (stillOurTail) restoreFile(manifestAbs, priorManifest);
-        else ledgerDirty = true;
-      });
-      try { git('reset', '-q', '--', storePath, MANIFEST_FILE); } catch { /* best-effort unstage */ }
+      if (artifact.raced) {
+        // Either the write landed in a DIFFERENT segment than the one priorManifest
+        // was captured for (a checkout-switch race), or a concurrent recorder
+        // appended into the SAME already-open segment in the unlocked window before
+        // this write's own locked append (see resolveManifestArtifactAfterWrite for
+        // both cases) — either way, priorManifest is no longer a trustworthy preimage
+        // of "everything except our own entry": a targeted restore here would corrupt
+        // or delete real evidence that was never ours. Never guess: flag dirty so the
+        // caller quarantines the branch instead of silently leaving false evidence
+        // behind under the pretense of a clean rollback.
+        ledgerDirty = true;
+      } else {
+        withLedgerLock(manifestAbs, () => {
+          const now = existsSync(manifestAbs) ? readFileSync(manifestAbs) : null;
+          const stillOurTail = now !== null && afterManifest !== null && now.equals(afterManifest);
+          if (stillOurTail) restoreFile(manifestAbs, priorManifest);
+          else ledgerDirty = true;
+        });
+      }
+      try { git('reset', '-q', '--', storePath, artifact.rel); } catch { /* best-effort unstage */ }
       if (ledgerDirty) error.ledgerDirty = true;
       throw error;
     }
@@ -259,7 +386,16 @@ export function completeTicketOnIntegration({ repo, ticketId, integrationBranch,
     // The exact commit we created — the withdrawal path requires HEAD to still be
     // this, so it can never uncommit someone else's work.
     const completionSha = git('rev-parse', 'HEAD');
-    return { completed: true, preCompletionSha, completionSha, shardPath: storePath };
+    // `raced: true` (adversarial-review finding) means this commit's ledgerPath was a
+    // BRAND NEW file whose content, at commit time, already held MORE than our own
+    // entry — a concurrent recorder won the mint and appended before we did, and our
+    // commit captured both entries together (the write itself is correct: nothing was
+    // lost here). The caller MUST carry this forward to revertCompletionCommit: a
+    // later withdrawal that blindly restores `ledgerPath` to its pre-commit (absent)
+    // state would delete the concurrent recorder's entry along with ours, since the
+    // ledger-unchanged-since-commit check alone cannot see that the commit itself was
+    // never exclusively ours.
+    return { completed: true, preCompletionSha, completionSha, shardPath: storePath, ledgerPath: artifact.rel, raced: artifact.raced === true };
   } finally {
     releaseTicketLock(lock);
   }

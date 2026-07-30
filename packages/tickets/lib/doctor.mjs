@@ -1,12 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { canonicalJson } from './canonical.mjs';
 import { ARCHIVE_DIRECTORY, CURRENT_TICKET_FILE, LOCK_DIRECTORY } from './constants.mjs';
 import { readTicketLock } from './lock.mjs';
 import { readActiveTicketPointer, resolveActiveTicketAgainst } from './pointer.mjs';
 import { pendingTransactions } from './store.mjs';
 import { DirectoryTicketStore } from './stores/directory.mjs';
+import { isSegmentedRepo, peekOpenSegment, segmentPath, entrySigValid } from './manifest-segments.mjs';
 import { validateKeyParam } from './key-contract.mjs';
 
 /**
@@ -60,32 +60,42 @@ function currentTicketCheck(root, snapshot) {
  * removes the shard the same way a hand-delete would and records no evidence
  * either, so absence is inherently ambiguous and left to the archive/graph checks.
  */
-// Manifest HMAC verification, mirroring @adlc/gate-manifest's sign.mjs byte-for-byte.
-// It cannot be imported: the package graph is tickets ← core ← gate-manifest, so
-// tickets (the base layer) would create a cycle. The v1 form is a fixed key order;
-// v2 signs canonical JSON of every field but `sig` (this package's canonicalJson is
-// byte-identical to core's, verified by test). Keep in lockstep with sign.mjs.
+// entrySigValid now lives in manifest-segments.mjs — shared with
+// forestChainsIntact's own signature-aware chain check, and still the only
+// place in this package that mirrors @adlc/gate-manifest's sign.mjs
+// byte-for-byte (see that file's header for why this cannot be imported
+// from gate-manifest directly: tickets ← core ← gate-manifest would cycle).
 
-function canonicalEntryBytes(entry) {
-  if (entry.sigVersion === 2) {
-    const { sig: _sig, ...signed } = entry;
-    return canonicalJson(signed);
+// Verify one chain's (root OR one segment) unbroken hash-link + (with a key)
+// per-entry signature, same rules as before this was factored out for
+// T-MANIFEST-FOREST — extracted so root and a segment can run the identical
+// algorithm. Returns the last `data.storeHash` seen, or null if none did.
+// `chainLabel` names the chain in error messages ('manifest ledger' for root,
+// 'segment <name>' otherwise) so a break is attributable.
+function walkChainForStoreHash(lines, key, chainLabel) {
+  let boundStoreHash = null;
+  let prevLine = null;
+  let prevSeq = 0;
+  for (let i = 0; i < lines.length; i++) {
+    let entry;
+    try { entry = JSON.parse(lines[i]); } catch {
+      return { ok: false, code: 'MANIFEST_MALFORMED', reason: `${chainLabel} has a malformed entry at line ${i + 1}; integrity check FAILED` };
+    }
+    const expectedPrev = prevLine === null ? null : createHash('sha256').update(prevLine).digest('hex');
+    if (entry?.prev !== expectedPrev || entry?.seq !== prevSeq + 1) {
+      return { ok: false, code: 'MANIFEST_CHAIN_INVALID', reason: `${chainLabel} hash chain breaks at line ${i + 1}; integrity check FAILED` };
+    }
+    // With a key configured EVERY entry must carry a valid signature. The backward
+    // hash chain alone leaves the FINAL entry unprotected — nothing links forward
+    // from it — so its data.storeHash could be edited in place undetected.
+    if (key !== null && !entrySigValid(key, entry)) {
+      return { ok: false, code: 'MANIFEST_SIGNATURE_INVALID', reason: `${chainLabel} entry at line ${i + 1} is unsigned or its signature does not verify; integrity check FAILED` };
+    }
+    if (entry?.data && typeof entry.data.storeHash === 'string') boundStoreHash = entry.data.storeHash;
+    prevLine = lines[i];
+    prevSeq = entry.seq;
   }
-  const canonical = { seq: entry.seq, gate: entry.gate, ts: entry.ts };
-  if (entry.ticket !== undefined) canonical.ticket = entry.ticket;
-  if (entry.data !== undefined) canonical.data = entry.data;
-  canonical.files = entry.files;
-  canonical.prev = entry.prev;
-  return JSON.stringify(canonical);
-}
-
-function entrySigValid(key, entry) {
-  if (typeof entry.sig !== 'string' || entry.sig.length === 0) return false;
-  const expected = createHmac('sha256', key).update(canonicalEntryBytes(entry)).digest('hex');
-  const a = Buffer.from(entry.sig, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return { ok: true, boundStoreHash };
 }
 
 function storeHashBindingCheck(root, snapshot, key) {
@@ -95,44 +105,59 @@ function storeHashBindingCheck(root, snapshot, key) {
   if (!snapshot) return { ...check, bound: false, reason: 'active store did not load; storeHash binding not checked' };
 
   const manifestPath = join(root, '.adlc/manifest.jsonl');
-  if (!existsSync(manifestPath)) return { ...check, bound: false, reason: 'no evidence ledger yet' };
-
-  let lines;
-  try {
-    lines = readFileSync(manifestPath, 'utf8').split('\n').filter((line) => line.trim());
-  } catch (error) {
-    return { ...check, ok: false, code: 'MANIFEST_UNREADABLE', message: `cannot read the evidence ledger: ${error.message}` };
-  }
+  let boundStoreHash = null;
 
   // Verify the manifest is a well-formed, unbroken hash chain BEFORE trusting any
   // storeHash it records. Otherwise a forged or tampered ledger could assert an
   // arbitrary "bound" hash, and a malformed line silently skipped could hide a break.
   // The chain format is the ledger writer's (evidence.mjs / ledger.mjs): each entry's
   // `prev` is sha256 of the previous raw line, and `seq` increments from 1.
-  let boundStoreHash = null;
-  let prevLine = null;
-  let prevSeq = 0;
-  for (let i = 0; i < lines.length; i++) {
-    let entry;
-    try { entry = JSON.parse(lines[i]); } catch {
-      // A corrupt/tampered ledger is a real integrity FAILURE, not an inert state:
-      // it must fail the check (and the report), distinct from the legitimately-inert
-      // "no manifest yet" cases above which stay ok:true.
-      return { ...check, ok: false, code: 'MANIFEST_MALFORMED', reason: `manifest ledger has a malformed entry at line ${i + 1}; integrity check FAILED` };
+  if (existsSync(manifestPath)) {
+    let lines;
+    try {
+      lines = readFileSync(manifestPath, 'utf8').split('\n').filter((line) => line.trim());
+    } catch (error) {
+      return { ...check, ok: false, code: 'MANIFEST_UNREADABLE', message: `cannot read the evidence ledger: ${error.message}` };
     }
-    const expectedPrev = prevLine === null ? null : createHash('sha256').update(prevLine).digest('hex');
-    if (entry?.prev !== expectedPrev || entry?.seq !== prevSeq + 1) {
-      return { ...check, ok: false, code: 'MANIFEST_CHAIN_INVALID', reason: `manifest hash chain breaks at line ${i + 1}; integrity check FAILED` };
+    const rootResult = walkChainForStoreHash(lines, key, 'manifest ledger');
+    if (!rootResult.ok) return { ...check, ok: false, code: rootResult.code, reason: rootResult.reason };
+    if (rootResult.boundStoreHash !== null) boundStoreHash = rootResult.boundStoreHash;
+  }
+
+  // T-MANIFEST-FOREST: once segmented, THIS branch's evidence-required
+  // transactions land in its own open segment, not root (root is frozen or
+  // was never used at all in a greenfield repo). Scoped deliberately to just
+  // the ONE segment this checkout's lineage token resolves to — not "the
+  // whole forest" — because there is no total order across independent
+  // segments to pick a single "latest" from (the same reason
+  // carryForwardCrossModelReview and ticket-sync's outcomes reducer stay
+  // scoped rather than guessing); root-then-this-branch's-segment IS a well
+  // defined order, since the segment can only exist anchored after root's
+  // state at mint time.
+  const dir = join(root, '.adlc');
+  if (isSegmentedRepo(dir)) {
+    // peekOpenSegment (never mints), NOT resolveOpenSegment — this is a read-only
+    // doctor check with no writer lock held; resolveOpenSegment's minting branch
+    // writes the .lineage token as a side effect, which could race a genuine
+    // writer that already minted its own token but has not yet created the
+    // segment file, splitting that writer's evidence across two segments
+    // (adversarial-review finding).
+    const resolved = peekOpenSegment(dir, { cwd: root });
+    if (resolved) {
+      const segFile = segmentPath(dir, resolved.name);
+      let segLines;
+      try {
+        segLines = existsSync(segFile) ? readFileSync(segFile, 'utf8').split('\n').filter((line) => line.trim()) : [];
+      } catch (error) {
+        return { ...check, ok: false, code: 'MANIFEST_UNREADABLE', message: `cannot read segment ${resolved.name}: ${error.message}` };
+      }
+      const segResult = walkChainForStoreHash(segLines, key, `segment ${resolved.name}`);
+      if (!segResult.ok) return { ...check, ok: false, code: segResult.code, reason: segResult.reason };
+      if (segResult.boundStoreHash !== null) boundStoreHash = segResult.boundStoreHash;
     }
-    // With a key configured EVERY entry must carry a valid signature. The backward
-    // hash chain alone leaves the FINAL entry unprotected — nothing links forward
-    // from it — so its data.storeHash could be edited in place undetected.
-    if (key !== null && !entrySigValid(key, entry)) {
-      return { ...check, ok: false, code: 'MANIFEST_SIGNATURE_INVALID', reason: `manifest entry at line ${i + 1} is unsigned or its signature does not verify; integrity check FAILED` };
-    }
-    if (entry?.data && typeof entry.data.storeHash === 'string') boundStoreHash = entry.data.storeHash;
-    prevLine = lines[i];
-    prevSeq = entry.seq;
+    // resolved === null means this branch has never recorded evidence into a
+    // segment yet — nothing to add; root's own boundStoreHash (if any) still
+    // stands as the latest known checkpoint for this checkout.
   }
 
   if (!boundStoreHash) return { ...check, bound: false, reason: 'no evidence-required transaction recorded yet' };

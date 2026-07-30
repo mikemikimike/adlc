@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHmac } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DirectoryTicketStore, TicketService, doctorTicketStore, prettyCanonicalJson, ticketFilename } from '../index.mjs';
@@ -269,6 +270,23 @@ test('doctor storehash-manifest-bind: a forged / chain-broken manifest is NOT tr
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('doctor storehash-manifest-bind: a manifest line that is not valid JSON FAILS the integrity check', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // Not a chain break, not a bad signature — the line itself does not parse.
+    // Distinct failure mode from the forged/chain-broken case above; must not be
+    // silently skipped or treated as an ignorable trailing line.
+    const manifestPath = join(root, '.adlc', 'manifest.jsonl');
+    writeFileSync(manifestPath, readFileSync(manifestPath, 'utf8') + 'not-json-at-all\n');
+
+    const report = doctorTicketStore(store, { root });
+    const check = bindCheck(report);
+    assert.equal(check.ok, false, 'a malformed manifest line FAILS the integrity check');
+    assert.equal(check.code, 'MANIFEST_MALFORMED', 'the malformed-entry code is reported, not miscategorized as a chain break');
+    assert.equal(report.ok, false, 'and fails the overall report');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // Signature verification (adversarial-review round 6): the backward hash chain
 // leaves the FINAL entry unprotected, so with a key configured every entry must
 // also carry a valid HMAC or the last entry's storeHash could be edited in place.
@@ -350,6 +368,102 @@ test('doctor storehash-manifest-bind: a store with no recorded evidence yet is i
     const check = bindCheck(report);
     assert.equal(check.ok, true);
     assert.equal(check.bound, false, 'nothing to bind against yet');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// T-MANIFEST-FOREST (adversarial-review finding): storeHashBindingCheck must
+// bind to evidence recorded in this branch's own segment, not just root —
+// needs a real git repo, since segment resolution reads the current branch.
+function gitStoreWithSegmentedEvidence({ key = null } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'adlc-doctor-segment-'));
+  const g = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  g('init', '-q', '-b', 'feat/doctor-segment-test');
+  g('config', 'user.email', 't@t.co');
+  g('config', 'user.name', 'tester');
+  g('config', 'commit.gpgsign', 'false');
+  writeFileSync(join(root, 'README.md'), 'fixture\n');
+  g('add', '.');
+  g('commit', '-q', '-m', 'init');
+  writeDirectory(root, []);
+  mkdirSync(join(root, '.adlc', 'manifest.d'), { recursive: true });
+  writeFileSync(join(root, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+  const store = new DirectoryTicketStore(join(root, '.adlc', 'tickets'));
+  const service = new TicketService(store, { root, key });
+  service.apply(service.planCreate(ticket('A')));
+  service.apply(service.planComplete('A')); // evidence-required → recorded into the segment
+  return { root, store, service };
+}
+
+test('doctor storehash-manifest-bind: binds to evidence recorded in a segment (segmented repo), not just root', () => {
+  const { root, store } = gitStoreWithSegmentedEvidence();
+  try {
+    const report = doctorTicketStore(store, { root });
+    const check = bindCheck(report);
+    assert.equal(check.ok, true, JSON.stringify(check));
+    assert.equal(check.bound, true, 'must bind to the segment-recorded checkpoint, not report "no evidence yet"');
+    assert.equal(check.storeHash, check.boundStoreHash);
+    assert.notEqual(check.drift, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: a signed segment checkpoint is authenticated the same as a signed root one', () => {
+  // The key is an EXPLICIT parameter now — env manipulation is inert by design
+  // (spec Layer 2, P1): both evidence recording and doctor consult only what
+  // they are handed.
+  const { root, store } = gitStoreWithSegmentedEvidence({ key: 'doctor-segment-test-key' });
+  try {
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'doctor-segment-test-key' }));
+    assert.equal(check.bound, true);
+    assert.equal(check.authenticated, true);
+    assert.equal(check.signaturesVerified, true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: a corrupted segment chain fails closed, not silently ignored', () => {
+  const { root, store } = gitStoreWithSegmentedEvidence();
+  try {
+    const segDir = join(root, '.adlc', 'manifest.d');
+    const segName = readdirSync(segDir).find((n) => n.endsWith('.jsonl'));
+    const segPath = join(segDir, segName);
+    const entry = JSON.parse(readFileSync(segPath, 'utf8').trim());
+    entry.prev = 'f'.repeat(64); // break the chain
+    writeFileSync(segPath, `${JSON.stringify(entry)}\n`);
+
+    const check = bindCheck(doctorTicketStore(store, { root }));
+    assert.equal(check.ok, false);
+    assert.equal(check.code, 'MANIFEST_CHAIN_INVALID');
+    assert.match(check.reason, new RegExp(segName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// Adversarial-review finding: a read-only doctor check must never mint a segment
+// as a side effect. resolveOpenSegment (mint-capable) writes .lineage even when
+// it decides not to create anything else — a race against a real writer that
+// already minted its own token but had not yet created the segment file would
+// overwrite that token, splitting the writer's evidence across two segments.
+test('doctor storehash-manifest-bind: never mints a segment or writes .lineage (read-only)', () => {
+  const root = mkdtempSync(join(tmpdir(), 'adlc-doctor-segment-nomint-'));
+  try {
+    const g = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    g('init', '-q', '-b', 'feat/doctor-nomint-test');
+    g('config', 'user.email', 't@t.co');
+    g('config', 'user.name', 'tester');
+    g('config', 'commit.gpgsign', 'false');
+    writeFileSync(join(root, 'README.md'), 'fixture\n');
+    g('add', '.');
+    g('commit', '-q', '-m', 'init');
+    const path = writeDirectory(root, [ticket('A')]);
+    mkdirSync(join(root, '.adlc', 'manifest.d'), { recursive: true });
+    writeFileSync(join(root, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+    // Segmented, but nothing has recorded evidence into a segment yet.
+
+    const before = readdirSync(join(root, '.adlc', 'manifest.d')).sort();
+    const check = bindCheck(doctorTicketStore(new DirectoryTicketStore(path), { root }));
+    assert.equal(check.bound, false, 'no evidence recorded yet');
+    assert.deepEqual(
+      readdirSync(join(root, '.adlc', 'manifest.d')).sort(), before,
+      'doctor must not mint a segment or write .lineage as a side effect of a read-only check'
+    );
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
