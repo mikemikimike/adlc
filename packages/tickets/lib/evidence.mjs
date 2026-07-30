@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { conflict } from './errors.mjs';
 import { sha256 } from './canonical.mjs';
 import { fsyncDirectory } from './durability.mjs';
+import { validateKeyParam } from './key-contract.mjs';
 
 const sleep = (milliseconds) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 
@@ -50,6 +51,7 @@ function sign(key, entry) {
 
 /** Append an idempotent, hash-bound transaction/recovery record to gate-manifest. */
 export function recordTicketEvidence(root, {
+  key,
   transactionId,
   operation,
   action = 'apply',
@@ -59,6 +61,9 @@ export function recordTicketEvidence(root, {
   archiveHash = null,
   revision = process.env.ADLC_REVISION ?? null,
 } = {}) {
+  // Validate FIRST: the idempotent-retry early return must not bypass the key
+  // contract — an invalid key is a caller bug on every path, retries included.
+  const signingKey = validateKeyParam(key);
   const path = join(root, '.adlc/manifest.jsonl');
   return withManifestLock(path, () => {
     const content = existsSync(path) ? readFileSync(path, 'utf8') : '';
@@ -103,8 +108,7 @@ export function recordTicketEvidence(root, {
       files: {},
       prev: previous ? sha256(previous) : null,
     };
-    const key = process.env.ADLC_MANIFEST_KEY;
-    if (key) entry.sig = sign(key, entry);
+    if (signingKey) entry.sig = sign(signingKey, entry);
     const descriptor = openSync(path, 'a');
     try {
       writeFileSync(descriptor, `${JSON.stringify(entry)}\n`);
