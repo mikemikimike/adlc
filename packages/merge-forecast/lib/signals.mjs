@@ -10,7 +10,7 @@
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, resolve, dirname, relative } from 'node:path';
-import { scopesOverlap, globMatch, pairKey } from '@adlc/core';
+import { scopesOverlap, globMatch, pairKey, foldWinSeparators } from '@adlc/core';
 
 // ─── Signal 1: Declared scope overlap ────────────────────────────────────────
 
@@ -44,8 +44,11 @@ export function walkTree(root) {
       if (ent.isDirectory()) {
         walk(fullPath);
       } else if (ent.isFile()) {
-        // Return path relative to root with forward slashes
-        results.push(fullPath.slice(root.length + 1).replaceAll('\\', '/'));
+        // Windows-only fold: on POSIX a backslash is a real filename character,
+        // and aliasing `src\critical.mjs` onto `src/critical.mjs` attributes one
+        // file's history/import signals to the other, suppressing a legitimate
+        // conflict warning.
+        results.push(foldWinSeparators(fullPath.slice(root.length + 1)));
       }
     }
   }

@@ -253,3 +253,20 @@ export function normalizePathKey(env) {
   env.PATH = value;
   return true;
 }
+
+/**
+ * Fold `\` to `/` ONLY on Windows.
+ *
+ * Separator equivalence is a Windows fact, not a universal one. On POSIX a
+ * backslash is an ordinary filename character, so `test\critical.mjs` and
+ * `test/critical.mjs` are two DIFFERENT files. Folding them unconditionally has
+ * already produced three distinct defects in this repo: a wrong-file write in
+ * consensus-fix, a source file misclassified as a test (mutation-gate then
+ * exiting 0 with "nothing to mutate"), and mis-attributed merge signals.
+ *
+ * Lives here, once, because the same fold was independently reimplemented at
+ * four call sites and each copy had to be found separately.
+ */
+export function foldWinSeparators(value, platform = process.platform) {
+  return platform === 'win32' ? String(value).replaceAll('\\', '/') : String(value);
+}

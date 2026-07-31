@@ -332,6 +332,7 @@ export function winShell(env?: NodeJS.ProcessEnv): string;
 export function winSystemExe(name: string, env?: NodeJS.ProcessEnv): string;
 export function isRunnableFile(path: string, platform?: string): boolean;
 export function normalizePathKey(env: NodeJS.ProcessEnv | Record<string, string>): boolean;
+export function foldWinSeparators(value: string, platform?: string): string;
 
 // lib/railpath.mjs
 export function resolveRailPath(filePath: string, root: string): string;

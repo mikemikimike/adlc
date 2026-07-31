@@ -1,6 +1,8 @@
 // hollow-test/lib/report.mjs
 // Formats mutation results for human-readable and JSON output.
 
+import { foldWinSeparators } from '@adlc/core';
+
 /**
  * @typedef {Object} MutantResult
  * @property {string} file
@@ -80,7 +82,10 @@ export function buildJsonReport(results) {
       undetermined: undetermined.length,
     },
     mutants: results.map((r) => ({
-      file: r.file.replaceAll('\\', '/'),
+      // Win32-only, matching targets.mjs. Folding on POSIX corrupts
+      // machine-readable attribution: a result for the real file
+      // `test\critical.mjs` would be reported against `test/critical.mjs`.
+      file: foldWinSeparators(r.file),
       line: r.line,
       operator: r.operator,
       status: r.undetermined ? 'undetermined' : r.invalid ? 'invalid' : r.killed ? 'killed' : 'survived',

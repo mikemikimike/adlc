@@ -3,7 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { globMatch } from '@adlc/core';
+import { globMatch, foldWinSeparators } from '@adlc/core';
 
 // SOURCE IS AN INCLUDE-LIST, NOT AN EXCLUDE-LIST, AND THIS IS THE ONLY COPY.
 //
@@ -75,14 +75,14 @@ const SOURCE_EXT_RE = /\.(?:mjs|cjs|js)$/i;
  * rail under a test/ directory and broke the documented workflow.
  * @param {string} file repo-relative path
  */
-// Separator folding is a WINDOWS fact. On POSIX a backslash is an ordinary
-// filename character, so `test\critical.mjs` and `test/critical.mjs` are two
-// DIFFERENT files — folding them together let a real source file named with a
-// backslash be classified as test code, at which point mutation-gate reports
-// "nothing to mutate" and exits 0. A gate that silently passes is worse than
-// one that fails, so the fold applies only where it is true.
-const foldSeparators = (file, platform = process.platform) =>
-  (platform === 'win32' ? String(file).replaceAll('\\', '/') : String(file));
+// Separator folding is a WINDOWS fact — see foldWinSeparators in @adlc/core for
+// the rationale and the three defects unconditional folding produced here.
+//
+// IMPORTED, not re-implemented. A local copy of this rule is what let the same
+// bug live at four call sites and get corrected four separate times; a copy also
+// silently detaches the shared tests from this module, so reverting the shared
+// implementation would leave this file's behaviour (and its tests) green.
+const foldSeparators = foldWinSeparators;
 
 export function isSupportedSourceExtension(file, platform = process.platform) {
   return SOURCE_EXT_RE.test(foldSeparators(file, platform));

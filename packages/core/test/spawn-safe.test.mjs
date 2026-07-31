@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 const { delimiter, join } = posix;
 
-import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe, isRunnableFile, normalizePathKey } from '../lib/spawn-safe.mjs';
+import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe, isRunnableFile, normalizePathKey, foldWinSeparators } from '../lib/spawn-safe.mjs';
 
 /** An `exists` probe that answers true for exactly the given absolute paths. */
 const existsIn = (...paths) => {
@@ -375,4 +375,25 @@ test('normalizePathKey leaves an env with no PATH alone', () => {
   const env = winEnv({ HOME: '/h' });
   assert.equal(normalizePathKey(env), false);
   assert.equal(env.HOME, '/h');
+});
+
+// ---------------------------------------------------------------- foldWinSeparators
+
+// MUTATION-SENSITIVE BY CONSTRUCTION. Reverting any call site to an
+// unconditional `.replaceAll('\\','/')` must fail a test, or the fix silently
+// rots back — which is exactly what round 12 found: the round-11 folding fixes
+// were correct but nothing bound them. These assertions fail the instant the
+// platform guard is dropped.
+test('foldWinSeparators does NOT fold on POSIX (a backslash is a real filename char)', () => {
+  assert.equal(foldWinSeparators('test\\critical.mjs', 'linux'), 'test\\critical.mjs');
+  assert.equal(foldWinSeparators('test\\critical.mjs', 'darwin'), 'test\\critical.mjs');
+  assert.notEqual(
+    foldWinSeparators('test\\critical.mjs', 'linux'),
+    'test/critical.mjs',
+    'folding here is what made a SOURCE file classify as a TEST, so mutation-gate reported nothing to mutate',
+  );
+});
+
+test('foldWinSeparators DOES fold on win32, where the two spellings are one file', () => {
+  assert.equal(foldWinSeparators('test\\critical.mjs', 'win32'), 'test/critical.mjs');
 });
