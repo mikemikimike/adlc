@@ -75,12 +75,21 @@ const SOURCE_EXT_RE = /\.(?:mjs|cjs|js)$/i;
  * rail under a test/ directory and broke the documented workflow.
  * @param {string} file repo-relative path
  */
-export function isSupportedSourceExtension(file) {
-  return SOURCE_EXT_RE.test(file.replaceAll('\\', '/'));
+// Separator folding is a WINDOWS fact. On POSIX a backslash is an ordinary
+// filename character, so `test\critical.mjs` and `test/critical.mjs` are two
+// DIFFERENT files — folding them together let a real source file named with a
+// backslash be classified as test code, at which point mutation-gate reports
+// "nothing to mutate" and exits 0. A gate that silently passes is worse than
+// one that fails, so the fold applies only where it is true.
+const foldSeparators = (file, platform = process.platform) =>
+  (platform === 'win32' ? String(file).replaceAll('\\', '/') : String(file));
+
+export function isSupportedSourceExtension(file, platform = process.platform) {
+  return SOURCE_EXT_RE.test(foldSeparators(file, platform));
 }
 
-export function isMutableSource(file, { testGlobs = [], sourceGlobs = [] } = {}) {
-  const normFile = file.replaceAll('\\', '/');
+export function isMutableSource(file, { testGlobs = [], sourceGlobs = [], platform = process.platform } = {}) {
+  const normFile = foldSeparators(file, platform);
   // Explicit source declaration wins over every heuristic below. Names like
   // `hollow-test.mjs` are indistinguishable from a test by convention alone, so
   // the only correct answer is to let the project say which it is.

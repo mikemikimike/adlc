@@ -330,6 +330,8 @@ export function quoteWinCmdArg(arg: string): string;
 export function winCmdArgs(bin: string, args?: string[]): string[];
 export function winShell(env?: NodeJS.ProcessEnv): string;
 export function winSystemExe(name: string, env?: NodeJS.ProcessEnv): string;
+export function isRunnableFile(path: string, platform?: string): boolean;
+export function normalizePathKey(env: NodeJS.ProcessEnv | Record<string, string>): boolean;
 
 // lib/railpath.mjs
 export function resolveRailPath(filePath: string, root: string): string;

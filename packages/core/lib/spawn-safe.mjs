@@ -38,7 +38,7 @@ import path from 'node:path';
  * shadowing the real executable further along. Returning false for anything
  * that is not a regular file keeps the search going.
  */
-const isFile = (p, platform = process.platform) => {
+export const isRunnableFile = (p, platform = process.platform) => {
   try {
     if (!statSync(p).isFile()) return false;
   } catch {
@@ -66,6 +66,25 @@ const isFile = (p, platform = process.platform) => {
 // Windows PATH entry as "relative" and skip it. Selecting the flavour keeps the
 // win32 branch honest on any host (which is also what makes it testable).
 const flavour = (platform) => (platform === 'win32' ? path.win32 : path.posix);
+
+/**
+ * FULLY QUALIFIED, not merely "absolute".
+ *
+ * `path.win32.isAbsolute('\\tools\\agy.cmd')` is TRUE, but a single leading
+ * separator on Windows is DRIVE-RELATIVE: it inherits whatever drive the process
+ * is currently on. `\\attacker\\cmd.exe` therefore resolves differently depending
+ * on cwd — which is exactly the property this module exists to eliminate, so
+ * accepting it contradicts the fail-closed contract. Drive-qualified (`C:\\...`)
+ * and UNC (`\\\\server\\share\\...`) forms are genuinely anchored and stay allowed.
+ */
+const isFullyQualified = (value, platform) => {
+  const p = flavour(platform);
+  if (!p.isAbsolute(value)) return false;
+  if (platform !== 'win32') return true;
+  if (/^[A-Za-z]:[\\/]/.test(value)) return true;   // C:\... or C:/...
+  if (/^[\\/]{2}[^\\/]/.test(value)) return true;    // \\server\share (UNC)
+  return false;                                    // \tools\... — drive-relative
+};
 
 /**
  * Candidate filenames for `name` on the given platform, in resolution order.
@@ -106,13 +125,13 @@ export function resolveOnPath(name, opts = {}) {
   const {
     env = process.env,
     platform = process.platform,
-    exists = (candidate) => isFile(candidate, platform),
+    exists = (candidate) => isRunnableFile(candidate, platform),
   } = opts;
   const p = flavour(platform);
   const value = String(name ?? '');
   if (value === '') return null;
 
-  if (/[/\\]/.test(value)) return p.isAbsolute(value) && exists(value) ? value : null;
+  if (/[/\\]/.test(value)) return isFullyQualified(value, platform) && exists(value) ? value : null;
 
   // Windows env names are case-insensitive, so PATH may arrive as `Path`.
   const pathValue = platform === 'win32'
@@ -125,7 +144,7 @@ export function resolveOnPath(name, opts = {}) {
     // the POSIX half of this module's whole purpose — see the header.
     if (!dir) continue;
     // A relative PATH entry is cwd-anchored and equally hijackable.
-    if (!p.isAbsolute(dir)) continue;
+    if (!isFullyQualified(dir, platform)) continue;
     for (const candidate of candidates) {
       const full = p.join(dir, candidate);
       if (exists(full)) return full;
@@ -182,7 +201,7 @@ export function winCmdArgs(bin, args = []) {
  */
 export function winShell(env = process.env) {
   const comSpec = env.ComSpec ?? env.COMSPEC;
-  if (comSpec && path.win32.isAbsolute(comSpec)) return comSpec;
+  if (comSpec && isFullyQualified(comSpec, 'win32')) return comSpec;
   return winSystemExe('cmd.exe', env);
 }
 
@@ -206,6 +225,31 @@ export function winShell(env = process.env) {
  */
 export function winSystemExe(name, env = process.env) {
   const root = env.SystemRoot ?? env.SYSTEMROOT;
-  const base = root && path.win32.isAbsolute(root) ? root : 'C:\\Windows';
+  const base = root && isFullyQualified(root, 'win32') ? root : 'C:\\Windows';
   return path.win32.join(base, 'System32', name);
+}
+
+/**
+ * Collapse a case-variant Windows PATH key onto canonical `PATH`, in place.
+ *
+ * ORDER IS LOAD-BEARING and is the entire reason this is a function rather than
+ * three inline statements. Windows `process.env` is CASE-INSENSITIVE, so `Path`
+ * and `PATH` are the SAME variable: assigning `PATH` and THEN deleting `Path`
+ * removes the value just written and leaves the process with no PATH at all.
+ * Read, delete, then assign.
+ *
+ * Exported so the contract is testable against the real implementation — an
+ * earlier test copied these statements into itself and therefore stayed green
+ * no matter what production did.
+ *
+ * @param {NodeJS.ProcessEnv|Record<string,string>} env  mutated in place
+ * @returns {boolean} whether a variant was collapsed
+ */
+export function normalizePathKey(env) {
+  const pathKey = Object.keys(env).find((k) => k.toUpperCase() === 'PATH');
+  if (!pathKey || pathKey === 'PATH') return false;
+  const value = env[pathKey];
+  delete env[pathKey];
+  env.PATH = value;
+  return true;
 }

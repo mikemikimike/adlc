@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 const { delimiter, join } = posix;
 
-import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe } from '../lib/spawn-safe.mjs';
+import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe, isRunnableFile, normalizePathKey } from '../lib/spawn-safe.mjs';
 
 /** An `exists` probe that answers true for exactly the given absolute paths. */
 const existsIn = (...paths) => {
@@ -292,19 +292,38 @@ test('resolveOnPath skips a NON-EXECUTABLE regular file on POSIX', { skip: proce
 
 // Windows has no execute bit — selection is by EXTENSION. Requiring X_OK there
 // would reject every legitimately installed `.cmd`/`.exe`.
-test('resolveOnPath does not demand an execute bit on win32', () => {
+test('the probe does not demand an execute bit on win32', () => {
+  // Driven through isRunnableFile rather than resolveOnPath, because a POSIX
+  // tmpdir path is DRIVE-RELATIVE under win32 rules and is (correctly) refused
+  // by the fully-qualified check before the probe is ever consulted. The rule
+  // under test is the permission one: Windows has no execute bit, so requiring
+  // X_OK there would reject every legitimately installed .cmd/.exe.
   const root = mkdtempSync(join(tmpdir(), 'spawn-safe-win-'));
   try {
     const bin = join(root, 'agy.cmd');
     writeFileSync(bin, '@echo off\n', { mode: 0o644 }); // no +x, as on a real NTFS checkout
-    // Real filesystem, win32 rules — the probe must accept it on extension alone.
-    assert.equal(
-      resolveOnPath(bin, { env: { PATH: '' }, platform: 'win32' }),
-      bin,
-    );
+    assert.equal(isRunnableFile(bin, 'win32'), true, 'win32 selects by extension, not permission');
+    assert.equal(isRunnableFile(bin, 'linux'), false, 'POSIX still requires the execute bit');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// `path.win32.isAbsolute('\\tools\\agy.cmd')` is true, but a single leading
+// separator is DRIVE-RELATIVE on Windows — it inherits the process's current
+// drive, which is precisely the cwd-dependence this module exists to remove.
+test('resolveOnPath refuses a DRIVE-RELATIVE win32 path but accepts drive-qualified and UNC', () => {
+  const opts = { env: { PATH: '' }, platform: 'win32', exists: () => true };
+  assert.equal(resolveOnPath('\\tools\\agy.cmd', opts), null, 'single leading separator is drive-relative');
+  assert.equal(resolveOnPath('C:\\tools\\agy.cmd', opts), 'C:\\tools\\agy.cmd');
+  assert.equal(resolveOnPath('\\\\server\\share\\agy.cmd', opts), '\\\\server\\share\\agy.cmd', 'UNC is anchored');
+});
+
+test('winShell and winSystemExe reject a DRIVE-RELATIVE ComSpec/SystemRoot', () => {
+  assert.equal(winShell({ ComSpec: '\\attacker\\cmd.exe' }), 'C:\\Windows\\System32\\cmd.exe');
+  assert.equal(winSystemExe('where.exe', { SystemRoot: '\\attacker' }), 'C:\\Windows\\System32\\where.exe');
+  // A drive-qualified SystemRoot is still honoured.
+  assert.equal(winSystemExe('where.exe', { SystemRoot: 'D:\\Windows' }), 'D:\\Windows\\System32\\where.exe');
 });
 
 // An install shipping only `copilot.exe` (or an extensionless shim) must not be
@@ -315,4 +334,45 @@ test('binCandidates expands a BARE win32 name so .exe-only installs resolve', ()
   assert.ok(cands.includes('copilot.exe'), 'an .exe-only install must be reachable');
   assert.ok(cands.includes('copilot.cmd'));
   assert.ok(cands.includes('copilot'), 'an extensionless shim must be reachable');
+});
+
+// ---------------------------------------------------------------- normalizePathKey
+
+// Windows env keys are CASE-INSENSITIVE, so `Path` and `PATH` are one variable.
+// Assigning PATH and then deleting the variant therefore deletes what was just
+// written, leaving the process with NO PATH — copilot-live-deny's version probe
+// then reported an installed binary as missing.
+//
+// This drives the REAL exported function. The previous attempt copied the three
+// statements into the test body, so reverting production to the broken order
+// left it green — a test that asserts its own copy proves nothing.
+const winEnv = (initial) => {
+  const store = new Map(Object.entries(initial));
+  const keyFor = (k) => [...store.keys()].find((s) => s.toUpperCase() === String(k).toUpperCase());
+  return new Proxy({}, {
+    get: (_t, k) => (typeof k === 'string' ? store.get(keyFor(k)) : undefined),
+    set: (_t, k, v) => { const e = keyFor(k); if (e) store.delete(e); store.set(String(k), v); return true; },
+    deleteProperty: (_t, k) => { const e = keyFor(k); if (e) store.delete(e); return true; },
+    has: (_t, k) => keyFor(k) !== undefined,
+    ownKeys: () => [...store.keys()],
+    getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }),
+  });
+};
+
+test('normalizePathKey preserves the value when collapsing a case variant', () => {
+  const env = winEnv({ Path: 'C:\\tools;C:\\Windows\\System32' });
+  assert.equal(normalizePathKey(env), true, 'a variant was present');
+  assert.equal(env.PATH, 'C:\\tools;C:\\Windows\\System32', 'PATH must survive — the probe depends on it');
+});
+
+test('normalizePathKey is a no-op when the key is already canonical', () => {
+  const env = winEnv({ PATH: '/usr/bin' });
+  assert.equal(normalizePathKey(env), false);
+  assert.equal(env.PATH, '/usr/bin');
+});
+
+test('normalizePathKey leaves an env with no PATH alone', () => {
+  const env = winEnv({ HOME: '/h' });
+  assert.equal(normalizePathKey(env), false);
+  assert.equal(env.HOME, '/h');
 });

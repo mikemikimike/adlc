@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 // Imported, not re-declared: this file previously kept its own byte-identical
 // copy of quoteWinCmdArg, and a forked copy is exactly what drifts (see the
 // KEEP IN SYNC warnings in packages/core/lib/shell.mjs).
-import { resolveOnPath, quoteWinCmdArg, winShell } from '../packages/core/lib/spawn-safe.mjs';
+import { resolveOnPath, quoteWinCmdArg, winShell, normalizePathKey } from '../packages/core/lib/spawn-safe.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK = join(REPO, 'plugins', 'adlc-copilot', 'hooks', 'adlc-rails-guard.mjs');
@@ -143,18 +143,10 @@ function runCopilotBin(args, opts = {}) {
 }
 
 if (process.platform === 'win32') {
-  const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH');
-  if (pathKey && pathKey !== 'PATH') {
-    // ORDER IS LOAD-BEARING. Windows `process.env` is CASE-INSENSITIVE, so
-    // `Path` and `PATH` are the SAME variable. Assigning `PATH` and then
-    // deleting `Path` therefore deleted the value that had just been written,
-    // leaving the process with NO PATH at all — and the version probe then
-    // reported an installed Copilot as missing. Read the value out first,
-    // delete, and assign last so the write is what survives.
-    const value = process.env[pathKey];
-    delete process.env[pathKey];
-    process.env.PATH = value;
-  }
+  // See normalizePathKey: read/delete/assign order matters because Windows env
+  // keys are case-insensitive. Imported rather than inlined so the ordering
+  // contract is covered by a test that binds to the real implementation.
+  normalizePathKey(process.env);
 }
 
 if (process.env.ADLC_COPILOT_LIVE_INSTALL !== '1') {

@@ -220,6 +220,13 @@ function verifySignedRunner({ trusted, env }) {
     // `.cmd`/`.bat` copies need a shell; `.exe` must NOT — shell would re-parse argv
     // and would also be wrong for PE binaries previously mis-suffixed as `.cmd`.
     const needsWinShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(runnerCopy);
+    // Resolved from the CALLER'S env, deliberately BEFORE runnerEnv narrows it.
+    // runnerEnv intentionally drops ComSpec and SystemRoot to keep the probe
+    // context tight, so asking winShell() about runnerEnv would find neither and
+    // fall back to the literal C:\Windows — ENOENT on a perfectly legitimate
+    // host with Windows installed on D:. Narrowing what the CHILD sees must not
+    // narrow what we use to LOCATE the interpreter.
+    const winShellPath = needsWinShell ? winShell(env) : null;
     const probe = (args, label) => {
       // `shell: true` joins argv unquoted and leaves the INTERPRETER an
       // unqualified `cmd.exe`. Both matter here: runnerTmpDir comes from TEMP,
@@ -227,7 +234,7 @@ function verifySignedRunner({ trusted, env }) {
       // and the trust-root probe fails (or runs unintended shell syntax), while
       // an unset ComSpec would let a cwd-local cmd.exe interpret it.
       const result = needsWinShell
-        ? spawnSync(winShell(runnerEnv), winCmdArgs(runnerCopy, args), {
+        ? spawnSync(winShellPath, winCmdArgs(runnerCopy, args), {
             encoding: 'utf8',
             timeout: RUNNER_PROBE_TIMEOUT_MS,
             env: runnerEnv,

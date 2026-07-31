@@ -207,7 +207,11 @@ function symlinkEscapesRoot(absolutePath) {
 
 const explicitTargets = (values.target ?? []).map((t) => {
   const abs = resolve(cwd, t);
-  const rel = relative(root, abs).replaceAll('\\', '/');
+  // Fold only on win32 — see targets.mjs. `relative()` already emits the host's
+  // separator, so on POSIX this must not rewrite a literal backslash in a name.
+  const rel = process.platform === 'win32'
+    ? relative(root, abs).replaceAll('\\', '/')
+    : relative(root, abs);
   if (escapesRoot(rel)) {
     opError(
       `--target ${t} resolves outside the repository root (${root}) — refusing to read or mutate it`
