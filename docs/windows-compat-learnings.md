@@ -273,7 +273,7 @@ reasoning*.
 
 ## 6. What to salvage from the branch
 
-The branch (`windows-compat`, final SHA `9bd8117`) is not worth rebasing, but
+The branch (`abandoned/windows-compat`, final SHA `9bd8117`) is not worth rebasing, but
 these are worth lifting essentially as-is, each as its own small PR:
 
 | Artifact | Notes |
