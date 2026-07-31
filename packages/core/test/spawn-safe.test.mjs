@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 const { delimiter, join } = posix;
 
-import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe, isRunnableFile, normalizePathKey, foldWinSeparators } from '../lib/spawn-safe.mjs';
+import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe, isRunnableFile, normalizePathKey, foldWinSeparators, hasCmdMetacharacters } from '../lib/spawn-safe.mjs';
 
 /** An `exists` probe that answers true for exactly the given absolute paths. */
 const existsIn = (...paths) => {
@@ -396,4 +396,21 @@ test('foldWinSeparators does NOT fold on POSIX (a backslash is a real filename c
 
 test('foldWinSeparators DOES fold on win32, where the two spellings are one file', () => {
   assert.equal(foldWinSeparators('test\\critical.mjs', 'win32'), 'test/critical.mjs');
+});
+
+// EVERY character individually. A mutation that drops one from the class (the
+// mutation operator turns `<>` into `>=>`) must fail a test — a survived mutant
+// here means an operator-supplied path carrying that character reaches cmd.exe.
+test('hasCmdMetacharacters flags each shell metacharacter on its own', () => {
+  for (const ch of ['\r', '\n', '&', '|', '<', '>', '^', '%', ';']) {
+    assert.equal(hasCmdMetacharacters(`C:\\tools\\copilot${ch}payload`), true,
+      `${JSON.stringify(ch)} must be rejected`);
+  }
+});
+
+test('hasCmdMetacharacters allows characters legal in a real path', () => {
+  // Whitespace especially: `C:\Program Files\...` must stay usable.
+  for (const ok of ['C:\\Program Files\\copilot.cmd', '/usr/local/bin/copilot', 'C:\\dir=1\\copilot']) {
+    assert.equal(hasCmdMetacharacters(ok), false, `${ok} must be allowed`);
+  }
 });

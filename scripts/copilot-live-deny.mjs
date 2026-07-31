@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 // Imported, not re-declared: this file previously kept its own byte-identical
 // copy of quoteWinCmdArg, and a forked copy is exactly what drifts (see the
 // KEEP IN SYNC warnings in packages/core/lib/shell.mjs).
-import { resolveOnPath, quoteWinCmdArg, winShell, normalizePathKey } from '../packages/core/lib/spawn-safe.mjs';
+import { resolveOnPath, quoteWinCmdArg, winShell, normalizePathKey, hasCmdMetacharacters } from '../packages/core/lib/spawn-safe.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK = join(REPO, 'plugins', 'adlc-copilot', 'hooks', 'adlc-rails-guard.mjs');
@@ -64,7 +64,7 @@ const COPILOT = COPILOT_OVERRIDE ?? 'copilot';
 function rejectUnsafeCopilotOverride(path) {
   // cmd.exe chaining / redirection / expansion, plus POSIX `;`. Whitespace
   // alone is allowed so a quoted Program Files path can still be supplied.
-  if (/[\r\n&|<>^%;]/.test(path)) {
+  if (hasCmdMetacharacters(path)) {
     console.error('copilot-live-deny: ADLC_COPILOT_PATH contains shell metacharacters — refusing to spawn');
     process.exit(1);
   }

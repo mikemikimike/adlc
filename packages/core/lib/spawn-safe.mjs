@@ -270,3 +270,21 @@ export function normalizePathKey(env) {
 export function foldWinSeparators(value, platform = process.platform) {
   return platform === 'win32' ? String(value).replaceAll('\\', '/') : String(value);
 }
+
+/**
+ * Does `value` contain a character cmd.exe or a POSIX shell would treat as
+ * syntax rather than data?
+ *
+ * `\r\n & | < > ^ %` are cmd.exe chaining/redirection/expansion; `;` is the
+ * POSIX separator. Whitespace is deliberately NOT included — a quoted
+ * `C:\Program Files\...` path must remain usable.
+ *
+ * Shared because this exact character class had been written out four separate
+ * times (core/lib/llm.mjs, cli/lib/dispatch.mjs, scripts/copilot-live-deny.mjs,
+ * scripts/ceremony-drift.mjs). Each copy needed its own test to prove the class
+ * was complete, and the copy in copilot-live-deny had none — a mutation that
+ * deleted `<` from it survived the gate.
+ */
+export function hasCmdMetacharacters(value) {
+  return /[\r\n&|<>^%;]/.test(String(value));
+}
