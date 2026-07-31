@@ -563,3 +563,33 @@ describe('checkSkill', () => {
     }
   });
 });
+
+// BINDING TEST for the round-13 POSIX-builtin correction. Removing these names
+// from COMMON_BUILTINS was right — they are not cmd.exe builtins and must not be
+// certified `ok` blind — but it sent them to `where.exe`, which can NEVER find a
+// shell builtin: no executable file exists for `export` on any machine, Git Bash
+// installed or not. A valid Bash-oriented skill was therefore marked STALE and
+// skill-rot exited 2.
+//
+// `unverifiable` is the honest verdict: the claim's truth depends on a shell
+// where.exe cannot interrogate. Forcing win32 so the branch is exercised on any
+// host — without this the correction has no test and reverting it stays green.
+describe('verifyClaim — POSIX shell builtins on Windows', () => {
+  const withWin32 = (fn) => {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try { return fn(); } finally { Object.defineProperty(process, 'platform', original); }
+  };
+
+  test('reports a POSIX shell builtin as unverifiable, not stale', () => {
+    for (const cmd of ['export', 'source', 'alias', 'eval']) {
+      const r = withWin32(() => verifyClaim({ type: 'command', value: cmd, raw: cmd }, { repoRoot: process.cwd(), skillDir: process.cwd() }));
+      assert.equal(r.status, 'unverifiable', `${cmd} must not be marked stale — where.exe can never find a shell builtin`);
+    }
+  });
+
+  test('still certifies a genuine cmd.exe builtin', () => {
+    const r = withWin32(() => verifyClaim({ type: 'command', value: 'echo', raw: 'echo' }, { repoRoot: process.cwd(), skillDir: process.cwd() }));
+    assert.equal(r.status, 'ok');
+  });
+});

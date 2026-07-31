@@ -191,7 +191,13 @@ test('#314: a migration whose manifest is a SYMLINK is denied (working-tree type
   // The migration branch is the one path that reads the working-tree manifest. A symlink to
   // an allow-listed target (../.gitignore) passes the diff-shape allow-list, so the lstat
   // regular-file guard is what stops readFileSync from following the link to forged evidence.
-  assert.equal(runMigrationScenario({ manifestSymlink: true }), 2);
+  const result = runMigrationScenario({ manifestSymlink: true });
+  // The helper returns a sentinel when the OS withheld symlink privilege — the
+  // whole point of running this on Windows instead of skipping it. Comparing
+  // that sentinel to 2 would FAIL on exactly the unprivileged host the fallback
+  // exists for, converting an opt-out into a red build.
+  if (result && typeof result === 'object' && result.skipped) return;
+  assert.equal(result, 2);
 });
 
 test('legacy archive migration is accepted only with identical archived content', () => {
