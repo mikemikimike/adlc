@@ -452,3 +452,17 @@ describe('classifyTestResult', () => {
     assert.equal(c.timedOut, false);
   });
 });
+
+describe('report separator handling', () => {
+// BINDING TEST for report.mjs's separator handling. Folding here on POSIX
+// reports a result for the real file `test\critical.mjs` against a DIFFERENT
+// path, corrupting machine-readable attribution. Replacing the call site with
+// an unconditional fold must fail this.
+it('preserves a POSIX filename containing a backslash', () => {
+  const report = buildJsonReport([
+    { file: 'src/test\\critical.mjs', line: 1, operator: 'x', killed: false, invalid: false },
+  ]);
+  assert.equal(report.mutants[0].file, 'src/test\\critical.mjs',
+    'a backslash in a POSIX filename must not be rewritten — the report would name a file that does not exist');
+});
+});

@@ -5,6 +5,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { applyHunks } from './hunks.mjs';
+import { foldWinSeparators } from '@adlc/core';
 
 /**
  * Map a candidate's filename back to the caller's ORIGINAL path string.
@@ -41,9 +42,9 @@ export function resolveTargetPath(file, callerPaths, platform = process.platform
   //    normalization everywhere is how a candidate naming `src/a.mjs` could be
   //    evaluated against one file and applied to another.
   if (platform !== 'win32') return name;
-  const normalized = name.replaceAll('\\', '/');
+  const normalized = foldWinSeparators(name, 'win32');
   for (const original of callerPaths) {
-    if (String(original).replaceAll('\\', '/') === normalized) return original;
+    if (foldWinSeparators(String(original), 'win32') === normalized) return original;
   }
   return name;
 }

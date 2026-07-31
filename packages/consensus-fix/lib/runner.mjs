@@ -11,7 +11,7 @@ export { resolveTargetPath };
 import { totalHunkChangedLines } from './hunks.mjs';
 import { groupByChangeset, selectWinner, isAllDivergent } from './agreement.mjs';
 import { buildPrompt } from './prompt.mjs';
-import { extractJson, winShell } from '@adlc/core';
+import { extractJson, winShell, foldWinSeparators } from '@adlc/core';
 
 /**
  * Run the given shell command, returning { exitCode, output }.
@@ -72,7 +72,7 @@ export function validateCandidate(parsed, allowedPaths, platform = process.platf
   // catch around that call, so one malformed candidate aborted the whole
   // ensemble instead of being discarded as the single bad candidate it is.
   const foldSeparators = platform === 'win32';
-  const canon = (v) => (foldSeparators ? String(v).replaceAll('\\', '/') : String(v));
+  const canon = (v) => (foldSeparators ? foldWinSeparators(String(v), 'win32') : String(v));
   const allowedSet = new Set(allowedPaths.map(canon));
   for (const change of parsed.changes) {
     if (typeof change.file !== 'string' || !Array.isArray(change.hunks)) {

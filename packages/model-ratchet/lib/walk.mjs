@@ -3,6 +3,7 @@
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, extname, dirname, resolve, relative } from 'node:path';
+import { foldWinSeparators } from '@adlc/core';
 
 // ---------------------------------------------------------------------------
 // Source file extensions we care about

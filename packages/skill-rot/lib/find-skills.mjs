@@ -5,6 +5,7 @@
 
 import { readdirSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { foldWinSeparators } from '@adlc/core';
 
 /** Default search roots (only those that exist are searched). */
 export const DEFAULT_ROOTS = ['.claude/skills', '.agents/skills', 'skills'];

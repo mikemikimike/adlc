@@ -46,6 +46,22 @@ const COMMON_BUILTINS = new Set([
   'cd', 'dir', 'echo', 'set', 'type', 'copy', 'move', 'del', 'mkdir', 'rmdir', 'cls', 'path', 'exit',
 ]);
 
+// POSIX SHELL BUILTINS — no executable file exists for these ANYWHERE, so
+// `where.exe` cannot find them even on a box with Git Bash or WSL installed.
+// Removing them from COMMON_BUILTINS (correct: they are not cmd.exe builtins and
+// must not be certified `ok` unconditionally) sent them to where.exe instead,
+// which marks a perfectly valid Bash-oriented skill STALE and exits 2 —
+// `export ADLC_TICKET=T1` in a skill is extracted as the command `export`.
+//
+// The honest verdict for these on Windows is UNVERIFIABLE, not stale: whether
+// the claim holds depends on a shell we cannot interrogate with where.exe. The
+// POSIX branch below still resolves them properly via `command -v`.
+const POSIX_SHELL_BUILTINS = new Set([
+  'export', 'source', 'alias', 'unalias', 'eval', 'exec', 'shift', 'trap',
+  'umask', 'ulimit', 'wait', 'read', 'readonly', 'unset', 'local', 'declare',
+  'command', 'builtin', 'let', 'test',
+]);
+
 /**
  * Verify a command exists via `command -v <tok>` or in ./node_modules/.bin.
  */
@@ -67,6 +83,9 @@ function verifyCommand(cmd, repoRoot) {
   if (process.platform === 'win32') {
     if (COMMON_BUILTINS.has(cmd.toLowerCase())) {
       return { status: 'ok' };
+    }
+    if (POSIX_SHELL_BUILTINS.has(cmd.toLowerCase())) {
+      return { status: 'unverifiable', reason: `POSIX shell builtin — no executable for where.exe to find: ${cmd}` };
     }
     try {
       // ABSOLUTE `where.exe`. skill-rot runs with cwd at the repository root,
