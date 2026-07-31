@@ -37,9 +37,19 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
  * explicitly so this gate reports the real remaining surface instead of an
  * unqualified pass.
  */
-const KNOWN_PRE_EXISTING = new Set([
-  'scripts/release.mjs',             // bare `npm` (publish credentials) — #421
-]);
+// EMPTY, and it must stay that way unless an entry is genuinely pre-existing.
+//
+// This set previously listed scripts/release.mjs as "pre-existing on main". That
+// was FALSE and checkable: origin/main spawns `npm` with no `shell` option at
+// all — the flag was introduced on THIS branch. The exemption therefore excused
+// a hole the same change created, and the staleness check below then asserted
+// that exemption as legitimate. A gate that exempts the defect its own change
+// introduces, on an incorrect provenance claim, is worse than no gate.
+//
+// Before adding anything here, verify the claim the way it should have been
+// verified the first time: `git show origin/main:<file>` and confirm the pattern
+// is actually present there.
+const KNOWN_PRE_EXISTING = new Set([]);
 
 // KNOWN BLIND SPOT, stated rather than hidden. The detector reads the spawn's
 // FIRST ARGUMENT literally, so a command assigned to a variable first —

@@ -25,6 +25,7 @@ import { execFileSync } from 'node:child_process';
 // tooling. No published @adlc/* package gains a runtime dependency from it —
 // see the note on relativeSpecifiers for why a real parser is required here.
 import { parse } from 'acorn';
+import { resolveOnPath, winShell, winCmdArgs } from '../packages/core/lib/spawn-safe.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PKGS = join(ROOT, 'packages');
@@ -48,8 +49,26 @@ function writeJson(path, value) {
  * the platform test, and so that test is directly assertable on both platforms
  * from a machine that is only ever one of them.
  */
-export function npmShellFlag(platform = process.platform) {
-  return platform === 'win32';
+/**
+ * Resolve `npm` to an ABSOLUTE path and, on win32, drive a `.cmd` shim through a
+ * resolved cmd.exe with quoted argv.
+ *
+ * This replaces a `shell: process.platform === 'win32'` flag that this BRANCH
+ * introduced (origin/main spawns `npm` with no shell at all). Under `shell:true`
+ * cmd.exe resolves the bare name `npm` against the CURRENT DIRECTORY before
+ * PATH — and defaultPackImpl/defaultPublishImpl run with cwd inside the package
+ * being released, holding publish credentials. A repo shipping `npm.cmd` would
+ * have supplied the interpreter for `npm publish`.
+ *
+ * @returns {{cmd: string, args: string[], opts: object}} spawn triple
+ */
+export function npmInvocation(args, platform = process.platform) {
+  const resolved = resolveOnPath('npm', { platform });
+  if (!resolved) throw new Error('npm not found on PATH');
+  if (platform === 'win32' && /\.(cmd|bat)$/i.test(resolved)) {
+    return { cmd: winShell(), args: winCmdArgs(resolved, args), opts: { windowsVerbatimArguments: true } };
+  }
+  return { cmd: resolved, args, opts: {} };
 }
 
 /**
@@ -59,7 +78,8 @@ export function npmShellFlag(platform = process.platform) {
  * tests can drive releaseMain without shelling out to npm.
  */
 function defaultRegenerateLockfile(root) {
-  execFileSync('npm', ['install', '--package-lock-only'], { cwd: root, stdio: 'inherit', shell: npmShellFlag() });
+  const { cmd, args, opts } = npmInvocation(['install', '--package-lock-only']);
+  execFileSync(cmd, args, { cwd: root, stdio: 'inherit', ...opts });
 }
 
 export function packagePublishOrder(names) {
@@ -644,11 +664,12 @@ function packedFilePaths(dir, packImpl) {
 }
 
 function defaultPackImpl(dir) {
-  return execFileSync('npm', ['pack', '--dry-run', '--json'], {
+  const { cmd, args, opts } = npmInvocation(['pack', '--dry-run', '--json']);
+  return execFileSync(cmd, args, {
     cwd: dir,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
-    shell: npmShellFlag(),
+    ...opts,
   });
 }
 
@@ -742,7 +763,8 @@ export function findPackagingProblems({ packagesDir = PKGS, pluginsDir = PLUGINS
 }
 
 function defaultPublishImpl(dir) {
-  execFileSync('npm', ['publish', '--provenance'], { cwd: dir, stdio: 'inherit', shell: npmShellFlag() });
+  const { cmd, args, opts } = npmInvocation(['publish', '--provenance']);
+  execFileSync(cmd, args, { cwd: dir, stdio: 'inherit', ...opts });
 }
 
 export function releaseMain(

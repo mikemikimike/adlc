@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getTool } from './registry.mjs';
+import { resolveOnPath, winShell, winCmdArgs, hasCmdMetacharacters } from '@adlc/core';
 
 const require = createRequire(import.meta.url);
 
@@ -110,7 +111,7 @@ function resolveNpxCliJs() {
 // Node install, not of this function. A test that could not choose the branch would be
 // asserting the machine it happens to run on -- either the fallback or the JS-entry path
 // would go permanently unexercised depending on where the suite ran.
-function runExternal(packageName, args, spawnFn, resolveNpxCli = resolveNpxCliJs) {
+function runExternal(packageName, args, spawnFn, resolveNpxCli = resolveNpxCliJs, resolveNpxBin = () => resolveOnPath('npx')) {
   const npxCli = resolveNpxCli();
   if (npxCli) {
     const result = spawnFn(process.execPath, [npxCli, packageName, ...args], { stdio: 'inherit' });
@@ -119,28 +120,36 @@ function runExternal(packageName, args, spawnFn, resolveNpxCli = resolveNpxCliJs
     return { code: typeof result.status === 'number' ? result.status : 1 };
   }
 
-  // Rare fallback (Node install without a bundled npm). Windows still needs a
-  // shell for `npx.cmd`, so every forwarded arg must be free of cmd metacharacters.
+  // Rare fallback (Node install without a bundled npm).
   //
-  // The check is WINDOWS-ONLY because the risk is: below, `shell: true` is set
-  // only on win32. On POSIX this spawn is shell-free, so `&`, `%`, `;` and the
-  // rest are ordinary literal argv — and `adlc review` documents full argument
-  // passthrough. Refusing them there would reject a legitimate command (an
-  // adversarial-review flag carrying `;`, say) to mitigate a shell that is not
-  // in play.
+  // NO BARE NAME REACHES A SHELL. origin/main spawned `npx` with no shell at
+  // all; the `npx.cmd` + `shell: true` form was introduced on this branch and is
+  // the same repo-local hijack spawn-safe.mjs exists to close — `adlc review`
+  // runs with cwd at the repository UNDER REVIEW, so a reviewed repo containing
+  // `npx.cmd` would supply the executable. The metacharacter denylist cannot
+  // help: `npx.cmd` contains none. Resolve absolutely, or fail closed.
   const isWindows = process.platform === 'win32';
-  const CMD_META = /[\r\n&|<>^%;]/;
-  if (isWindows && [packageName, ...args].some((a) => CMD_META.test(String(a)))) {
+  // VALIDATE BEFORE RESOLVING. A refusal that depends on whether npx happens to
+  // be installed is not a refusal — the same ordering bug this branch already
+  // fixed in core/lib/llm.mjs. Kept as defence in depth alongside winCmdArgs
+  // quoting, and win32-only because the POSIX spawn below is shell-free.
+  if (isWindows && [packageName, ...args].some((a) => hasCmdMetacharacters(a))) {
     return {
       code: 1,
       error: `failed to run npx ${packageName}: arguments contain shell metacharacters and npx-cli.js was not found beside node`,
     };
   }
-  const cmd = isWindows ? 'npx.cmd' : 'npx';
-  const result = spawnFn(cmd, [packageName, ...args], {
-    stdio: 'inherit',
-    ...(isWindows ? { shell: true } : {}),
-  });
+  // Injectable for the same reason resolveNpxCli is: on a mocked win32 platform
+  // resolveOnPath applies Windows path rules to a POSIX PATH and can never
+  // succeed, so the win32 branch would be untestable off Windows.
+  const resolvedNpx = resolveNpxBin();
+  if (!resolvedNpx) {
+    return { code: 1, error: `failed to run npx ${packageName}: npx not found on PATH and npx-cli.js was not found beside node` };
+  }
+  const useCmdShell = isWindows && /\.(cmd|bat)$/i.test(resolvedNpx);
+  const result = useCmdShell
+    ? spawnFn(winShell(), winCmdArgs(resolvedNpx, [packageName, ...args]), { stdio: 'inherit', windowsVerbatimArguments: true })
+    : spawnFn(resolvedNpx, [packageName, ...args], { stdio: 'inherit' });
   if (result.error) return { code: 1, error: `failed to run npx ${packageName}: ${result.error.message}` };
   if (result.signal) return { code: 1, error: `${packageName} terminated by signal ${result.signal}` };
   return { code: typeof result.status === 'number' ? result.status : 1 };
@@ -153,7 +162,7 @@ export function dispatch(toolName, args, opts = {}) {
     return runBin('@adlc/ticket-sync', resolvePackageBin('@adlc/ticket-sync', 'adlc-ticket-sync'), args, spawnFn);
   }
   if (tool?.external) {
-    return runExternal(tool.packageName, args, spawnFn, opts.resolveNpxCliJs);
+    return runExternal(tool.packageName, args, spawnFn, opts.resolveNpxCliJs, opts.resolveNpxBin);
   }
   return runBin(tool?.packageName ?? `@adlc/${toolName}`, resolveBin(toolName), args, spawnFn);
 }

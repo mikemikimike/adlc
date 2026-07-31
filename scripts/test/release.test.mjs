@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets, findPublishMetadataProblems, npmShellFlag } from '../release.mjs';
+import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets, findPublishMetadataProblems, npmInvocation } from '../release.mjs';
 
 /** Build a throwaway repo with package and Codex-manifest version surfaces. */
 function makeRepo() {
@@ -229,11 +229,16 @@ test('releaseMain rejects an invalid version (and does not regenerate the lockfi
 // none of them exercises the platform test; asserting the flag directly is the
 // only coverage it has. Both directions are pinned: a check inverted to
 // `!== 'win32'` breaks npm on Windows AND shells out on POSIX.
-test('npmShellFlag is true only on win32', () => {
-  assert.equal(npmShellFlag('win32'), true);
-  assert.equal(npmShellFlag('darwin'), false);
-  assert.equal(npmShellFlag('linux'), false);
-  assert.equal(npmShellFlag(), process.platform === 'win32'); // the real default argument
+test('npmInvocation resolves npm ABSOLUTELY and never hands a bare name to a shell', () => {
+  // origin/main spawned `npm` with no shell. This branch briefly added
+  // `shell: process.platform === 'win32'`, which lets cmd.exe resolve the bare
+  // name against the CURRENT DIRECTORY first — with publish credentials in
+  // scope. The contract now is: an absolute command, or a throw.
+  const { cmd, args, opts } = npmInvocation(['publish'], 'linux');
+  assert.ok(cmd.startsWith('/') || /^[A-Za-z]:/.test(cmd), `expected an absolute npm, got ${cmd}`);
+  assert.deepEqual(args, ['publish']);
+  assert.equal(opts.shell, undefined, 'no shell on POSIX');
+  assert.notEqual(cmd, 'npm', 'a bare name must never be returned');
 });
 
 test('packagePublishOrder keeps core first and cli last', () => {

@@ -118,25 +118,36 @@ test('with npm\'s JS entry missing, "review" falls back to plain `npx` with the 
 
   assert.equal(error, undefined);
   assert.equal(code, 0);
-  assert.deepEqual(calls, [{
-    cmd: 'npx',
-    args: ['adversarial-review', '--scope', 'working-tree'],
-    options: { stdio: 'inherit' },
-  }], 'POSIX needs no shell even in the fallback');
+  // The command must be an ABSOLUTE resolved npx, never the bare name.
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].cmd.startsWith('/'), `expected absolute npx, got ${calls[0].cmd}`);
+  assert.deepEqual(calls[0].args, ['adversarial-review', '--scope', 'working-tree'], 'full passthrough');
+  assert.equal(calls[0].options.shell, undefined, 'POSIX needs no shell even in the fallback');
 });
 
-test('the win32 `npx` fallback uses npx.cmd through a shell, still with full passthrough', () => {
+// THIS TEST PREVIOUSLY PINNED THE UNSAFE FORM. It asserted `cmd: 'npx.cmd'`
+// with `shell: true` — a bare name resolved by cmd.exe against the cwd, which
+// for `adlc review` is the repository under review. Asserting that shape as
+// correct is what let the hole survive its own regression guard.
+test('the win32 `npx` fallback resolves absolutely and never passes a bare name', () => {
   const { calls, spawnFn } = recordingSpawn();
 
   const { code } = withPlatform('win32', () =>
-    dispatch('review', ['--scope', 'working-tree'], { spawnFn, resolveNpxCliJs: () => null }));
+    dispatch('review', ['--scope', 'working-tree'], {
+      spawnFn,
+      resolveNpxCliJs: () => null,
+      resolveNpxBin: () => 'C:\\Program Files\\nodejs\\npx.cmd',
+    }));
 
   assert.equal(code, 0);
-  assert.deepEqual(calls, [{
-    cmd: 'npx.cmd',
-    args: ['adversarial-review', '--scope', 'working-tree'],
-    options: { stdio: 'inherit', shell: true },
-  }]);
+  assert.equal(calls.length, 1);
+  assert.notEqual(calls[0].cmd, 'npx.cmd', 'a bare name must never reach the spawn');
+  assert.notEqual(calls[0].cmd, 'npx');
+  // Either an absolute npx, or cmd.exe driving an absolute .cmd with quoted argv.
+  const drivesCmdExe = /cmd\.exe$/i.test(calls[0].cmd);
+  assert.ok(drivesCmdExe || calls[0].cmd.startsWith('/') || /^[A-Za-z]:/.test(calls[0].cmd),
+    `expected a resolved command, got ${calls[0].cmd}`);
+  assert.ok(JSON.stringify(calls[0].args).includes('adversarial-review'), 'full passthrough preserved');
 });
 
 test('the `npx` fallback refuses cmd.exe metacharacters instead of spawning them', () => {
