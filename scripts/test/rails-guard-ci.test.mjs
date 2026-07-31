@@ -14,6 +14,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { ACTIVE_MANIFEST, ARCHIVE_MANIFEST, prettyCanonicalJson, sha256, storeHash, ticketFilename } from '@adlc/tickets';
+import { stageSymlink, commitIndex, tryWorktreeSymlink } from '../../packages/rails-guard/test/helpers/git-fixtures.mjs';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'rails-guard-ci.mjs');
 
@@ -147,7 +148,14 @@ function runMigrationScenario({ mutateTicket = (ticket) => ticket, extraChange =
       // — the migration branch reads it via readFileSync and would follow the link to forged
       // evidence. The lstat regular-file check must deny it.
       rmSync(join(dir, '.adlc/manifest.jsonl'), { force: true });
-      symlinkSync('../.gitignore', join(dir, '.adlc/manifest.jsonl'));
+      // This case genuinely needs a symlink ON DISK — the migration branch is the
+      // one path that reads the WORKING TREE, so an index-staged object cannot
+      // express it. tryWorktreeSymlink reports whether the OS allowed it instead
+      // of the whole test being skipped by platform, so it runs everywhere and
+      // opts out only when Windows actually withholds the privilege.
+      if (!tryWorktreeSymlink(symlinkSync, '../.gitignore', join(dir, '.adlc/manifest.jsonl'))) {
+        return { skipped: 'no symlink privilege' };
+      }
     }
     if (extraChange) { mkdirSync(join(dir, 'src'), { recursive: true }); writeFileSync(join(dir, 'src/extra.mjs'), 'export {};\n'); }
     git(dir, ['add', '-A']);
@@ -179,7 +187,7 @@ test('legacy-to-directory migration requires hash-bound evidence', () => {
   assert.equal(runMigrationScenario({ evidence: 'invalid' }), 2);
 });
 
-test('#314: a migration whose manifest is a SYMLINK is denied (working-tree type-confusion)', { skip: process.platform === 'win32' }, () => {
+test('#314: a migration whose manifest is a SYMLINK is denied (working-tree type-confusion)', () => {
   // The migration branch is the one path that reads the working-tree manifest. A symlink to
   // an allow-listed target (../.gitignore) passes the diff-shape allow-list, so the lstat
   // regular-file guard is what stops readFileSync from following the link to forged evidence.
@@ -337,7 +345,7 @@ test('#314: an untracked, gitignored .adlc/manifest.jsonl does NOT trigger a fal
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: a manifest committed as a SYMLINK is denied (type-confusion fail-closed)', { skip: process.platform === 'win32' }, () => {
+test('#314: a manifest committed as a SYMLINK is denied (type-confusion fail-closed)', () => {
   // git show returns a symlink's TARGET STRING, not the target's content — so a manifest
   // symlinked to a whitespace target would slip past a content-only `.trim()` check while
   // downstream readers that follow the link consume forged evidence. The committed-object
@@ -359,9 +367,12 @@ test('#314: a manifest committed as a SYMLINK is denied (type-confusion fail-clo
     git(dir, ['checkout', '-q', '-b', 'feat']);
     // The manifest is a symlink whose target is whitespace, so `git show` → "  " → .trim()
     // is empty (a content-only check would NOT deny). The mode is 120000, so we deny.
-    symlinkSync('  ', join(dir, '.adlc', 'manifest.jsonl'));
-    git(dir, ['add', '-f', '.adlc/manifest.jsonl']);
-    git(dir, ['commit', '-qm', 'symlink manifest']);
+    // Staged through the INDEX (mode 120000) rather than symlinkSync: identical
+    // committed object, no filesystem symlink, so this runs on Windows too. The
+    // test used to be skipped there — reporting green for the very attack it
+    // exists to deny.
+    stageSymlink(dir, '.adlc/manifest.jsonl', '  ');
+    commitIndex(dir, 'symlink manifest');
     assert.equal(run(), 2, 'a symlink manifest must be denied, not read as empty');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -393,7 +404,7 @@ test('#314: deleting a base-tracked manifest at HEAD denies as "absent at HEAD" 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: replacing a base manifest with a SYMLINK at HEAD is denied (append-only type-confusion)', { skip: process.platform === 'win32' }, () => {
+test('#314: replacing a base manifest with a SYMLINK at HEAD is denied (append-only type-confusion)', () => {
   // Base has a real tracked manifest. A PR turns it into a symlink pointing at a decoy that
   // starts with the base content — so a working-tree readFileSync + startsWith would PASS,
   // then downstream readers follow the link to forged evidence. The committed-object mode
@@ -405,7 +416,9 @@ test('#314: replacing a base manifest with a SYMLINK at HEAD is denied (append-o
     mutate: (d) => {
       writeFileSync(join(d, '.adlc', 'decoy'), '{"seq":1}\n{"forged":true}\n');
       rmSync(join(d, '.adlc', 'manifest.jsonl'));
-      symlinkSync('decoy', join(d, '.adlc', 'manifest.jsonl'));
+      // Index-staged mode 120000 — same committed object as symlinkSync, but no
+      // filesystem symlink, so the case is exercised on Windows too.
+      stageSymlink(d, '.adlc/manifest.jsonl', 'decoy');
     },
   });
   assert.equal(code, 2);
@@ -458,7 +471,7 @@ test('#314: a TRACKED non-empty manifest on the first-bootstrap path is still re
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: an ancestor .adlc committed as a SYMLINK is denied (ancestor type-confusion)', { skip: process.platform === 'win32' }, () => {
+test('#314: an ancestor .adlc committed as a SYMLINK is denied (ancestor type-confusion)', () => {
   // git ls-tree does NOT descend a symlinked `.adlc`, so the leaf lookup would report the
   // manifest absent while filesystem consumers follow `.adlc` → `state/manifest.jsonl` and
   // read forged evidence. The `.adlc`-is-a-tree ancestor guard denies it.
@@ -475,8 +488,11 @@ test('#314: an ancestor .adlc committed as a SYMLINK is denied (ancestor type-co
     git(dir, ['checkout', '-q', '-b', 'feat']);
     mkdirSync(join(dir, 'state'), { recursive: true });
     writeFileSync(join(dir, 'state', 'manifest.jsonl'), '{"forged":"evidence"}\n');
-    symlinkSync('state', join(dir, '.adlc')); // .adlc itself is a symlink
-    git(dir, ['add', '-A']); git(dir, ['commit', '-qm', 'symlink .adlc']);
+    git(dir, ['add', '-A']);
+    // `.adlc` itself committed as a symlink → `git ls-tree` will not descend it.
+    // Staged through the index so no filesystem symlink is required.
+    stageSymlink(dir, '.adlc', 'state');
+    commitIndex(dir, 'symlink .adlc');
     assert.equal(run(), 2, 'a symlinked .adlc must be denied, not read as absent');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -11,6 +11,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, chmodSync }
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tryWorktreeSymlink } from './helpers/git-fixtures.mjs';
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'rails-guard.mjs');
 
@@ -117,7 +118,7 @@ test('deleting a railed manifest during a bump still FAILS', () => {
 // returns the blob, so a manifest replaced by a symlink to identical text
 // compared equal and was exempted — while git recorded a typechange. The link
 // target then lives outside the rail and can be swapped freely afterwards.
-test('replacing a railed manifest with a symlink still FAILS', { skip: process.platform === 'win32' }, () => {
+test('replacing a railed manifest with a symlink still FAILS', () => {
   // THE BASELINE MODE IS THE POINT. A symlink reports its executable bits set,
   // so against an ordinary 0644 baseline the executable-bit parity check rejects
   // this incidentally and the regular-file guard is never exercised — the test
@@ -138,7 +139,9 @@ test('replacing a railed manifest with a symlink still FAILS', { skip: process.p
     // the read throw, and the test would pass on that instead of on the guard.
     writeFileSync(join(dir, 'packages', 'build-gate', 'target.json'), bumped);
     rmSync(manifest);
-    symlinkSync('target.json', manifest);
+    // Runs on every platform; opts out only when the OS actually withholds
+    // symlink privilege, rather than skipping all of Windows blind.
+    if (!tryWorktreeSymlink(symlinkSync, 'target.json', manifest)) return;
     const res = guard(dir, newBase, RAIL);
     assert.equal(res.status, 2, `expected deny, got ${res.status}: ${res.stdout}`);
   } finally {
@@ -171,7 +174,12 @@ test('a manifest differing only in INVALID UTF-8 bytes still FAILS', () => {
   }
 });
 
-test('flipping a railed manifest to executable still FAILS', { skip: process.platform === 'win32' }, () => {
+test('flipping a railed manifest to executable still FAILS', {
+  // NTFS has no execute bit: chmodSync is a no-op on Windows, so this fixture
+  // cannot express the mutation at all. Skipped for a real capability gap,
+  // unlike the symlink cases above which now run there via the index/EPERM path.
+  skip: process.platform === 'win32' ? 'no execute bit on NTFS' : false,
+}, () => {
   const { dir, baseSha } = makeRepo();
   try {
     const manifest = join(dir, 'packages', 'build-gate', 'package.json');
@@ -212,7 +220,7 @@ test('a manifest under a git CLEAN FILTER still FAILS', () => {
   }
 });
 
-test('a manifest that was a SYMLINK at the baseline still FAILS', { skip: process.platform === 'win32' }, () => {
+test('a manifest that was a SYMLINK at the baseline still FAILS', () => {
   // The mode check has to hold on the base side too, not only at HEAD.
   //
   // THE FIXTURE IS THE POINT. An earlier version pointed the symlink at
@@ -228,7 +236,8 @@ test('a manifest that was a SYMLINK at the baseline still FAILS', { skip: proces
     const manifest = join(dir, 'packages', 'build-gate', 'package.json');
     const jsonAsPath = JSON.stringify({ version: '1.5.0' }, null, 2) + '\n';
     rmSync(manifest);
-    symlinkSync(jsonAsPath, manifest); // dangling by design; only the blob matters
+    // dangling by design; only the blob matters
+    if (!tryWorktreeSymlink(symlinkSync, jsonAsPath, manifest)) return;
     run('add', '-A');
     run('commit', '-q', '-m', 'symlink baseline');
     const newBase = run('rev-parse', 'HEAD').trim();
@@ -273,7 +282,7 @@ test('a manifest under working-tree-encoding still FAILS', () => {
   }
 });
 
-test('a filename containing git PATHSPEC MAGIC still FAILS', { skip: process.platform === 'win32' }, () => {
+test('a filename containing git PATHSPEC MAGIC still FAILS', () => {
   // Round-7 scenario. `changedFiles` returns raw paths, but ls-tree takes a
   // PATHSPEC, and git reads a leading `:(...)` as magic — verified
   // directly: `ls-tree <base> -- ':(top)victim/package.json'` reports the mode of
@@ -293,7 +302,8 @@ test('a filename containing git PATHSPEC MAGIC still FAILS', { skip: process.pla
     writeFileSync(join(dir, 'victim', 'package.json'), baseline);
     mkdirSync(join(dir, ':(top)victim'), { recursive: true });
     const magicManifest = join(dir, ':(top)victim', 'package.json');
-    symlinkSync(baseline, magicManifest); // Git stores the target text as the blob.
+    // Git stores the target text as the blob.
+    if (!tryWorktreeSymlink(symlinkSync, baseline, magicManifest)) return;
     run('add', '-A');
     run('commit', '-q', '-m', 'same blob under regular and symlink modes');
     const newBase = run('rev-parse', 'HEAD').trim();

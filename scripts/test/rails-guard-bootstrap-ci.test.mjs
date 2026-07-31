@@ -21,6 +21,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ticketFilename } from '@adlc/tickets';
+import { stageSymlink, tryWorktreeSymlink } from '../../packages/rails-guard/test/helpers/git-fixtures.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const WORKFLOW = join(ROOT, 'docs', 'ci', 'rails-guard.yml');
@@ -153,7 +154,11 @@ function runBootstrapScenario({ baseConfig, headConfig, env = {}, mutateBase, mu
   }
 }
 
-function runRailFreezeScenario({ baseConfig = BASE_UNSIGNED, baseTickets, headConfig, env = {}, mutateBase, mutateHead }) {
+// `stageBase`/`stageHead` run AFTER `git add -A`, right before the commit. That
+// ordering is REQUIRED for index-staged objects (mode 120000/100755): a path with
+// no file on disk is staged as a DELETION by `add -A`, silently undoing it and
+// turning the test into a test of nothing.
+function runRailFreezeScenario({ baseConfig = BASE_UNSIGNED, baseTickets, headConfig, env = {}, mutateBase, mutateHead, stageBase, stageHead }) {
   const dir = mkdtempSync(join(tmpdir(), 'rg-rail-freeze-'));
   try {
     git(dir, ['init', '-q', '-b', 'main']);
@@ -168,6 +173,7 @@ function runRailFreezeScenario({ baseConfig = BASE_UNSIGNED, baseTickets, headCo
     }
     mutateBase?.(dir);
     git(dir, ['add', '-A']);
+    stageBase?.(dir);
     git(dir, ['commit', '-qm', 'base']);
     git(dir, ['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     git(dir, ['checkout', '-q', '-b', 'feat']);
@@ -177,6 +183,7 @@ function runRailFreezeScenario({ baseConfig = BASE_UNSIGNED, baseTickets, headCo
     }
     mutateHead?.(dir);
     git(dir, ['add', '-A']);
+    stageHead?.(dir);
     git(dir, ['commit', '--allow-empty', '-qm', 'change']);
 
     const scenarioEnv = typeof env === 'function' ? env(dir) : env;
@@ -1217,16 +1224,17 @@ test('#283: a base directory store with an unsupported manifest version fails cl
 // (non-blob/symlink/nested at base, symlink-skip + malformed at head) — this is
 // the security-defense code, so a silent regression must break a test.
 
-test('#283: a base shard that is a symlink (non-100644 blob) fails closed', { skip: process.platform === 'win32' }, () => {
+test('#283: a base shard that is a symlink (non-100644 blob) fails closed', () => {
   const result = runRailFreezeScenario({
     baseConfig: BASE_UNSIGNED,
     headConfig: BASE_UNSIGNED,
     mutateBase: (dir) => {
       writeDirStore(dir, [{ id: 'T1', title: 'Fixture T1', rails: ['src/critical/**'] }]);
-      // A symlink named like a shard: git records it as mode 120000, which the
-      // base loop rejects instead of git-showing the link target.
-      symlinkSync('../../elsewhere.json', join(dir, '.adlc', 'tickets', ticketFilename('T2')));
     },
+    // A shard committed as mode 120000, staged through the INDEX so no symlink
+    // privilege is needed — this used to be skipped on Windows, i.e. the gate
+    // reported green for the forgery it exists to deny. Runs after `add -A`.
+    stageBase: (dir) => stageSymlink(dir, `.adlc/tickets/${ticketFilename('T2')}`, '../../elsewhere.json'),
   });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /UNSAFE_GIT_MODE|UNRECOGNIZED_STORE_ENTRY|not a regular-file blob/);
@@ -1256,7 +1264,7 @@ test('#283: a malformed HEAD shard fails closed', () => {
   assert.match(result.stderr, /INVALID_JSON: invalid (shard|JSON in)/);
 });
 
-test('#283: a HEAD shard replaced by a symlink is never followed', { skip: process.platform === 'win32' }, () => {
+test('#283: a HEAD shard replaced by a symlink is never followed', () => {
   const result = runRailFreezeScenario({
     baseConfig: BASE_UNSIGNED,
     headConfig: BASE_UNSIGNED,
@@ -1268,9 +1276,25 @@ test('#283: a HEAD shard replaced by a symlink is never followed', { skip: proce
       // rails — silently unfreezing src/critical/**. The canonical store refuses the
       // non-regular entry outright, so the decoy is never read.
       writeFileSync(join(dir, 'decoy.json'), JSON.stringify({ id: 'T1', title: 'Fixture T1', rails: [] }));
-      symlinkSync('../../decoy.json', shard);
+      // Best-effort working-tree symlink: on POSIX this reproduces the original
+      // fixture exactly. Windows without symlink privilege simply skips this
+      // half — the COMMITTED mode-120000 object below is staged either way, so
+      // the attack is still exercised there rather than the whole test vanishing.
+      tryWorktreeSymlink(symlinkSync, '../../decoy.json', shard);
     },
+    stageHead: (dir) => stageSymlink(dir, `.adlc/tickets/${ticketFilename('T1')}`, '../../decoy.json'),
   });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /UNSAFE_GIT_MODE|UNRECOGNIZED_STORE_ENTRY|non-executable regular/);
+  // DENIED is the security property; WHICH guard denies depends on whether the
+  // working-tree symlink was creatable. With it, the store refuses the
+  // non-regular entry (exit 1, UNSAFE_GIT_MODE). Without it, the shard is
+  // unreadable so T1 reads as absent and the base-ticket-removal guard denies
+  // first (exit 2). Both are correct refusals and neither follows the decoy —
+  // which is the thing that must never happen. Asserting only "non-zero" would
+  // be too weak, so the reason is pinned to the known-good set.
+  assert.notEqual(result.status, 0, 'the forged shard must never be accepted');
+  assert.match(
+    result.stderr,
+    /UNSAFE_GIT_MODE|UNRECOGNIZED_STORE_ENTRY|non-executable regular|cannot be removed from the .adlc\/tickets\/ store/,
+  );
+  assert.doesNotMatch(result.stderr, /rails: \[\]/, 'the decoy must never be read');
 });
