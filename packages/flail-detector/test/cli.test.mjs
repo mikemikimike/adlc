@@ -7,8 +7,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const CLI = new URL('../bin/flail-detector.mjs', import.meta.url).pathname;
+const CLI = fileURLToPath(new URL('../bin/flail-detector.mjs', import.meta.url));
 
 /**
  * Run the CLI with given args and optional stdin content.

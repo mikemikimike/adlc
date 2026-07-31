@@ -76,25 +76,26 @@ const SOURCE_EXT_RE = /\.(?:mjs|cjs|js)$/i;
  * @param {string} file repo-relative path
  */
 export function isSupportedSourceExtension(file) {
-  return SOURCE_EXT_RE.test(file);
+  return SOURCE_EXT_RE.test(file.replaceAll('\\', '/'));
 }
 
 export function isMutableSource(file, { testGlobs = [], sourceGlobs = [] } = {}) {
+  const normFile = file.replaceAll('\\', '/');
   // Explicit source declaration wins over every heuristic below. Names like
   // `hollow-test.mjs` are indistinguishable from a test by convention alone, so
   // the only correct answer is to let the project say which it is.
-  if (sourceGlobs.some((g) => globMatch(g, file))) {
-    return SOURCE_EXT_RE.test(file);
+  if (sourceGlobs.some((g) => globMatch(g, normFile))) {
+    return SOURCE_EXT_RE.test(normFile);
   }
-  if (EXCLUDE_DIR_RE.test(file)) return false;
-  if (EXCLUDE_FILE_RE.test(file)) return false;
+  if (EXCLUDE_DIR_RE.test(normFile)) return false;
+  if (EXCLUDE_FILE_RE.test(normFile)) return false;
   // Caller-declared test paths. The built-in rules cannot infer every project's
   // convention, and the hyphenated forms in particular are genuinely ambiguous
   // (see EXCLUDE_FILE_RE). Rather than guess wrong in either direction, a
   // consumer whose tests are named `foo-test.js` declares it:
   //   hollow-test --test-glob '**/*-test.js'
-  if (testGlobs.some((g) => globMatch(g, file))) return false;
-  return SOURCE_EXT_RE.test(file);
+  if (testGlobs.some((g) => globMatch(g, normFile))) return false;
+  return SOURCE_EXT_RE.test(normFile);
 }
 
 /**

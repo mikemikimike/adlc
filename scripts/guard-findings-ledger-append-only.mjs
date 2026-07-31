@@ -124,8 +124,10 @@ export function guard(baseRef, { run = defaultGit, read = readFileSync, exists =
   return 0;
 }
 
+import { pathToFileURL } from 'node:url';
+
 // CLI entry — skipped when this module is imported by a test.
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const baseRef = process.argv[2];
   if (!baseRef) {
     console.error('usage: guard-findings-ledger-append-only.mjs <base-ref>');

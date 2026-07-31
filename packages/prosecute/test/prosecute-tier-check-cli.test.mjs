@@ -16,8 +16,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { record } from '@adlc/gate-manifest/lib/record.mjs';
+import { fileURLToPath } from 'node:url';
 
-const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/adlc-prosecute.mjs', import.meta.url));
 
 // #326 hardening: the gate verifies attestation signatures, so both record-cross-model (which
 // signs) and tier-check (which verifies) need ADLC_MANIFEST_KEY. Set it for the whole file so
@@ -365,7 +366,7 @@ describe('adlc-prosecute tier-check — chain failure vs missing attestation (#3
   // tool", which is precisely how a repo-breaking constraint went unrecorded; a doc that
   // silently loses this again should fail the build, not just read differently.
   it('documents that rotating the signing key is a migration, in both the tool doc and the ADR', () => {
-    const root = new URL('../../../', import.meta.url).pathname;
+    const root = fileURLToPath(new URL('../../../', import.meta.url));
     for (const rel of ['docs/tools/gate-manifest.md', 'docs/adr/0007-multimodel-adversarial-review.md']) {
       const text = readFileSync(join(root, rel), 'utf8');
       assert.match(text, /rotat/i, `${rel} must discuss key rotation`);

@@ -28,7 +28,14 @@ test('closed layout rejects extra files, nested directories, symlinks, filename 
   const cases = [
     (path) => writeFileSync(join(path, 'README'), 'no'),
     (path) => mkdirSync(join(path, 'nested')),
-    (path) => symlinkSync(join(path, '.store.json'), join(path, 'alias.json')),
+    (path) => {
+      try {
+        symlinkSync(join(path, '.store.json'), join(path, 'alias.json'));
+      } catch (err) {
+        if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return false;
+        throw err;
+      }
+    },
     (path) => writeFileSync(join(path, ticketFilename('X')), JSON.stringify(ticket('Y'))),
     (path) => writeFileSync(join(path, ticketFilename('X')), JSON.stringify(ticket('X', { edges: [{ to: 'Y' }] }))),
     (path) => {
@@ -40,7 +47,7 @@ test('closed layout rejects extra files, nested directories, symlinks, filename 
     const dir = root();
     try {
       const path = writeDirectory(dir, []);
-      poison(path);
+      if (poison(path) === false) continue;
       assert.throws(() => new DirectoryTicketStore(path).load());
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
@@ -51,8 +58,12 @@ test('store roots and legacy files cannot be symlinks', () => {
   try {
     const realDirectory = writeDirectory(dir, [ticket('A')]);
     const aliasDirectory = join(dir, 'tickets-alias');
-    symlinkSync(realDirectory, aliasDirectory, 'dir');
-    assert.throws(() => new DirectoryTicketStore(aliasDirectory).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    try {
+      symlinkSync(realDirectory, aliasDirectory, 'dir');
+      assert.throws(() => new DirectoryTicketStore(aliasDirectory).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
 
     writeLegacy(dir, [ticket('A')]);
     const legacyPath = join(dir, '.adlc/tickets.json');
@@ -60,8 +71,12 @@ test('store roots and legacy files cannot be symlinks', () => {
     rmSync(realLegacy, { force: true });
     writeFileSync(realLegacy, JSON.stringify({ tickets: [ticket('A')] }));
     rmSync(legacyPath);
-    symlinkSync(realLegacy, legacyPath);
-    assert.throws(() => new LegacyTicketStore(legacyPath).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    try {
+      symlinkSync(realLegacy, legacyPath);
+      assert.throws(() => new LegacyTicketStore(legacyPath).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -73,9 +88,13 @@ test('a symlinked store parent cannot redirect active storage outside the reposi
     mkdirSync(externalAdlc, { recursive: true });
     writeFileSync(join(externalAdlc, 'tickets.json'), JSON.stringify({ tickets: [ticket('A')] }));
     writeDirectory(external, [ticket('A')]);
-    symlinkSync(externalAdlc, join(dir, '.adlc'), 'dir');
-    assert.throws(() => new LegacyTicketStore(join(dir, '.adlc/tickets.json')).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
-    assert.throws(() => new DirectoryTicketStore(join(dir, '.adlc/tickets')).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    try {
+      symlinkSync(externalAdlc, join(dir, '.adlc'), 'dir');
+      assert.throws(() => new LegacyTicketStore(join(dir, '.adlc/tickets.json')).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+      assert.throws(() => new DirectoryTicketStore(join(dir, '.adlc/tickets')).load(), (error) => error.code === 'UNSAFE_STORE_PATH');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(external, { recursive: true, force: true });

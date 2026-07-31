@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 import { runProsecution } from '../lib/run.mjs';
 import { canonicalJson, resolveRevision, resolveChangeSetRevision, sha256 } from '@adlc/core';
 import { ticketHash as domainTicketHash } from '@adlc/tickets';

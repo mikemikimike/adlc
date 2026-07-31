@@ -36,7 +36,7 @@ import {
   detectProvider,
   PROVIDER_NAMES,
 } from '@adlc/core';
-import { runConsensusFix } from '../lib/runner.mjs';
+import { runConsensusFix, resolveTargetPath } from '../lib/runner.mjs';
 import { buildPrompt } from '../lib/prompt.mjs';
 import { takeSnapshot, restoreSnapshot } from '../lib/snapshot.mjs';
 import { applyHunks } from '../lib/hunks.mjs';
@@ -229,10 +229,19 @@ const {
 let applied = false;
 if (values['apply'] && selectionResult && !allDivergent) {
   const { winner } = selectionResult;
+  // validateCandidate accepts a model filename whose separators differ from the
+  // caller's (it compares them separator-normalized), so on Windows a `--files
+  // src\file.mjs` run legitimately reaches here with `src/file.mjs`. The
+  // snapshot is keyed by the CALLER'S original strings, so the model's form must
+  // be mapped back before indexing or writing: indexing it directly yields
+  // undefined, and with several files the earlier ones have ALREADY been written
+  // by the time it fails — a partially modified tree, which is exactly what the
+  // snapshot/restore machinery exists to prevent.
   for (const { file, hunks } of winner.changes) {
-    const result = applyHunks(outerSnapshot[file], hunks);
+    const target = resolveTargetPath(file, filePaths);
+    const result = applyHunks(outerSnapshot[target], hunks);
     if (!result.ok) opError(`failed to apply winning candidate to ${file}: ${result.error}`);
-    writeFileSync(file, result.content, 'utf8');
+    writeFileSync(target, result.content, 'utf8');
   }
   applied = true;
 }

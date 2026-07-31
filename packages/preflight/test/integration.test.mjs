@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { runChecks } from '../lib/runner.mjs';
 import { computeVerdict } from '../lib/render.mjs';
@@ -36,7 +37,7 @@ function initRepo(dir) {
   return g;
 }
 
-const CLI_PATH = new URL('../bin/preflight.mjs', import.meta.url).pathname;
+const CLI_PATH = fileURLToPath(new URL('../bin/preflight.mjs', import.meta.url));
 
 // ── runChecks — all-required-pass path ───────────────────────────────────────
 

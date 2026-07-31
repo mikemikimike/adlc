@@ -43,7 +43,7 @@
  * it is not a containment boundary and is not offered as one.
  */
 
-const SECRET_FILE = /(^|[\s'"`/=(])\.env(\.[\w.-]+)?\b|\bid_[rd]sa\b|\.pem\b|\bcredentials(\.\w+)?\b|\bsecrets?\.(json|ya?ml|txt|env)\b/;
+const SECRET_FILE = /(^|[\s'"`/=\\()])\.env(\.[\w.-]+)?\b|\bid_[rd]sa\b|\.pem\b|\bcredentials(\.\w+)?\b|\bsecrets?\.(json|ya?ml|txt|env)\b/;
 
 // `set -x`, `set -ex`, `set -o xtrace`, `bash -x`, `sh -exc`. Deliberately NOT
 // `set +x` (that DISABLES tracing — it is the fix, not the defect) and not
@@ -128,6 +128,8 @@ function main() {
   });
 }
 
+import { pathToFileURL } from 'node:url';
+
 // Importable for the test; only reads stdin when run as the hook.
 export { violations };
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();

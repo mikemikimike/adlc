@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets, findPublishMetadataProblems } from '../release.mjs';
+import { releaseMain, repinInternalDependencies, packagePublishOrder, findVersionDrift, publishTargets, findPublishMetadataProblems, npmShellFlag } from '../release.mjs';
 
 /** Build a throwaway repo with package and Codex-manifest version surfaces. */
 function makeRepo() {
@@ -219,6 +219,21 @@ test('releaseMain rejects an invalid version (and does not regenerate the lockfi
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// The three default npm impls (lockfile regen, pack, publish) all shell out to
+// `npm`, which is `npm.cmd` on Windows — CreateProcess cannot run it, so
+// execFileSync needs `shell: true` there and must NOT get it anywhere else
+// (a shell reintroduces metacharacter interpretation on the arguments). Those
+// impls are the injectable DEFAULTS, so every releaseMain test replaces them and
+// none of them exercises the platform test; asserting the flag directly is the
+// only coverage it has. Both directions are pinned: a check inverted to
+// `!== 'win32'` breaks npm on Windows AND shells out on POSIX.
+test('npmShellFlag is true only on win32', () => {
+  assert.equal(npmShellFlag('win32'), true);
+  assert.equal(npmShellFlag('darwin'), false);
+  assert.equal(npmShellFlag('linux'), false);
+  assert.equal(npmShellFlag(), process.platform === 'win32'); // the real default argument
 });
 
 test('packagePublishOrder keeps core first and cli last', () => {

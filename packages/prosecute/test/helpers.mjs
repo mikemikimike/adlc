@@ -2,13 +2,14 @@
 // one-file-per-concern split). Not itself a *.test.mjs file, so `node --test test/*.test.mjs`
 // does not try to run it directly.
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { execFileSync } from 'node:child_process';
 import { sha256 } from '@adlc/core';
+import { fileURLToPath } from 'node:url';
 
 export const FIXTURE_REVISION = 'fixture-revision';
-export const repoRoot = resolve(new URL('../../../', import.meta.url).pathname);
+export const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 export function tmpAdlc() {
   const dir = mkdtempSync(join(tmpdir(), 'adlc-prosecute-'));

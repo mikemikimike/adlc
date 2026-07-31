@@ -10,14 +10,25 @@
 
 import { spawn as cpSpawn } from 'node:child_process';
 
+/** Windows: route `.mjs` (any case) through `node` — CreateProcess cannot run it. */
+export function isWinMjsCommand(cmd) {
+  return process.platform === 'win32' && typeof cmd === 'string' && /\.mjs$/i.test(cmd);
+}
+
 export function spawnAsync(cmd, args = [], opts = {}) {
   return new Promise((resolve) => {
+    let actualCmd = cmd;
+    let actualArgs = args;
+    if (isWinMjsCommand(cmd)) {
+      actualCmd = process.execPath;
+      actualArgs = [cmd, ...args];
+    }
     // Some harness workers take their prompt on STDIN (e.g. agy --print); pass it
     // via `opts.input`. Long prompts on stdin also avoid ARG_MAX limits.
     const stdin = opts.input !== undefined ? 'pipe' : 'ignore';
     let child;
     try {
-      child = cpSpawn(cmd, args, { ...opts, stdio: [stdin, 'pipe', 'pipe'] });
+      child = cpSpawn(actualCmd, actualArgs, { ...opts, stdio: [stdin, 'pipe', 'pipe'] });
     } catch (error) {
       resolve({ error, status: null, stdout: '', stderr: '' });
       return;

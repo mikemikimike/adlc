@@ -71,7 +71,7 @@ export function walkSourceFiles(root) {
       if (stat.isDirectory()) {
         walk(full);
       } else if (stat.isFile()) {
-        const rel = relative(root, full);
+        const rel = relative(root, full).replaceAll('\\', '/');
         if (!isExcluded(rel)) {
           results.push(rel);
         }

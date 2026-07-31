@@ -1,0 +1,318 @@
+// spawn-safe.test.mjs — the repo-local command-hijack defense (#352 cross-model
+// review findings F1/F2).
+//
+// The defect these guard against is not hypothetical: the windows-compat work
+// spawned a BARE `agy.cmd` / `copilot.cmd` under `shell: true`, and cmd.exe
+// resolves a bare name against the CURRENT DIRECTORY before PATH. Both call
+// sites run with cwd set to the repository under analysis, so a repo that
+// merely contained a file with that name would have it executed.
+//
+// Every assertion here drives the real functions with an injected `exists`
+// probe and an explicit platform, so both the win32 and POSIX halves are
+// exercised on any host.
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+// POSIX flavour explicitly for the POSIX cases and win32 flavour for the win32
+// ones, so the expectations are correct on any host (a Mac's `join` would build
+// `C:\tools/agy.cmd`, which is not what Windows resolution produces).
+import { posix, win32 } from 'node:path';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+const { delimiter, join } = posix;
+
+import { resolveOnPath, binCandidates, quoteWinCmdArg, winCmdArgs, winShell, winSystemExe } from '../lib/spawn-safe.mjs';
+
+/** An `exists` probe that answers true for exactly the given absolute paths. */
+const existsIn = (...paths) => {
+  const set = new Set(paths);
+  return (p) => set.has(p);
+};
+
+// ---------------------------------------------------------------- resolveOnPath
+
+test('resolveOnPath returns the absolute path of the first PATH hit', () => {
+  const hit = join('/opt/bin', 'agy');
+  const resolved = resolveOnPath('agy', {
+    env: { PATH: ['/usr/bin', '/opt/bin'].join(delimiter) },
+    platform: 'linux',
+    exists: existsIn(hit),
+  });
+  assert.equal(resolved, hit);
+});
+
+test('resolveOnPath honours PATH ORDER (earlier directory wins)', () => {
+  const first = join('/usr/bin', 'agy');
+  const second = join('/opt/bin', 'agy');
+  const resolved = resolveOnPath('agy', {
+    env: { PATH: ['/usr/bin', '/opt/bin'].join(delimiter) },
+    platform: 'linux',
+    exists: existsIn(first, second),
+  });
+  assert.equal(resolved, first);
+});
+
+// THE HIJACK, POSIX HALF. An EMPTY component in PATH means "current directory"
+// to a shell — `PATH=/usr/bin:` searches cwd. Joining it would resolve the
+// attacker's file; skipping it is the whole point.
+test('resolveOnPath SKIPS empty PATH components (an empty entry means cwd)', () => {
+  const cwdPlant = join(process.cwd(), 'agy');
+  for (const path of [`/usr/bin${delimiter}`, `${delimiter}/usr/bin`, `/usr/bin${delimiter}${delimiter}/opt/bin`]) {
+    const resolved = resolveOnPath('agy', {
+      env: { PATH: path },
+      platform: 'linux',
+      // ONLY the cwd plant exists — a resolver that honoured the empty
+      // component would find it. Correct behaviour is to find nothing.
+      exists: existsIn(cwdPlant),
+    });
+    assert.equal(resolved, null, `empty component in ${JSON.stringify(path)} must not resolve to cwd`);
+  }
+});
+
+test('resolveOnPath SKIPS relative PATH components (also cwd-anchored)', () => {
+  const relPlant = join('node_modules/.bin', 'agy');
+  const resolved = resolveOnPath('agy', {
+    env: { PATH: ['node_modules/.bin', '../elsewhere'].join(delimiter) },
+    platform: 'linux',
+    exists: existsIn(relPlant),
+  });
+  assert.equal(resolved, null);
+});
+
+test('resolveOnPath returns null when the command is absent — callers FAIL CLOSED', () => {
+  const resolved = resolveOnPath('agy', {
+    env: { PATH: '/usr/bin' },
+    platform: 'linux',
+    exists: () => false,
+  });
+  assert.equal(resolved, null, 'must be null, never the bare name');
+});
+
+test('resolveOnPath refuses a RELATIVE explicit path but accepts an absolute one', () => {
+  const abs = '/opt/tools/agy';
+  assert.equal(
+    resolveOnPath(abs, { env: { PATH: '' }, platform: 'linux', exists: existsIn(abs) }),
+    abs,
+  );
+  // `./agy` and `sub/agy` are cwd-anchored — the same reachability as a bare name.
+  for (const rel of ['./agy', 'sub/agy', '..\\agy']) {
+    assert.equal(
+      resolveOnPath(rel, { env: { PATH: '/usr/bin' }, platform: 'linux', exists: () => true }),
+      null,
+      `${rel} is cwd-relative and must be refused`,
+    );
+  }
+});
+
+// The DEFAULT probe must reject a directory. `existsSync` answers true for one,
+// so a directory named `agy.cmd` sitting earlier on PATH would be "resolved" and
+// handed to spawn, shadowing the real executable further along — a denial of
+// service at best, and on Windows a way to steer resolution at worst. Driven
+// against the real filesystem because the point is the DEFAULT probe, which an
+// injected boolean `exists` would bypass.
+test('resolveOnPath skips a DIRECTORY and keeps searching for a real file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'spawn-safe-'));
+  try {
+    const shadowDir = join(root, 'first');
+    const realDir = join(root, 'second');
+    mkdirSync(join(shadowDir, 'agy'), { recursive: true }); // a DIRECTORY named `agy`
+    mkdirSync(realDir, { recursive: true });
+    const realBin = join(realDir, 'agy');
+    // 0755: the probe requires an execute bit on POSIX, so a fixture without one
+    // would be skipped and this test would pass for the wrong reason.
+    writeFileSync(realBin, '#!/bin/sh\n', { mode: 0o755 });
+
+    const resolved = resolveOnPath('agy', {
+      env: { PATH: [shadowDir, realDir].join(delimiter) },
+      platform: 'linux',
+      // no `exists` override — exercising the production probe
+    });
+    assert.equal(resolved, realBin, 'the directory must not shadow the real executable');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('resolveOnPath returns null for an empty name', () => {
+  assert.equal(resolveOnPath('', { env: { PATH: '/usr/bin' }, exists: () => true }), null);
+  assert.equal(resolveOnPath(undefined, { env: { PATH: '/usr/bin' }, exists: () => true }), null);
+});
+
+test('resolveOnPath reads a case-variant PATH key on win32 (env names fold there)', () => {
+  const hit = win32.join('C:\\tools', 'agy.cmd');
+  const resolved = resolveOnPath('agy', {
+    env: { Path: 'C:\\tools' },
+    platform: 'win32',
+    exists: existsIn(hit),
+  });
+  assert.equal(resolved, hit);
+});
+
+// A win32 PATH entry like `C:\tools` must be recognised as ABSOLUTE. Resolving
+// with the host's path flavour on a POSIX machine classifies it as relative and
+// skips it — which would make the resolver return null for every real Windows
+// install and send callers down their fail-closed path in production.
+test('resolveOnPath treats a drive-letter PATH entry as absolute on win32', () => {
+  const hit = win32.join('C:\\tools', 'agy.cmd');
+  assert.equal(
+    resolveOnPath('agy', { env: { PATH: 'C:\\tools;C:\\other' }, platform: 'win32', exists: existsIn(hit) }),
+    hit,
+  );
+});
+
+test('resolveOnPath splits win32 PATH on ";" not ":" (a drive colon is not a separator)', () => {
+  const hit = win32.join('C:\\second', 'agy.cmd');
+  assert.equal(
+    resolveOnPath('agy', { env: { PATH: 'C:\\first;C:\\second' }, platform: 'win32', exists: existsIn(hit) }),
+    hit,
+  );
+});
+
+// ---------------------------------------------------------------- binCandidates
+
+test('binCandidates tries the batch shim before the executable on win32', () => {
+  assert.deepEqual(binCandidates('agy', 'win32'), ['agy.cmd', 'agy.exe', 'agy.bat', 'agy']);
+});
+
+test('binCandidates leaves an explicit extension alone', () => {
+  assert.deepEqual(binCandidates('agy.cmd', 'win32'), ['agy.cmd']);
+});
+
+test('binCandidates does not invent extensions off win32', () => {
+  assert.deepEqual(binCandidates('agy', 'linux'), ['agy']);
+  assert.deepEqual(binCandidates('agy', 'darwin'), ['agy']);
+});
+
+// ---------------------------------------------------------------- quoting
+
+// THE OTHER HALF OF F2. Node's `shell: true` joins argv with spaces and no
+// quoting, so an argument containing `>` reaches cmd.exe as a REDIRECTION —
+// the deny prompt contains `>`, which silently became a file write.
+test('quoteWinCmdArg keeps redirection and chaining metacharacters literal', () => {
+  for (const meta of ['>', '<', '&', '|', '^']) {
+    const quoted = quoteWinCmdArg(`prompt ${meta} tail`);
+    assert.ok(quoted.startsWith('"') && quoted.endsWith('"'), `${meta} must be enclosed in quotes`);
+    assert.ok(quoted.includes(meta), 'the character itself is preserved, not stripped');
+  }
+});
+
+test('quoteWinCmdArg doubles % so cmd.exe cannot expand %VAR%', () => {
+  assert.equal(quoteWinCmdArg('%PATH%'), '"%%PATH%%"');
+});
+
+test('quoteWinCmdArg escapes embedded double quotes', () => {
+  assert.equal(quoteWinCmdArg('say "hi"'), '"say \\"hi\\""');
+});
+
+test('winCmdArgs builds a /d /s /c line with every element quoted', () => {
+  const argv = winCmdArgs('C:\\tools\\agy.cmd', ['--print', 'a > b']);
+  assert.deepEqual(argv.slice(0, 3), ['/d', '/s', '/c']);
+  const line = argv[3];
+  assert.ok(line.startsWith('"') && line.endsWith('"'), 'the whole line is wrapped for /s');
+  assert.ok(line.includes('"C:\\tools\\agy.cmd"'), 'the binary is quoted');
+  assert.ok(line.includes('"a > b"'), 'an argument containing > stays one quoted argument');
+});
+
+test('winShell prefers an ABSOLUTE ComSpec (either casing)', () => {
+  assert.equal(winShell({ ComSpec: 'C:\\Windows\\System32\\cmd.exe' }), 'C:\\Windows\\System32\\cmd.exe');
+  assert.equal(winShell({ COMSPEC: 'C:\\alt\\cmd.exe' }), 'C:\\alt\\cmd.exe');
+});
+
+// THE INTERPRETER IS PART OF THE ATTACK SURFACE. Resolving the target binary to
+// an absolute path accomplishes nothing if the SHELL used to launch it is itself
+// an unqualified name: Windows searches the current directory before the system
+// directories, so a checkout containing `cmd.exe` would supply the interpreter
+// for every one of these invocations. An earlier version of this test asserted
+// `winShell({}) === 'cmd.exe'` — it pinned the vulnerable fallback as correct,
+// which is how a hollow test converts a hole into a guarantee.
+// EVERY env-derived component must be checked, not just the first one. Round 4
+// validated ComSpec and then joined SystemRoot unchecked, so `{SystemRoot: '.'}`
+// still produced a relative `System32\cmd.exe` — the same cwd-resolved
+// interpreter, reached by a different door. The relative/empty SystemRoot cases
+// below are exactly the ones that omission left uncovered.
+test('winShell NEVER returns a bare or relative interpreter', () => {
+  const envs = [
+    {},
+    { ComSpec: 'cmd.exe' },
+    { ComSpec: '.\\cmd.exe' },
+    { COMSPEC: 'sub\\cmd.exe' },
+    { SystemRoot: '.' },
+    { SystemRoot: '' },
+    { SystemRoot: 'relative\\win' },
+    { ComSpec: 'cmd.exe', SystemRoot: '..' },
+  ];
+  for (const env of envs) {
+    const shell = winShell(env);
+    assert.ok(win32.isAbsolute(shell), `${JSON.stringify(env)} produced non-absolute ${shell}`);
+    assert.notEqual(shell, 'cmd.exe');
+  }
+});
+
+test('winShell falls back to %SystemRoot%\\System32\\cmd.exe when it is absolute', () => {
+  assert.equal(winShell({ SystemRoot: 'D:\\Win' }), 'D:\\Win\\System32\\cmd.exe');
+  assert.equal(winShell({}), 'C:\\Windows\\System32\\cmd.exe');
+  // A non-absolute SystemRoot is DISCARDED, not joined.
+  assert.equal(winShell({ SystemRoot: '.' }), 'C:\\Windows\\System32\\cmd.exe');
+});
+
+test('winSystemExe resolves any system tool absolutely, discarding a relative root', () => {
+  assert.equal(winSystemExe('where.exe', { SystemRoot: 'D:\\Win' }), 'D:\\Win\\System32\\where.exe');
+  assert.equal(winSystemExe('where.exe', {}), 'C:\\Windows\\System32\\where.exe');
+  for (const root of ['.', '', 'rel\\path', '..']) {
+    assert.ok(win32.isAbsolute(winSystemExe('where.exe', { SystemRoot: root })), `SystemRoot=${JSON.stringify(root)}`);
+  }
+});
+
+// A regular file is not necessarily RUNNABLE on POSIX. A mode-0644 `agy` earlier
+// on PATH would otherwise be resolved and then spawned, failing EACCES instead
+// of falling through to the real 0755 one — the same shadowing the directory
+// check closed, one permission bit over. Driven against the real filesystem
+// because the production probe is the subject.
+test('resolveOnPath skips a NON-EXECUTABLE regular file on POSIX', { skip: process.platform === 'win32' ? 'POSIX permission bits' : false }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'spawn-safe-mode-'));
+  try {
+    const firstDir = join(root, 'first');
+    const secondDir = join(root, 'second');
+    mkdirSync(firstDir, { recursive: true });
+    mkdirSync(secondDir, { recursive: true });
+    const notExec = join(firstDir, 'agy');
+    const realExec = join(secondDir, 'agy');
+    writeFileSync(notExec, '#!/bin/sh\n', { mode: 0o644 });
+    writeFileSync(realExec, '#!/bin/sh\n', { mode: 0o755 });
+
+    const resolved = resolveOnPath('agy', {
+      env: { PATH: [firstDir, secondDir].join(delimiter) },
+      platform: 'linux',
+    });
+    assert.equal(resolved, realExec, 'a non-executable file must not shadow the real binary');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Windows has no execute bit — selection is by EXTENSION. Requiring X_OK there
+// would reject every legitimately installed `.cmd`/`.exe`.
+test('resolveOnPath does not demand an execute bit on win32', () => {
+  const root = mkdtempSync(join(tmpdir(), 'spawn-safe-win-'));
+  try {
+    const bin = join(root, 'agy.cmd');
+    writeFileSync(bin, '@echo off\n', { mode: 0o644 }); // no +x, as on a real NTFS checkout
+    // Real filesystem, win32 rules — the probe must accept it on extension alone.
+    assert.equal(
+      resolveOnPath(bin, { env: { PATH: '' }, platform: 'win32' }),
+      bin,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// An install shipping only `copilot.exe` (or an extensionless shim) must not be
+// reported missing. Pinning the default to `copilot.cmd` did exactly that,
+// because an explicit extension is resolved verbatim rather than expanded.
+test('binCandidates expands a BARE win32 name so .exe-only installs resolve', () => {
+  const cands = binCandidates('copilot', 'win32');
+  assert.ok(cands.includes('copilot.exe'), 'an .exe-only install must be reachable');
+  assert.ok(cands.includes('copilot.cmd'));
+  assert.ok(cands.includes('copilot'), 'an extensionless shim must be reachable');
+});

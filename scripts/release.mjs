@@ -39,13 +39,27 @@ function writeJson(path, value) {
 }
 
 /**
+ * Whether an `npm` invocation needs a shell. On Windows npm is `npm.cmd`, which
+ * CreateProcess cannot execute directly — execFileSync without `shell` dies with
+ * ENOENT. Everywhere else the shell is unnecessary and undesirable (it would
+ * reintroduce metacharacter interpretation on arguments).
+ *
+ * Extracted and exported so the three default npm impls below share ONE copy of
+ * the platform test, and so that test is directly assertable on both platforms
+ * from a machine that is only ever one of them.
+ */
+export function npmShellFlag(platform = process.platform) {
+  return platform === 'win32';
+}
+
+/**
  * Regenerate package-lock.json so it tracks the freshly-bumped versions. Pure
  * lockfile resolution (the suite is zero-dependency / workspace-only), so this is
  * offline and fast. Injectable via the `regenerateLockfile` option so the unit
  * tests can drive releaseMain without shelling out to npm.
  */
 function defaultRegenerateLockfile(root) {
-  execFileSync('npm', ['install', '--package-lock-only'], { cwd: root, stdio: 'inherit' });
+  execFileSync('npm', ['install', '--package-lock-only'], { cwd: root, stdio: 'inherit', shell: npmShellFlag() });
 }
 
 export function packagePublishOrder(names) {
@@ -634,6 +648,7 @@ function defaultPackImpl(dir) {
     cwd: dir,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
+    shell: npmShellFlag(),
   });
 }
 
@@ -727,7 +742,7 @@ export function findPackagingProblems({ packagesDir = PKGS, pluginsDir = PLUGINS
 }
 
 function defaultPublishImpl(dir) {
-  execFileSync('npm', ['publish', '--provenance'], { cwd: dir, stdio: 'inherit' });
+  execFileSync('npm', ['publish', '--provenance'], { cwd: dir, stdio: 'inherit', shell: npmShellFlag() });
 }
 
 export function releaseMain(

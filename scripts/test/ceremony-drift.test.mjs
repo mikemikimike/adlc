@@ -802,3 +802,45 @@ test('a railed preexisting-completed-field entry gets no runnable command', () =
   assert.match(body, /## Needs a manual decision/);
   assert.match(body, /will \*\*not\*\* clear/);
 });
+
+// ---- `gh` resolution is resolved once, not per call ----
+//
+// resolveGhBin scans PATH and memoizes; a version that re-scanned on every call
+// would return the SAME string in the common case, so the return value alone is
+// no evidence of the cache. The only way to observe it is to make a second scan
+// impossible — populate the cache, then delete the stub and take it off PATH, and
+// require the original answer back. A re-scan finds nothing and falls through to
+// the bare name.
+//
+// The cache is module state shared by the whole process; this is its only
+// in-process caller, so the first call below is genuinely the first.
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, delimiter } from 'node:path';
+import { resolveGhBin } from '../ceremony-drift.mjs';
+
+test('resolveGhBin caches the resolved path instead of re-scanning PATH', () => {
+  // Windows prefers the `.cmd` shim over the bare name, so stub the name that
+  // platform's own search order reaches first.
+  const stubName = process.platform === 'win32' ? 'gh.cmd' : 'gh';
+  const binDir = mkdtempSync(join(tmpdir(), 'adlc-drift-ghbin-'));
+  const empty = mkdtempSync(join(tmpdir(), 'adlc-drift-noghbin-'));
+  const stub = join(binDir, stubName);
+  // 0755: resolveOnPath requires an execute bit on POSIX (a non-executable file
+  // earlier on PATH must not shadow a real binary), so a mode-0644 stub would be
+  // skipped and this test would fail for a reason unrelated to caching.
+  writeFileSync(stub, '', { mode: 0o755 }); // never executed — only probed
+  const savedPath = process.env.PATH;
+  try {
+    process.env.PATH = `${binDir}${delimiter}${savedPath}`;
+    assert.equal(resolveGhBin(), stub, 'first call resolves the stub ahead of any real gh');
+
+    rmSync(binDir, { recursive: true, force: true });
+    process.env.PATH = empty;
+    assert.equal(resolveGhBin(), stub, 'second call reuses the cached path without re-scanning');
+  } finally {
+    process.env.PATH = savedPath;
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(empty, { recursive: true, force: true });
+  }
+});

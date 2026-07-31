@@ -38,6 +38,8 @@ const DIGESTS = path.join(repoRoot, 'scripts/test/install-digests.json');
 
 const read = (abs) => readFileSync(abs, 'utf8');
 
+const posixTest = (name, fn) => test(name, { skip: process.platform === 'win32' }, fn);
+
 /** Every harness the installer knows how to detect, and the binary that reveals it. */
 const HARNESSES = [
   { bin: 'claude', label: 'Claude Code' },
@@ -123,7 +125,7 @@ function runInstaller(box) {
   return spawnSync('sh', [INSTALL_SH], { encoding: 'utf8', env: box.env, timeout: 60_000 });
 }
 
-test('install.sh is POSIX sh and free of the common bashisms', () => {
+posixTest('install.sh is POSIX sh and free of the common bashisms', () => {
   const syntax = spawnSync('sh', ['-n', INSTALL_SH], { encoding: 'utf8' });
   assert.equal(syntax.status, 0, `sh -n failed: ${syntax.stderr}`);
 
@@ -152,7 +154,7 @@ test('install.sh is POSIX sh and free of the common bashisms', () => {
   assert.match(read(INSTALL_SH), /^#!\/bin\/sh$/m, 'install.sh must declare #!/bin/sh');
 });
 
-test('install.sh survives truncation: a partial download executes nothing', () => {
+posixTest('install.sh survives truncation: a partial download executes nothing', () => {
   // `sh` reads a pipe incrementally and runs what it has, so `curl … | sh` on a
   // dropped connection executes whatever prefix arrived.
   //
@@ -219,7 +221,7 @@ test('install.sh survives truncation: a partial download executes nothing', () =
   }
 });
 
-test('install.sh refuses to run without Node and installs nothing', () => {
+posixTest('install.sh refuses to run without Node and installs nothing', () => {
   const box = sandbox({ bins: ['npm'] }); // npm present, node absent
   try {
     const result = runInstaller(box);
@@ -231,7 +233,7 @@ test('install.sh refuses to run without Node and installs nothing', () => {
   }
 });
 
-test('install.sh refuses to run on a Node older than 18 and installs nothing', () => {
+posixTest('install.sh refuses to run on a Node older than 18 and installs nothing', () => {
   const box = sandbox({ bins: ['node', 'npm'], nodeVersion: 'v16.20.2' });
   try {
     const result = runInstaller(box);
@@ -246,7 +248,7 @@ test('install.sh refuses to run on a Node older than 18 and installs nothing', (
   }
 });
 
-test('install.sh installs the toolkit and only the harnesses that are present', () => {
+posixTest('install.sh installs the toolkit and only the harnesses that are present', () => {
   // Two present, five absent. The absent five are the point of the test.
   const present = ['codex', 'pi'];
   const absent = HARNESSES.filter((h) => !present.includes(h.bin));
@@ -300,7 +302,7 @@ test('install.sh installs the toolkit and only the harnesses that are present', 
   }
 });
 
-test('install.sh continues past a failing harness but exits non-zero', () => {
+posixTest('install.sh continues past a failing harness but exits non-zero', () => {
   // Two properties, and they pull in opposite directions. A broken harness must
   // not ABORT the run — the others on the machine are still worth installing.
   // But the run must not report SUCCESS either: `curl … | sh` hands this exit
@@ -317,7 +319,7 @@ test('install.sh continues past a failing harness but exits non-zero', () => {
   }
 });
 
-test('install.sh does not run project-scoped installers from the caller\'s directory', () => {
+posixTest('install.sh does not run project-scoped installers from the caller\'s directory', () => {
   // `@adlc/opencode init` defaults its root to the CWD and scaffolds .adlc/ and
   // .opencode/ there. This script is machine-level and the documented flow is
   // "install, THEN cd into your repo", so running it here would configure $HOME
@@ -337,7 +339,7 @@ test('install.sh does not run project-scoped installers from the caller\'s direc
   }
 });
 
-test('install.sh honours pi\'s 22.19 floor at the MINOR version, not just the major', () => {
+posixTest('install.sh honours pi\'s 22.19 floor at the MINOR version, not just the major', () => {
   // @adlc/pi needs a higher Node than the toolkit (22.19 vs 18). Comparing only
   // the major accepts 22.0–22.18, which install a package outside its engine
   // contract that then fails at load time. The boundary cases are the test:
@@ -369,7 +371,7 @@ test('install.sh honours pi\'s 22.19 floor at the MINOR version, not just the ma
   }
 });
 
-test('every harness recorded as manual has a printed instruction', () => {
+posixTest('every harness recorded as manual has a printed instruction', () => {
   // The class behind two separate findings: a harness can be added to MANUAL in
   // one place and forgotten in the summary, so the output names it and then
   // tells the user nothing. Derived from the script itself, so a harness added
@@ -387,7 +389,7 @@ test('every harness recorded as manual has a printed instruction', () => {
   );
 });
 
-test('install.sh prints manual steps only for the harnesses that need them', () => {
+posixTest('install.sh prints manual steps only for the harnesses that need them', () => {
   // MANUAL was used as a boolean, so one manual harness printed instructions for
   // all four — handing the user commands for software they do not have.
   const box = sandbox({ bins: ['node', 'npm'] });
@@ -407,7 +409,7 @@ test('install.sh prints manual steps only for the harnesses that need them', () 
   }
 });
 
-test('install.sh allowlists platforms rather than denylisting Windows', () => {
+posixTest('install.sh allowlists platforms rather than denylisting Windows', () => {
   // A denylist only stops what it enumerates. FreeBSD, Solaris, and — worse — an
   // ABSENT or spoofed `uname` (which fell through as "unknown") all proceeded to
   // install globally on a platform this project does not claim to support.
@@ -429,7 +431,7 @@ test('install.sh allowlists platforms rather than denylisting Windows', () => {
   }
 });
 
-test('install.sh refuses when uname is unavailable rather than assuming support', () => {
+posixTest('install.sh refuses when uname is unavailable rather than assuming support', () => {
   const box = sandbox({ bins: ['node', 'npm'] });
   try {
     // A `uname` that fails is indistinguishable from a hostile one; either way
@@ -446,7 +448,7 @@ test('install.sh refuses when uname is unavailable rather than assuming support'
   }
 });
 
-test('install.sh warns when a different adlc shadows the one npm installed', () => {
+posixTest('install.sh warns when a different adlc shadows the one npm installed', () => {
   // Running `adlc` proves something named adlc runs, not that it is the binary
   // npm just wrote. With several Node managers or a stale user-local copy, the
   // user can end up running gates from a toolkit this script never touched.
@@ -465,7 +467,7 @@ test('install.sh warns when a different adlc shadows the one npm installed', () 
   }
 });
 
-test('install.sh stays quiet when the adlc on PATH IS the one npm installed', () => {
+posixTest('install.sh stays quiet when the adlc on PATH IS the one npm installed', () => {
   // The complement matters: a warning that fires on every healthy install is
   // noise, and noise is what teaches people to ignore the real one. Reporting a
   // prefix the shims genuinely sit under models the normal case — no test-only
@@ -493,7 +495,7 @@ test('install.sh stays quiet when the adlc on PATH IS the one npm installed', ()
   }
 });
 
-test('install.sh verifies the Antigravity plugin path instead of assuming it', () => {
+posixTest('install.sh verifies the Antigravity plugin path instead of assuming it', () => {
   // `agy plugin install` takes a filesystem path, and with version managers or a
   // custom prefix `npm install -g` can write somewhere `npm root -g` does not
   // report. Passing an unverified path hands agy a non-existent directory and
@@ -590,7 +592,7 @@ test('install.sh delegates the Antigravity install to the package helper, never 
   }
 });
 
-test('install.sh refuses to run on native Windows but allows WSL', () => {
+posixTest('install.sh refuses to run on native Windows but allows WSL', () => {
   // Git Bash / MSYS / Cygwin give a POSIX shell on a platform where the toolkit
   // passes 6 of 28 suites, so the script would install a broken toolkit and
   // report success. WSL reports "Linux" and is a supported path.
@@ -610,7 +612,7 @@ test('install.sh refuses to run on native Windows but allows WSL', () => {
   }
 });
 
-test('install.sh installs the Copilot native plugin from its marketplace', () => {
+posixTest('install.sh installs the Copilot native plugin from its marketplace', () => {
   // Copilot ships a real native plugin (rails hook, build-gate, MCP, agents) via
   // its Git marketplace. The marketplace path does not go through npm, so the
   // unpublished @adlc/copilot package is no reason to downgrade this to a
@@ -627,7 +629,7 @@ test('install.sh installs the Copilot native plugin from its marketplace', () =>
   }
 });
 
-test('install.sh fails when npm succeeds but adlc is not on PATH', () => {
+posixTest('install.sh fails when npm succeeds but adlc is not on PATH', () => {
   // npm exiting 0 proves the package was written, not that it is runnable — a
   // custom prefix routinely puts the bin outside PATH. Reporting success and
   // then telling the user to run `adlc init` sends them to command-not-found.
@@ -646,7 +648,7 @@ test('install.sh fails when npm succeeds but adlc is not on PATH', () => {
   }
 });
 
-test('install.sh cannot be hijacked by a repo-local package named "plugins"', () => {
+posixTest('install.sh cannot be hijacked by a repo-local package named "plugins"', () => {
   // npx resolves a BARE package name against the current project first, so a
   // malicious repo shipping a workspace/dependency named `plugins` would have
   // its binary executed. The agent-led flow runs from inside the target repo,
@@ -672,7 +674,7 @@ test('install.sh cannot be hijacked by a repo-local package named "plugins"', ()
   }
 });
 
-test('install.sh passes non-interactive flags to every nested installer', () => {
+posixTest('install.sh passes non-interactive flags to every nested installer', () => {
   // Under `curl … | sh` stdin is NOT a terminal. herdr refuses a remote plugin
   // install without --yes in that case, and `plugins` prompts for confirmation.
   // Either one hangs or fails the install, and no other test can see it: the
@@ -723,7 +725,7 @@ test('install.sh passes non-interactive flags to every nested installer', () => 
   }
 });
 
-test('install.sh detects Cursor by config directory and asks for the manual step', () => {
+posixTest('install.sh detects Cursor by config directory and asks for the manual step', () => {
   // Cursor is a GUI app: no `cursor` binary is guaranteed, and its plugin
   // install has no shell command. Detecting it must not invent one.
   const box = sandbox({ bins: ['node', 'npm'] });
@@ -741,7 +743,7 @@ test('install.sh detects Cursor by config directory and asks for the manual step
   }
 });
 
-test('install.sh survives an environment with no HOME', () => {
+posixTest('install.sh survives an environment with no HOME', () => {
   // `set -u` plus a bare ${HOME} kills the install with "unbound variable" —
   // an error naming nothing the user can act on. Containers and some CI shells
   // have no HOME, and `curl | sh` is exactly what runs in a container.
@@ -763,7 +765,7 @@ test('install.sh survives an environment with no HOME', () => {
   }
 });
 
-test('install.sh is idempotent against harnesses that are ALREADY installed', () => {
+posixTest('install.sh is idempotent against harnesses that are ALREADY installed', () => {
   // Stateless shims cannot prove idempotence: they answer identically forever,
   // so "same commands twice" says nothing about what happens when a plugin is
   // already registered. These shims remember, and on a second invocation behave
@@ -812,7 +814,7 @@ test('install.sh is idempotent against harnesses that are ALREADY installed', ()
   }
 });
 
-test('ADLC_SKIP_HARNESSES=1 installs the toolkit and touches no harness', () => {
+posixTest('ADLC_SKIP_HARNESSES=1 installs the toolkit and touches no harness', () => {
   const box = sandbox({ bins: ['node', 'npm', 'codex', 'pi', 'herdr'] });
   try {
     const result = spawnSync('sh', [INSTALL_SH], {

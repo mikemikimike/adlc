@@ -23,7 +23,7 @@ import { BASE_MANIFEST } from './protected-paths.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
-import { spawnAsync } from './spawn-async.mjs';
+import { spawnAsync, isWinMjsCommand } from './spawn-async.mjs';
 import { completeTicketOnIntegration, revertCompletionCommit, assertOnBranch } from './complete.mjs';
 import { resolveKeyFromEnv } from '@adlc/tickets/lib/key-contract.mjs';
 
@@ -99,9 +99,20 @@ export function defaultIo() {
     // rest of the options reach spawnSync.
     adlc: (args, opts = {}) => {
       const { bin = 'adlc', ...rest } = opts;
+      if (isWinMjsCommand(bin)) {
+        return spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', ...rest });
+      }
       return spawnSync(bin, args, { encoding: 'utf8', ...rest });
     },
-    adlcAsync: (args, opts = {}) => spawnAsync('adlc', args, { encoding: 'utf8', ...opts }),
+    // Same `bin` contract as the sync sibling above, for the same reason: the
+    // rails-guard on the gate path must run the operator's `config.adlcBin`, not
+    // whatever bare `adlc` PATH happens to resolve. No isWinMjsCommand branch
+    // here — spawnAsync already applies it to whatever command it is handed, so
+    // re-implementing it would be a copy that can drift from the original.
+    adlcAsync: (args, opts = {}) => {
+      const { bin = 'adlc', ...rest } = opts;
+      return spawnAsync(bin, args, { encoding: 'utf8', ...rest });
+    },
     // Async (non-blocking) worker/gate/review execution so the concurrent
     // scheduler is not serialized by a blocking spawn (#164).
     spawnWorker: (cmd, args, opts) => spawnAsync(cmd, args, { encoding: 'utf8', ...opts }),
@@ -320,7 +331,10 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       };
       const readBytes = (p) => (io.exists(join(worktree, p)) ? io.readFile(join(worktree, p)) : undefined);
       const railsGuard = async () => {
-        const res = await io.adlcAsync(['rails-guard', '--base', startSha, '--ticket', ticket.id], { cwd: worktree });
+        // `bin` is the operator's configured adlc, exactly as the flail path uses
+        // it — the production rails gate must not silently fall back to whatever
+        // bare `adlc` PATH resolves inside the ticket worktree.
+        const res = await io.adlcAsync(['rails-guard', '--base', startSha, '--ticket', ticket.id], { cwd: worktree, bin: adlcBin });
         return { ok: res.status === 0, output: `${res.stdout ?? ''}${res.stderr ?? ''}` };
       };
       return runGatePipeline(ticket, {
@@ -455,7 +469,10 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
         + 'MISSING from the ledger, not zero — phase totals will under-report until it is re-recorded.'
       );
       let res;
-      try { res = io.adlc(['gate-manifest', 'record', 'p4', '--ticket', ticket.id, '--data', JSON.stringify(data)], {}); }
+      // `bin: adlcBin` for the same reason recordGate carries it: the recorder
+      // must be the operator's configured adlc, not whatever bare `adlc` PATH
+      // resolves inside the ticket worktree.
+      try { res = io.adlc(['gate-manifest', 'record', 'p4', '--ticket', ticket.id, '--data', JSON.stringify(data)], { bin: adlcBin }); }
       catch (e) { warn(e.message); return; }
       if (res?.error) warn(res.error.message);
       else if (res?.signal) warn(`recorder killed by ${res.signal}`);
@@ -471,7 +488,7 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       // to what an existing entry looks like.
       const argv = ['gate-manifest', 'record', phase, '--ticket', ticket.id, ok ? '--pass' : '--fail'];
       if (data !== undefined) argv.push('--data', JSON.stringify(data));
-      try { io.adlc(argv, {}); }
+      try { io.adlc(argv, { bin: adlcBin }); }
       catch { /* evidence is best-effort */ }
     },
 

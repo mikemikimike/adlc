@@ -131,6 +131,7 @@ test('AC3b: risk-tier PATTERN actually matches realistic auth/validator file pat
   // find the bug.
   const text = readTemplate();
   const patternLines = text
+    .replaceAll('\r\n', '\n')
     .split('\n')
     .filter((line) => /^\s*PATTERN=/.test(line))
     .map((line) => line.trim());
@@ -155,14 +156,14 @@ test('AC3b: risk-tier PATTERN actually matches realistic auth/validator file pat
   const mustNotNecessarilyBlockUnrelated = ['src/components/Button.tsx', 'README.md'];
 
   for (const file of mustMatch) {
-    const script = `${patternLines.join('\n')}\nprintf '%s\\n' ${JSON.stringify(file)} | grep -qiE "$PATTERN"`;
-    const rc = execFileSync('bash', ['-c', `${script}; echo $?`], { encoding: 'utf8' }).trim();
+    const script = `${patternLines.join('\n')}\nprintf '%s\\n' ${JSON.stringify(file)} | grep -qiE "$PATTERN"\n`;
+    const rc = execFileSync('bash', ['-s'], { input: `${script}echo $?`, encoding: 'utf8' }).trim();
     assert.equal(rc, '0', `expected PATTERN to classify "${file}" as risk=high (a real auth/validator path), but it did not match`);
   }
 
   for (const file of mustNotNecessarilyBlockUnrelated) {
-    const script = `${patternLines.join('\n')}\nprintf '%s\\n' ${JSON.stringify(file)} | grep -qiE "$PATTERN"`;
-    const rc = execFileSync('bash', ['-c', `${script}; echo $?`], { encoding: 'utf8' }).trim();
+    const script = `${patternLines.join('\n')}\nprintf '%s\\n' ${JSON.stringify(file)} | grep -qiE "$PATTERN"\n`;
+    const rc = execFileSync('bash', ['-s'], { input: `${script}echo $?`, encoding: 'utf8' }).trim();
     assert.equal(rc, '1', `expected PATTERN to NOT classify unrelated file "${file}" as risk=high`);
   }
 });
@@ -335,7 +336,7 @@ test('AC11: docs/README.md CI templates section lists the new template, mirrorin
   assert.match(readme, /ci\/adversarial-review\.yml/);
 });
 
-test('AC12: "Record adversarial-review verdict" step tolerates a review-report.txt with no provider token under bash -eo pipefail (regression for a missing `set +e`)', () => {
+test('AC12: "Record adversarial-review verdict" step tolerates a review-report.txt with no provider token under bash -eo pipefail (regression for a missing `set +e`)', { skip: process.platform === 'win32' }, () => {
   // Regression for a round-3 review finding: commit 4e347ff added `set +e`
   // before the provider-extraction grep specifically because GitHub Actions
   // runs `run:` blocks with `bash -eo pipefail` by default, and a
@@ -381,7 +382,7 @@ test('AC12: "Record adversarial-review verdict" step tolerates a review-report.t
   }
 });
 
-test('AC13: both "Post ... PR comment" steps tolerate a failing `gh pr comment` (forked PR, read-only GITHUB_TOKEN)', () => {
+test('AC13: both "Post ... PR comment" steps tolerate a failing `gh pr comment` (forked PR, read-only GITHUB_TOKEN)', { skip: process.platform === 'win32' }, () => {
   // Regression for a round-3 review finding: commit 4e347ff appended
   // `|| echo "::warning..."` to both `gh pr comment` invocations so a
   // forked PR's read-only GITHUB_TOKEN can't fail the job. For the "cheap"

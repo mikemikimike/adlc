@@ -7,8 +7,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const RULESET_PATH = join(new URL('../../../', import.meta.url).pathname, 'docs/github-rulesets/adlc-attestations-ruleset.json');
+const RULESET_PATH = join(fileURLToPath(new URL('../../../', import.meta.url)), 'docs/github-rulesets/adlc-attestations-ruleset.json');
 const ruleset = JSON.parse(readFileSync(RULESET_PATH, 'utf8'));
 
 describe('adlc-attestations-ruleset.json', () => {

@@ -28,10 +28,19 @@ export class GitTreeTicketStore {
     }
   }
 
-  #show(path) {
-    const output = runGit(this.cwd, ['show', `${this.exactRevision}:${path}`], { allowFailure: true });
-    if (output === null) throw operational('GIT_PATH_MISSING', `${path} is absent at ${this.exactRevision}`);
+  #blob(object) {
+    // Prefer `cat-file -p <oid>` over `show REV:path`. On Windows, git-for-windows
+    // stats the combined `REV:path` string as a filesystem path and fails with
+    // "Filename too long" for ULID-length ticket shards even though the blob exists.
+    const output = runGit(this.cwd, ['cat-file', '-p', object], { allowFailure: true });
+    if (output === null) throw operational('GIT_PATH_MISSING', `blob ${object} is absent at ${this.exactRevision}`);
     return output;
+  }
+
+  #show(path) {
+    const entry = this.#regularBlob(path);
+    if (!entry) throw operational('GIT_PATH_MISSING', `${path} is absent at ${this.exactRevision}`);
+    return this.#blob(entry.object);
   }
 
   #entries(path) {
@@ -95,8 +104,9 @@ export class GitTreeTicketStore {
       if (entry.type !== 'blob' || entry.mode !== '100644') throw invalid('UNSAFE_GIT_MODE', `${path} must be a non-executable regular file`);
       if (seenLower.has(relative.toLowerCase())) throw invalid('CASE_COLLISION', `case-insensitive collision at ${relative}`);
       seenLower.add(relative.toLowerCase());
+      const raw = this.#show(path);
       let ticket;
-      try { ticket = JSON.parse(this.#show(path)); } catch (error) { throw invalid('INVALID_JSON', `invalid shard ${relative}: ${error.message}`); }
+      try { ticket = JSON.parse(raw); } catch (error) { throw invalid('INVALID_JSON', `invalid shard ${relative}: ${error.message}`); }
       if (!ticket || typeof ticket.id !== 'string' || relative !== ticketFilename(ticket.id)) throw invalid('FILENAME_MISMATCH', `${relative} does not match its ticket id`);
       tickets.push(ticket);
     }

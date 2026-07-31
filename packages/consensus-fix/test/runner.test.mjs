@@ -14,7 +14,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { runCommand, validateCandidate, runConsensusFix } from '../lib/runner.mjs';
+import { runCommand, validateCandidate, runConsensusFix, resolveTargetPath } from '../lib/runner.mjs';
+import { applyChanges } from '../lib/snapshot.mjs';
 
 function makeTmp() {
   return mkdtempSync(join(tmpdir(), 'consensus-fix-runner-test-'));
@@ -213,7 +214,7 @@ test('runConsensusFix discards a candidate whose hunk fails to apply cleanly —
       return fixResponse(f, 'good fix');
     };
 
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
     const result = await runConsensusFix({ testCmd, files: [f], n: 2, tier: 'mid', completeFn });
 
     assert.equal(result.discarded.length, 1);
@@ -241,7 +242,7 @@ test('runConsensusFix: surviving candidate passes test, files restored after', a
     writeFileSync(sentinelFile, 'no');
 
     // Test command: check if sentinel file contains 'yes'.
-    const testCmd = `test "$(cat '${sentinelFile}')" = "yes"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') !== 'yes') process.exit(1)" "${sentinelFile}"`;
 
     const result = await runConsensusFix({
       testCmd,
@@ -310,7 +311,7 @@ test('runConsensusFix groups and selects winner across multiple candidates', asy
 
     // We need the test to pass.  We'll use a test that checks what's in the file.
     // The check: if file contains 'majority fix' or 'minority fix' → exit 0.
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const result = await runConsensusFix({
       testCmd,
@@ -348,7 +349,7 @@ test('runConsensusFix all-divergent flag set correctly', async () => {
       return fixResponse(f, `fix${call}`);
     };
 
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const result = await runConsensusFix({
       testCmd,
@@ -374,10 +375,10 @@ test('runConsensusFix: candidate passing test-cmd but failing rails is NOT a sur
     writeFileSync(f, 'original');
 
     // The repro gate (testCmd) passes whenever the file is no longer 'original'.
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
     // The rails gate (railsCmd) passes ONLY when the file contains 'good fix'.
     // A candidate that writes anything else games the repro but reddens rails.
-    const railsCmd = `test "$(cat '${f}')" = "good fix"`;
+    const railsCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') !== 'good fix') process.exit(1)" "${f}"`;
 
     let call = 0;
     const completeFn = async () => {
@@ -428,8 +429,8 @@ test('runConsensusFix: competing candidate that passes both gates wins over a sm
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
 
-    const testCmd = `test "$(cat '${f}')" != "original"`;
-    const railsCmd = `grep -q RAILS_OK '${f}'`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
+    const railsCmd = `node -e "if (!require('fs').readFileSync(process.argv[1], 'utf8').includes('RAILS_OK')) process.exit(1)" "${f}"`;
 
     let call = 0;
     const fn = async () => {
@@ -473,7 +474,7 @@ test('runConsensusFix: providerNames issues exactly one completeFn call per name
   try {
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const seenProviders = [];
     const completeFn = async (_prompt, providerName) => {
@@ -504,7 +505,7 @@ test('runConsensusFix: providerNames results record which provider produced whic
   try {
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const completeFn = async (_prompt, providerName) => fixResponse(f, `fix-from-${providerName}`);
 
@@ -530,7 +531,7 @@ test('runConsensusFix: providerNames + a failing provider surfaces as a discarde
   try {
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const completeFn = async (_prompt, providerName) => {
       if (providerName === 'openai') throw new Error('provider "openai" is not available');
@@ -559,7 +560,7 @@ test('runConsensusFix: without providerNames, behavior is unchanged (n resamples
   try {
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     let callCount = 0;
     const completeFn = async (_prompt, providerName) => {
@@ -590,7 +591,7 @@ test('runConsensusFix: without --rails, emits a warning and survivors are repro-
     const f = join(dir, 'source.mjs');
     writeFileSync(f, 'original');
 
-    const testCmd = `test "$(cat '${f}')" != "original"`;
+    const testCmd = `node -e "if (require('fs').readFileSync(process.argv[1], 'utf8') === 'original') process.exit(1)" "${f}"`;
 
     const messages = [];
     const result = await runConsensusFix({
@@ -618,4 +619,132 @@ test('runConsensusFix: without --rails, emits a warning and survivors are repro-
   } finally {
     cleanup(dir);
   }
+});
+
+// ─── candidate filename → caller's original path (Windows separator mismatch) ──
+//
+// validateCandidate compares separator-NORMALIZED paths, so a model may answer
+// `src/file.mjs` for a `--files src\file.mjs` run and pass validation. The
+// snapshot and the write are both keyed by the CALLER'S original string, so the
+// bin has to map back. Getting this wrong is not a clean failure: the apply loop
+// writes as it goes, so with several files the run dies on `undefined` only
+// AFTER earlier files are already modified — a partially written tree.
+
+test('resolveTargetPath maps a candidate\'s separators back to the caller\'s path', () => {
+  const callerPaths = ['src\\alpha.mjs', 'src\\beta.mjs'];
+  assert.equal(resolveTargetPath('src/alpha.mjs', callerPaths, 'win32'), 'src\\alpha.mjs');
+  assert.equal(resolveTargetPath('src/beta.mjs', callerPaths, 'win32'), 'src\\beta.mjs');
+});
+
+test('resolveTargetPath is identity when the candidate already matches the caller', () => {
+  const callerPaths = ['src/alpha.mjs', 'nested/dir/beta.mjs'];
+  assert.equal(resolveTargetPath('src/alpha.mjs', callerPaths), 'src/alpha.mjs');
+  assert.equal(resolveTargetPath('nested/dir/beta.mjs', callerPaths), 'nested/dir/beta.mjs');
+});
+
+test('resolveTargetPath falls back to the candidate when nothing matches', () => {
+  // The caller has already rejected any file outside the allowed list, so the
+  // fallback cannot introduce a path the operator did not name — it just keeps
+  // the error message pointing at what the model actually said.
+  assert.equal(resolveTargetPath('src/unknown.mjs', ['src/alpha.mjs']), 'src/unknown.mjs');
+});
+
+// THE PREVIOUS VERSION OF THIS TEST PINNED A WRONG-FILE WRITE. It asserted that
+// `src/a.mjs` resolves to `src\a.mjs` when both are supplied — which on POSIX,
+// where those are two DIFFERENT files, means evaluating a candidate against one
+// file and writing the other. Asserting "deterministic" was not enough: the
+// deterministic answer it locked in was the unsafe one.
+test('resolveTargetPath prefers an EXACT match over a separator-normalized one', () => {
+  // Both spellings present, candidate matches one of them verbatim → that one.
+  assert.equal(resolveTargetPath('src/a.mjs', ['src\\a.mjs', 'src/a.mjs'], 'linux'), 'src/a.mjs');
+  assert.equal(resolveTargetPath('src\\a.mjs', ['src/a.mjs', 'src\\a.mjs'], 'linux'), 'src\\a.mjs');
+  // Exact match wins on win32 too.
+  assert.equal(resolveTargetPath('src/a.mjs', ['src\\a.mjs', 'src/a.mjs'], 'win32'), 'src/a.mjs');
+});
+
+test('resolveTargetPath does NOT treat \\ and / as equivalent on POSIX', () => {
+  // A backslash is an ordinary filename character on POSIX. Silently rewriting
+  // the candidate to a different caller path is a wrong-file write, so the
+  // candidate is returned unchanged and the caller's "not in snapshot" check
+  // reports it honestly.
+  assert.equal(resolveTargetPath('src/a.mjs', ['src\\a.mjs'], 'linux'), 'src/a.mjs');
+  assert.equal(resolveTargetPath('src\\a.mjs', ['src/a.mjs'], 'linux'), 'src\\a.mjs');
+});
+
+test('resolveTargetPath DOES map separators on win32, where they name one file', () => {
+  assert.equal(resolveTargetPath('src/a.mjs', ['src\\a.mjs'], 'win32'), 'src\\a.mjs');
+  assert.equal(resolveTargetPath('src\\a.mjs', ['src/a.mjs'], 'win32'), 'src/a.mjs');
+});
+
+// WIRING, not just the helper. The previous tests exercised resolveTargetPath()
+// directly, so reverting the production call sites left them green — exactly the
+// hollow shape this repo's gates exist to reject. This drives applyChanges (the
+// EVALUATION path) against a snapshot whose keys use a different separator from
+// the candidate, and asserts the real file on disk changed. Before the fix,
+// evaluation resolved via a Map (which keeps the LAST duplicate) while --apply
+// used the first match, so the two could target DIFFERENT files on a POSIX box
+// where `a\b.mjs` and `a/b.mjs` are genuinely distinct paths.
+test('applyChanges resolves a separator-mismatched candidate to the snapshot key', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'consensus-fix-wiring-'));
+  try {
+    const real = join(dir, 'target.mjs');
+    writeFileSync(real, 'line1\nline2\n');
+    const snapshot = { [real]: 'line1\nline2\n' };
+    // The candidate names the same file with the OTHER separator style.
+    const candidateName = real.replaceAll('/', '\\');
+    // Separator mapping is win32-only (on POSIX those are different files), so
+    // the platform is forced here — the point of this test is the WIRING, that
+    // applyChanges consults resolveTargetPath at all, not which platform rule
+    // applies. Synchronous callback: the override is process-global.
+    const original = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    let res;
+    try {
+      res = applyChanges(
+        [{ file: candidateName, hunks: [{ startLine: 1, endLine: 1, replacement: 'PATCHED' }] }],
+        snapshot,
+      );
+    } finally {
+      Object.defineProperty(process, 'platform', original);
+    }
+    assert.equal(res.ok, true, res.error);
+    assert.match(readFileSync(real, 'utf8'), /PATCHED/, 'the real snapshot-keyed file must be the one written');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// VALIDATION AND APPLICATION MUST AGREE. They used different equivalence rules:
+// validateCandidate folded separators on every platform while resolveTargetPath
+// folds only on win32. On POSIX a candidate naming `src/a.mjs` for
+// `--files src\a.mjs` therefore PASSED validation and then threw inside
+// applyChanges — and runConsensusFix has no catch around that call, so a single
+// malformed candidate aborted the whole ensemble instead of being discarded.
+// The invariant: anything validation ACCEPTS, application must be able to place.
+test('validateCandidate and resolveTargetPath use the SAME equivalence rule', () => {
+  const callerPaths = ['src\\a.mjs'];
+  const candidate = { changes: [{ file: 'src/a.mjs', hunks: [{ startLine: 1, endLine: 1, replacement: 'x' }] }] };
+
+  for (const platform of ['linux', 'darwin', 'win32']) {
+    const { valid } = validateCandidate(candidate, callerPaths, platform);
+    if (!valid) continue; // rejected up front — nothing to place, and that is fine
+    const target = resolveTargetPath('src/a.mjs', callerPaths, platform);
+    assert.ok(
+      callerPaths.includes(target),
+      `${platform}: validation accepted the candidate but application resolved to ${JSON.stringify(target)}, which is not a caller path`,
+    );
+  }
+});
+
+test('POSIX validation REJECTS a separator-mismatched candidate outright', () => {
+  // Rejecting it as "not in the provided list" is the honest answer on POSIX,
+  // where the two spellings are different files — and it discards one candidate
+  // rather than aborting the ensemble downstream.
+  const { valid, reason } = validateCandidate(
+    { changes: [{ file: 'src/a.mjs', hunks: [{ startLine: 1, endLine: 1, replacement: 'x' }] }] },
+    ['src\\a.mjs'],
+    'linux',
+  );
+  assert.equal(valid, false);
+  assert.match(reason, /not in the provided list/);
 });

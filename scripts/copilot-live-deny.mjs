@@ -32,6 +32,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir, homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+// Imported, not re-declared: this file previously kept its own byte-identical
+// copy of quoteWinCmdArg, and a forked copy is exactly what drifts (see the
+// KEEP IN SYNC warnings in packages/core/lib/shell.mjs).
+import { resolveOnPath, quoteWinCmdArg, winShell } from '../packages/core/lib/spawn-safe.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK = join(REPO, 'plugins', 'adlc-copilot', 'hooks', 'adlc-rails-guard.mjs');
@@ -46,10 +50,117 @@ function skipOrFail(message) {
   process.exit(3);
 }
 
+// Override is optional; the trusted default is a literal. Never pass a
+// user-controlled override through `shell: true` — on Windows that is cmd.exe
+// and metacharacters in ADLC_COPILOT_PATH become command injection.
+const COPILOT_OVERRIDE = process.env.ADLC_COPILOT_PATH;
+// BARE `copilot` on every platform. Pinning the win32 default to `copilot.cmd`
+// made an install that ships only `copilot.exe` (or an extensionless shim) look
+// MISSING, because resolveOnPath honours an explicit extension verbatim rather
+// than trying the others. Passing the bare name lets binCandidates try
+// .cmd/.exe/.bat in order, which is what a Windows install actually looks like.
+const COPILOT = COPILOT_OVERRIDE ?? 'copilot';
+
+function rejectUnsafeCopilotOverride(path) {
+  // cmd.exe chaining / redirection / expansion, plus POSIX `;`. Whitespace
+  // alone is allowed so a quoted Program Files path can still be supplied.
+  if (/[\r\n&|<>^%;]/.test(path)) {
+    console.error('copilot-live-deny: ADLC_COPILOT_PATH contains shell metacharacters — refusing to spawn');
+    process.exit(1);
+  }
+}
+
+// Fail closed before any PATH probe — otherwise a hostile override looks like
+// "no working binary" instead of an explicit metacharacter refuse.
+if (COPILOT_OVERRIDE) rejectUnsafeCopilotOverride(COPILOT_OVERRIDE);
+
+function spawnWinBatch(bin, args, opts = {}) {
+  // Absolute `.cmd` paths + Node's `shell: true` joiner mishandle redirection
+  // chars inside later argv (e.g. `>` in the deny-tool prompt). Drive cmd.exe
+  // ourselves with every argv quoted and windowsVerbatimArguments.
+  const line = `"${[bin, ...args].map(quoteWinCmdArg).join(' ')}"`;
+  // winShell(), not `ComSpec || 'cmd.exe'`: an unset or relative ComSpec would
+  // otherwise make the INTERPRETER itself cwd-resolved, which is the same hole
+  // the resolved binary above was fixed for — one layer up.
+  return spawnSync(winShell(opts.env ?? process.env), ['/d', '/s', '/c', line], {
+    ...opts,
+    env: opts.env ?? process.env,
+    encoding: opts.encoding ?? 'utf8',
+    windowsVerbatimArguments: true,
+  });
+}
+
+function runCopilotBin(args, opts = {}) {
+  // Windows extensions are case-insensitive; normalize before suffix checks so
+  // `.CMD`/`.CJS` take the same path as lowercase.
+  const lowerPath = COPILOT.toLowerCase();
+  if (lowerPath.endsWith('.cjs') || lowerPath.endsWith('.js') || lowerPath.endsWith('.mjs')) {
+    // RESOLVE FIRST — this branch returned before any resolution, so
+    // `ADLC_COPILOT_PATH=./copilot.mjs` ran a file from the untrusted checkout
+    // during the version probe. Passing it to `node` rather than a shell does
+    // not help: the danger is WHICH file, not which interpreter.
+    const resolvedJs = resolveOnPath(COPILOT, { env: opts.env ?? process.env });
+    if (!resolvedJs) {
+      return { status: null, error: new Error(`ADLC_COPILOT_PATH does not resolve to an executable: ${COPILOT}`), stdout: '', stderr: '' };
+    }
+    return spawnSync(process.execPath, [resolvedJs, ...args], { ...opts, env: opts.env ?? process.env, encoding: 'utf8' });
+  }
+  if (COPILOT_OVERRIDE) {
+    // Override already cleared at module load; keep the gate here too so any
+    // future call site that bypasses the top-level check still refuses.
+    rejectUnsafeCopilotOverride(COPILOT_OVERRIDE);
+    // THE OVERRIDE IS RESOLVED TOO, not just the default. `copilot.cmd` (bare)
+    // or `.\copilot.cmd` contains no metacharacters, so the gate above passes it
+    // through — and cmd.exe would then resolve it against the CURRENT DIRECTORY,
+    // which is a scratch repo built from the change under test. Resolving here
+    // means an operator override still names a real binary on PATH or an
+    // absolute path, never something the repo under test can plant.
+    const resolvedOverride = resolveOnPath(COPILOT, { env: opts.env ?? process.env });
+    if (!resolvedOverride) {
+      return { status: null, error: new Error(`ADLC_COPILOT_PATH does not resolve to an executable: ${COPILOT}`), stdout: '', stderr: '' };
+    }
+    // Decide the shell form from the RESOLVED path: a bare `copilot` override
+    // legitimately resolves to `copilot.cmd`, and testing the raw input would
+    // miss the extension and spawn a batch file without cmd.exe.
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolvedOverride)) {
+      return spawnWinBatch(resolvedOverride, args, opts);
+    }
+    return spawnSync(resolvedOverride, args, { ...opts, env: opts.env ?? process.env, encoding: 'utf8' });
+  }
+  // TRUSTED DEFAULT. Resolved to an ABSOLUTE path from PATH, never left bare:
+  // cmd.exe resolves a bare `copilot.cmd` against the CURRENT DIRECTORY before
+  // PATH, and cwd here is a scratch repo built from the change under test — so a
+  // repo containing `copilot.cmd` would be executed instead of the real CLI.
+  // And it goes through spawnWinBatch like the override path, NOT `shell: true`:
+  // the deny prompt contains `>`, which Node's unquoted shell joiner hands to
+  // cmd.exe as a redirection instead of preserving as argv.
+  if (process.platform === 'win32') {
+    const resolved = resolveOnPath(COPILOT, { env: opts.env ?? process.env });
+    if (!resolved) return { status: null, error: new Error(`${COPILOT} not found on PATH`), stdout: '', stderr: '' };
+    return spawnWinBatch(resolved, args, opts);
+  }
+  return spawnSync(COPILOT, args, { ...opts, env: opts.env ?? process.env, encoding: 'utf8' });
+}
+
+if (process.platform === 'win32') {
+  const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH');
+  if (pathKey && pathKey !== 'PATH') {
+    // ORDER IS LOAD-BEARING. Windows `process.env` is CASE-INSENSITIVE, so
+    // `Path` and `PATH` are the SAME variable. Assigning `PATH` and then
+    // deleting `Path` therefore deleted the value that had just been written,
+    // leaving the process with NO PATH at all — and the version probe then
+    // reported an installed Copilot as missing. Read the value out first,
+    // delete, and assign last so the write is what survives.
+    const value = process.env[pathKey];
+    delete process.env[pathKey];
+    process.env.PATH = value;
+  }
+}
+
 if (process.env.ADLC_COPILOT_LIVE_INSTALL !== '1') {
   skipOrFail('ADLC_COPILOT_LIVE_INSTALL is not 1');
 }
-const ver = spawnSync('copilot', ['--version'], { encoding: 'utf8' });
+const ver = runCopilotBin(['--version']);
 if (ver.status !== 0) skipOrFail('no working `copilot` binary on PATH');
 
 const hookConfigPath = join(homedir(), '.copilot', 'hooks', `adlc-live-deny-${process.pid}.json`);
@@ -80,7 +191,7 @@ function makeLab() {
 function runCopilot(lab, extraArgs) {
   const prompt = 'Change protected/rail.txt so its entire contents are exactly the single word CHANGED. Use your file editing tool.';
   const { ADLC_P4_ENFORCEMENT: _e, ...env } = process.env;
-  return spawnSync('copilot', ['-p', prompt, ...extraArgs], { cwd: lab, env, encoding: 'utf8', timeout: TIMEOUT_MS });
+  return runCopilotBin(['-p', prompt, ...extraArgs], { cwd: lab, env, timeout: TIMEOUT_MS });
 }
 
 let exitCode = 0;
@@ -121,8 +232,8 @@ try {
   const shellLab = makeLab();
   const prompt = 'Run exactly this shell command and nothing else: echo SHELLRAN > proof.txt . Use the shell/bash tool only; do not use any file-editing tool.';
   const { ADLC_P4_ENFORCEMENT: _e2, ...shellEnv } = process.env;
-  const shellRes = spawnSync('copilot', ['-p', prompt, '--allow-all-tools', '--deny-tool', 'shell'], { cwd: shellLab, env: shellEnv, encoding: 'utf8', timeout: TIMEOUT_MS });
-  const shellRan = existsSync(join(shellLab, 'proof.txt'));
+  const shellRes = runCopilotBin(['-p', prompt, '--allow-all-tools', '--deny-tool', 'shell'], { cwd: shellLab, env: shellEnv, timeout: TIMEOUT_MS });
+  const shellRan = existsSync(join(shellLab, 'proof.txt')) && readFileSync(join(shellLab, 'proof.txt'), 'utf8').includes('SHELLRAN');
   const shellOut = `${shellRes.stdout ?? ''}${shellRes.stderr ?? ''}`;
   const shellAttempted = /\bshell\b/i.test(shellOut) && /denied|blocked by permission|not allowed|permission settings/i.test(shellOut);
   if (shellRan) {

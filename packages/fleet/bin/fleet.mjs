@@ -3,7 +3,7 @@
 // Exit codes (CONVENTIONS): 0 = ok · 1 = operational error · 2 = a ticket failed/blocked.
 
 import { parseArgs, gateFail, opError, printJson } from '@adlc/core';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -173,9 +173,35 @@ if (!['run', 'status', 'unlock'].includes(sub)) {
 }
 }
 
+import { fileURLToPath } from 'node:url';
+
+/**
+ * Is this module the process entry point (`node .../fleet.mjs`) rather than an import?
+ *
+ * Case folding applies on win32 ONLY. Windows paths are case-insensitive, so `FLEET.MJS`
+ * and `fleet.mjs` name the SAME file there and an unfolded comparison would refuse to
+ * dispatch a legitimate direct run. On a case-SENSITIVE filesystem (Linux, and macOS on a
+ * case-sensitive volume) they are two DIFFERENT files, and folding would let importing one
+ * of them dispatch the other's CLI — parsing argv and calling process.exit inside an
+ * unrelated program. Same platform-gated convention as scripts/run-tests.mjs
+ * buildSegmentEnv(), which folds env-var names on win32 only for the same reason.
+ *
+ * Comparison is on path STRINGS, never realpath: symlinked entry points (macOS /tmp, npm
+ * bin shims) resolve differently on either side, so realpath would make the guard disagree
+ * between macOS and Linux CI for reasons unrelated to how the module was loaded.
+ */
+export function isEntryPoint(moduleUrl, argv1, platform = process.platform) {
+  if (!argv1) return false;
+  const modulePath = fileURLToPath(moduleUrl);
+  const entryPath = resolve(argv1);
+  return platform === 'win32'
+    ? modulePath.toLowerCase() === entryPath.toLowerCase()
+    : modulePath === entryPath;
+}
+
 // Dispatch the CLI ONLY when run as the entry point. Importing this module (e.g. a unit
 // test importing runLive) must not parse argv, hit process.exit, or gateFail.
-if (import.meta.url === `file://${process.argv[1]}`) runCli();
+if (isEntryPoint(import.meta.url, process.argv[1])) runCli();
 
 // Collaborators are injectable (defaulting to the real implementations) purely for
 // testability: the production call site passes no overrides, so behavior is unchanged, but a

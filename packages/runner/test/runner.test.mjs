@@ -14,8 +14,9 @@ import { recordAcceptancePacket as realRecordAcceptancePacket } from '../lib/acc
 const appendManifestEntry = (entry, dir, opts = {}) => realAppendManifestEntry(entry, dir, { key: null, ...opts });
 const recordAcceptancePacket = (opts = {}) => realRecordAcceptancePacket({ key: null, ...opts });
 import { ticketHash as domainTicketHash } from '@adlc/tickets';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = resolve(new URL('../../../', import.meta.url).pathname);
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 function tmpAdlc() {
   const dir = mkdtempSync(join(tmpdir(), 'adlc-runner-'));
@@ -1121,7 +1122,7 @@ describe('assertPhase', () => {
 describe('adlc cli', () => {
   it('exits 1 when scoped evidence omits ticket', () => {
     const dir = tmpAdlc();
-    const bin = new URL('../bin/adlc.mjs', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../bin/adlc.mjs', import.meta.url));
     let code = 0;
     try {
       execFileSync(process.execPath, [bin, 'run', 'p5', '--dir', dir], { encoding: 'utf8' });
@@ -1136,7 +1137,7 @@ describe('adlc cli', () => {
     writeTicketDefinition(dir);
     const packet = join(dir, 'acceptance.json');
     writeFileSync(packet, JSON.stringify({ behaviorDiff: 'accepted' }));
-    const bin = new URL('../bin/adlc.mjs', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../bin/adlc.mjs', import.meta.url));
     let code = 0;
     try {
       execFileSync(process.execPath, [

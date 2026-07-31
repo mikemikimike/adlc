@@ -9,7 +9,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve, dirname, relative } from 'node:path';
 import { scopesOverlap, globMatch, pairKey } from '@adlc/core';
 
 // ─── Signal 1: Declared scope overlap ────────────────────────────────────────
@@ -44,8 +44,8 @@ export function walkTree(root) {
       if (ent.isDirectory()) {
         walk(fullPath);
       } else if (ent.isFile()) {
-        // Return path relative to root
-        results.push(fullPath.slice(root.length + 1));
+        // Return path relative to root with forward slashes
+        results.push(fullPath.slice(root.length + 1).replaceAll('\\', '/'));
       }
     }
   }
@@ -85,8 +85,9 @@ function resolveSpecifier(specifier, importingFile, root) {
   if (!specifier.startsWith('.')) return null; // package specifier — ignore
   const importingDir = dirname(join(root, importingFile));
   const resolved = resolve(importingDir, specifier);
-  // Make relative to root
-  const rel = resolved.startsWith(root + '/') ? resolved.slice(root.length + 1) : null;
+  // Make relative to root with forward slashes
+  const rel = relative(root, resolved).replaceAll('\\', '/');
+  if (!rel || rel.startsWith('../') || rel === '..') return null;
   return rel;
 }
 

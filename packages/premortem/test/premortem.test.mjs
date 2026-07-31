@@ -7,6 +7,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { buildPrompt, SYSTEM_PROMPT } from '../lib/prompt.mjs';
 import { renderReport } from '../lib/render.mjs';
@@ -171,7 +172,7 @@ test('--out writes report file to tmp dir', () => {
 // 4. CLI argument error handling (subprocess, offline)
 // ---------------------------------------------------------------------------
 
-const CLI = new URL('../bin/premortem.mjs', import.meta.url).pathname;
+const CLI = fileURLToPath(new URL('../bin/premortem.mjs', import.meta.url));
 
 test('CLI: no args exits 1', () => {
   const result = spawnSync(process.execPath, [CLI], { encoding: 'utf8' });
@@ -318,7 +319,7 @@ test('--json: run() emits JSON causes array to stdout (mocked LLM)', () => {
 
     const result = spawnSync(
       process.execPath,
-      ['--experimental-loader', loaderPath, runnerPath],
+      ['--experimental-loader', pathToFileURL(loaderPath).href, runnerPath],
       { encoding: 'utf8' },
     );
 

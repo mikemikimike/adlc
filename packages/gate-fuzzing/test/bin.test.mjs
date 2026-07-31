@@ -8,11 +8,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const BIN = resolve(new URL('../bin/gate-fuzzing.mjs', import.meta.url).pathname);
+const BIN = fileURLToPath(new URL('../bin/gate-fuzzing.mjs', import.meta.url));
 
 function makeRepoWithSuite() {
   const dir = mkdtempSync(join(tmpdir(), 'gate-fuzzing-bin-test-'));

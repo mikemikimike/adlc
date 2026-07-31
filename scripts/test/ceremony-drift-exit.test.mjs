@@ -21,7 +21,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, mkdirSync, chmodSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync, execFileSync } from 'node:child_process';
 
@@ -76,14 +76,72 @@ function makeRepo({ drift }) {
 function runWith(ghScript, { repo, env = {} } = {}) {
   const binDir = mkdtempSync(join(tmpdir(), 'adlc-drift-bin-'));
   try {
-    const log = join(binDir, 'calls.txt');
+    const log = join(binDir, 'calls.txt').replaceAll('\\', '/');
     const ghPath = join(binDir, 'gh');
     // Drain stdin first. The reporter pipes the issue body to `gh ... --body-file -`;
     // real gh reads it, but a stub that printf's and exits leaves the writer on a
     // closed pipe -> EPIPE -> spurious non-zero exit. Node 22 tolerated the race;
     // Node 18/20 surfaced it, so this passed locally and failed in CI.
-    writeFileSync(ghPath, `#!/bin/sh\ncat >/dev/null 2>&1\necho "$*" >> ${log}\n${ghScript}\n`);
+    writeFileSync(ghPath, `#!/bin/sh\ncat >/dev/null 2>&1\necho "$*" >> "${log}"\n${ghScript}\n`);
     chmodSync(ghPath, 0o755);
+    if (process.platform === 'win32') {
+      writeFileSync(join(binDir, 'gh.mjs'), `
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const binDir = path.dirname(fileURLToPath(import.meta.url));
+const logFile = path.join(binDir, 'calls.txt');
+const argsStr = process.argv.slice(2).join(' ');
+fs.appendFileSync(logFile, argsStr + '\\n');
+
+const ghPath = path.join(binDir, 'gh');
+const script = fs.readFileSync(ghPath, 'utf8').replaceAll('\\r\\n', '\\n');
+
+if (script.includes('exit 1')) {
+  const stderrMatch = script.match(/echo "([^"]+)" >&2/);
+  if (stderrMatch) console.error(stderrMatch[1]);
+  process.exit(1);
+}
+
+if (script.includes('"not json"')) {
+  process.stdout.write('not json');
+  process.exit(0);
+}
+
+if (argsStr.includes('issue list')) {
+  let targetPattern = '*"--label ceremony-drift"*';
+  if (!argsStr.includes('--label ceremony-drift') || !script.includes(targetPattern)) {
+    targetPattern = '*"issue list"*';
+  }
+  let blockIdx = script.indexOf(targetPattern);
+  if (blockIdx === -1) blockIdx = 0;
+  const catIdx = script.indexOf('cat ', blockIdx);
+  if (catIdx !== -1) {
+    const endCat = script.indexOf(' ;;', catIdx);
+    const filePath = script.slice(catIdx + 4, endCat).trim();
+    if (fs.existsSync(filePath)) {
+      process.stdout.write(fs.readFileSync(filePath, 'utf8'));
+      process.exit(0);
+    }
+  }
+  const pIdx = script.indexOf("printf '%s' ", blockIdx);
+  if (pIdx !== -1) {
+    const quoteChar = script[pIdx + "printf '%s' ".length];
+    const start = pIdx + "printf '%s' ".length + 1;
+    const end = script.indexOf(quoteChar, start);
+    if (end !== -1) {
+      process.stdout.write(script.slice(start, end));
+      process.exit(0);
+    }
+  }
+}
+
+process.stdout.write('https://example.test/issues/42');
+process.exit(0);
+`);
+      writeFileSync(join(binDir, 'gh.cmd'), `@echo off\nnode "%~dp0gh.mjs" %*\n`);
+    }
     const r = spawnSync(process.execPath, [SCRIPT], {
       cwd: repo,
       encoding: 'utf8',
@@ -91,7 +149,7 @@ function runWith(ghScript, { repo, env = {} } = {}) {
         ...process.env,
         ADLC_RAILS_BYPASS: undefined, // keep the harness hermetic (see issue #204)
         BASE_REF: 'HEAD', // the fixture repo has no origin/main
-        PATH: `${binDir}:${process.env.PATH}`,
+        PATH: `${binDir}${delimiter}${process.env.PATH}`,
         ...env,
       },
     });

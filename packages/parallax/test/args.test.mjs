@@ -6,8 +6,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const BIN = new URL('../bin/parallax.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/parallax.mjs', import.meta.url));
 const NODE = process.execPath;
 
 function run(args, opts = {}) {

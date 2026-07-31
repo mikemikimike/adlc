@@ -80,7 +80,7 @@ export function buildJsonReport(results) {
       undetermined: undetermined.length,
     },
     mutants: results.map((r) => ({
-      file: r.file,
+      file: r.file.replaceAll('\\', '/'),
       line: r.line,
       operator: r.operator,
       status: r.undetermined ? 'undetermined' : r.invalid ? 'invalid' : r.killed ? 'killed' : 'survived',

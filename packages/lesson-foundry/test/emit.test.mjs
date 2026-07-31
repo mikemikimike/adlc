@@ -41,7 +41,7 @@ test('buildCheckScript: returns runnable .mjs script', () => {
   assert(content.includes('process.exit(0)'));
   assert(content.includes('process.exit(2)'));
   assert(content.includes('import'));
-  assert(content.includes('grep'));
+  assert(content.includes('eval'), 'script embeds the pattern it searches for');
 });
 
 test('buildCheckScript: script name matches cluster name', () => {
@@ -87,8 +87,9 @@ test('buildCheckScript: generated gate exits 2 when a GENUINE occurrence exists 
   try {
     const lessonsDir = join(dir, '.adlc', 'lessons');
     mkdirSync(lessonsDir, { recursive: true });
-    // A real source file with the offending pattern.
-    writeFileSync(join(dir, 'app.mjs'), 'const x = 1; // TODO fix me later\n', 'utf8');
+    // A real source file with the offending pattern — on line 2, so the
+    // reported line number is wrong under any off-by-one.
+    writeFileSync(join(dir, 'app.mjs'), 'const x = 1;\nconst y = 2; // TODO fix me later\n', 'utf8');
 
     const findings = [
       { desc: 'Found "TODO" comment in production code', category: 'security' },
@@ -100,7 +101,10 @@ test('buildCheckScript: generated gate exits 2 when a GENUINE occurrence exists 
 
     const res = spawnSync(process.execPath, [scriptPath], { cwd: dir, encoding: 'utf8', timeout: 15000 });
     assert.strictEqual(res.status, 2, `gate must FAIL (exit 2) on a genuine occurrence; got ${res.status}: ${res.stdout}`);
-    assert(res.stderr.includes('app.mjs'), `failure should point at the real file: ${res.stderr}`);
+    assert(
+      res.stderr.includes('app.mjs:2:'),
+      `failure should point at the real file and line: ${res.stderr}`
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

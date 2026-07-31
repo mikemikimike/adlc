@@ -11,8 +11,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/adlc-prosecute.mjs', import.meta.url));
 const KEY = 'env-local-signing-key';
 
 function cleanEnv(overrides = {}) {

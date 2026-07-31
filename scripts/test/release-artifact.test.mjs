@@ -960,6 +960,7 @@ test('AC5 end-to-end: the packed ticket-sync tarball can actually be imported', 
   try {
     const out = execFileSync('npm', ['pack', '--pack-destination', tmp, '--json'], {
       cwd: pkgDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      shell: process.platform === 'win32',
     });
     const tarball = join(tmp, JSON.parse(out)[0].filename);
     execFileSync('tar', ['xzf', tarball, '-C', tmp]);
@@ -974,7 +975,7 @@ test('AC5 end-to-end: the packed ticket-sync tarball can actually be imported', 
     // relative graph rather than failing on an unrelated missing dependency.
     mkdirSync(join(extracted, 'node_modules', '@adlc'), { recursive: true });
     for (const dep of ['core', 'tickets']) {
-      symlinkSync(join(REPO_ROOT, 'packages', dep), join(extracted, 'node_modules', '@adlc', dep), 'dir');
+      symlinkSync(join(REPO_ROOT, 'packages', dep), join(extracted, 'node_modules', '@adlc', dep), process.platform === 'win32' ? 'junction' : 'dir');
     }
     // MUST be awaited inside the try: a bare `return import(...)` lets the
     // finally block delete the extracted tree before the import resolves.

@@ -315,6 +315,22 @@ export function classifyShellCommand(text: string): {
   paths: string[];
 };
 
+// lib/spawn-safe.mjs — resolve a command to an absolute path before it can reach
+// a shell (cmd.exe resolves a bare name against the CWD before PATH)
+export function binCandidates(name: string, platform?: string): string[];
+export function resolveOnPath(
+  name: string,
+  opts?: {
+    env?: NodeJS.ProcessEnv;
+    platform?: string;
+    exists?: (path: string) => boolean;
+  },
+): string | null;
+export function quoteWinCmdArg(arg: string): string;
+export function winCmdArgs(bin: string, args?: string[]): string[];
+export function winShell(env?: NodeJS.ProcessEnv): string;
+export function winSystemExe(name: string, env?: NodeJS.ProcessEnv): string;
+
 // lib/railpath.mjs
 export function resolveRailPath(filePath: string, root: string): string;
 

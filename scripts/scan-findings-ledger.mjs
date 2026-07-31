@@ -68,8 +68,10 @@ export function scan(ledger) {
   return 0;
 }
 
+import { pathToFileURL } from 'node:url';
+
 // CLI entry — skipped when this module is imported (so a unit test can assert scan()'s
 // exact return value without the top-level call scanning the importer's real ledger).
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.exitCode = scan(process.argv[2] ?? '.adlc/findings.jsonl');
 }

@@ -13,6 +13,7 @@ import {
   symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -284,7 +285,7 @@ function createOverlapRepo(dir) {
 
 // ── CLI runner ───────────────────────────────────────────────────────────────
 
-const BIN = resolve(new URL('.', import.meta.url).pathname, '../bin/hollow-test.mjs');
+const BIN = fileURLToPath(new URL('../bin/hollow-test.mjs', import.meta.url));
 
 function runCli(args, cwd) {
   return spawnSync('node', [BIN, ...args], {
@@ -311,7 +312,7 @@ describe('CLI: strong tests (all mutants killed)', () => {
 
   it('exits 0 when all mutants are killed', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10', '--json'],
       dir
     );
     assert.equal(result.status, 0, `stderr: ${result.stderr}\nstdout: ${result.stdout}`);
@@ -328,7 +329,7 @@ describe('CLI: strong tests (all mutants killed)', () => {
     const srcPath = join(dir, 'src', 'math.mjs');
     const before = readFileSync(srcPath, 'utf8');
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10', '--json'],
       dir
     );
     // Verify the engine actually ran mutants — otherwise byte-identity is trivially true.
@@ -343,7 +344,7 @@ describe('CLI: strong tests (all mutants killed)', () => {
 
   it('--json flag outputs valid JSON with correct shape', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '5', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '5', '--json'],
       dir
     );
     let parsed;
@@ -376,7 +377,7 @@ describe('CLI: weak tests (survivors detected)', () => {
 
   it('exits 2 when mutants survive', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10'],
       dir
     );
     assert.equal(result.status, 2,
@@ -387,7 +388,7 @@ describe('CLI: weak tests (survivors detected)', () => {
     const srcPath = join(dir, 'src', 'calc.mjs');
     const before = readFileSync(srcPath, 'utf8');
     runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10'],
       dir
     );
     const after = readFileSync(srcPath, 'utf8');
@@ -396,7 +397,7 @@ describe('CLI: weak tests (survivors detected)', () => {
 
   it('reports survived mutants in JSON output', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10', '--json'],
       dir
     );
     assert.equal(result.status, 2);
@@ -523,7 +524,7 @@ describe('CLI: default base fails closed', () => {
 
   it('exits 1 when no --base and no trunk to resolve a base from', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs'],
+      ['--test-cmd', 'node --test'],
       dir
     );
     assert.equal(result.status, 1,
@@ -552,7 +553,7 @@ describe('CLI: test-only diff has nothing to mutate', () => {
 
   it('exits 1 (operational error), NOT 0, when the diff contains only test files', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10'],
       dir
     );
     assert.equal(result.status, 1,
@@ -566,7 +567,7 @@ describe('CLI: test-only diff has nothing to mutate', () => {
 
   it('does not silently report a vacuous 0/0/0 JSON pass on a test-only diff', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10', '--json'],
       dir
     );
     assert.notEqual(result.status, 0,
@@ -613,7 +614,7 @@ describe('CLI: an explicit --target outside the source allow-list is refused', (
   for (const target of ['src/app.py', 'src/style.css']) {
     it(`refuses --target ${target} instead of mutating it`, () => {
       const result = runCli(
-        ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+        ['--test-cmd', 'node --test', '--base', 'HEAD~1',
          '--target', target, '--max', '10'],
         dir
       );
@@ -654,7 +655,7 @@ describe('CLI: explicit targets still bypass test-path exclusion', () => {
 
   it('mutates a --target under test/ rather than refusing it', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--target', 'test/guarded.test.mjs', '--max', '3', '--json'],
       dir
     );
@@ -692,7 +693,7 @@ describe('CLI: --rails matching a mix of source and non-source', () => {
 
   it('mutates the source rail and does not fail over the dropped JSON', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--rails', 'ticket.json', '--max', '10', '--json'],
       dir
     );
@@ -732,7 +733,7 @@ describe('CLI: --test-glob reclassifies a source file as a test', () => {
 
   it('mutates the file normally without the declaration', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--max', '3', '--json'],
       dir
     );
@@ -742,7 +743,7 @@ describe('CLI: --test-glob reclassifies a source file as a test', () => {
 
   it('refuses to mutate it once declared a test', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--test-glob', '**/nothing-matches-this.mjs',
        '--test-glob', '**/alpha.mjs',
        '--max', '3'],
@@ -793,7 +794,7 @@ describe('CLI: --source-glob rescues a diff-derived file named like a test', () 
 
   it('is excluded by naming convention without the declaration', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '3'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '3'],
       dir
     );
     const out = result.stderr + result.stdout;
@@ -803,7 +804,7 @@ describe('CLI: --source-glob rescues a diff-derived file named like a test', () 
 
   it('becomes diff-derived mutable source once declared', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--source-glob', '**/nothing-matches-this.mjs',
        '--source-glob', '**/widget-test.mjs',
        '--max', '3', '--json'],
@@ -892,7 +893,7 @@ describe('CLI: a syntactically invalid mutant is not a kill', () => {
 
   it('marks the unparseable null-return mutant invalid rather than killed', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--target', 'src/shape.mjs', '--max', '20', '--json'],
       dir
     );
@@ -923,7 +924,7 @@ describe('CLI: a syntactically invalid mutant is not a kill', () => {
     // Quota of one: the null-return mutant is the only trial. Pre-fix this
     // exited 0 — a green gate built entirely on a file that never parsed.
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--target', 'src/shape.mjs', '--max', '1', '--json'],
       dir
     );
@@ -979,7 +980,7 @@ describe('CLI: an explicit target with only invalid mutants is not masked', () =
     // invalid null-return. Without per-file accounting the run exits 0 on the
     // strength of plain.mjs.
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1',
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1',
        '--target', 'src/shape.mjs', '--max', '2'],
       dir
     );
@@ -994,7 +995,7 @@ describe('CLI: an explicit target with only invalid mutants is not masked', () =
   // Restricting the guard to explicit targets left this case passing.
   it('fails for a diff-derived file with no valid mutant, with no --target at all', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '2'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '2'],
       dir
     );
     const out = result.stderr + result.stdout;
@@ -1022,7 +1023,7 @@ describe('CLI: --target mutates a file outside the diff', () => {
   it('mutates src/guarded.mjs (unchanged in the diff) and the rails kill it', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/guarded.mjs',
         '--max', '10',
@@ -1047,7 +1048,7 @@ describe('CLI: --target mutates a file outside the diff', () => {
     const before = readFileSync(srcPath, 'utf8');
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/guarded.mjs',
         '--max', '10',
@@ -1087,7 +1088,7 @@ describe('CLI: --target with a nonexistent file fails closed', () => {
   it('exits 1 (NOT 0) with a clear error, not a vacuous 0/0/0 JSON pass', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/does_not_exist.mjs',
         '--max', '10',
@@ -1135,7 +1136,7 @@ describe('CLI: --target pointing at a file with no mutable content fails closed'
   it('exits 1 (NOT 0) instead of falling through to the empty-results pass', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/decoy.mjs',
         '--max', '10',
@@ -1214,7 +1215,7 @@ describe('CLI: --max budget cannot silently starve an explicit --target', () => 
     // this printed a false "all mutants killed" 0-survivor pass.
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/never_in_diff.mjs',
         '--max', '3',
@@ -1270,7 +1271,7 @@ describe('CLI: --rails reads declared rail globs from a ticket file', () => {
   it('expands the ticket-declared rails glob to a mutation target and passes', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--rails', ticketPath,
         '--max', '10',
@@ -1350,7 +1351,7 @@ describe('CLI: --rails matches correctly when invoked from a non-root cwd', () =
   it('expands a repo-root-relative rails glob even when cwd is a subdirectory of the repo', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--rails', ticketPath,
         '--max', '10',
@@ -1401,7 +1402,7 @@ describe('CLI: --target rejects a path that escapes the repo root', () => {
   it('exits 1 (NOT 0) for a relative --target that resolves above the repo root', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', '../outside-secret.mjs',
         '--max', '10',
@@ -1425,7 +1426,7 @@ describe('CLI: --target rejects a path that escapes the repo root', () => {
   it('exits 1 (NOT 0) for an absolute --target path outside the repo', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', outsideFile,
         '--max', '10',
@@ -1462,6 +1463,7 @@ describe('CLI: --target/--rails reject a symlink that escapes the repo root', ()
   let outsideDir;
   let outsideFile;
   let ticketPath;
+  let symlinkCreated = true;
 
   const outsideContent = [
     'export function check(a, b) {',
@@ -1492,16 +1494,28 @@ describe('CLI: --target/--rails reject a symlink that escapes the repo root', ()
     // merely present) — hollow-test refuses to run on a dirty tree, so an
     // untracked symlink alone would fail via the dirty-tree guard before
     // ever reaching the containment check this test targets.
-    symlinkSync(outsideDir, join(dir, 'escape-link'));
+    if (process.platform === 'win32') {
+      symlinkCreated = false;
+    } else {
+      try {
+        symlinkSync(outsideDir, join(dir, 'escape-link'), 'junction');
 
-    // A second symlink, this one a direct file->file link tracked at its OWN
-    // path — the vector for --rails: `git ls-files` lists a tracked symlink
-    // as a single leaf entry (it does not traverse "through" a symlink the
-    // way a real directory would), so a rails glob can only ever match the
-    // symlink's own tracked name, never a path "inside" it. Naming that
-    // tracked symlink directly is the realistic rails-side escape.
-    symlinkSync(outsideFile, join(dir, 'escape-link-file.mjs'));
-    commitAll(dir, 'add symlinks pointing outside the repo');
+        // A second symlink, this one a direct file->file link tracked at its OWN
+        // path — the vector for --rails: `git ls-files` lists a tracked symlink
+        // as a single leaf entry (it does not traverse "through" a symlink the
+        // way a real directory would), so a rails glob can only ever match the
+        // symlink's own tracked name, never a path "inside" it. Naming that
+        // tracked symlink directly is the realistic rails-side escape.
+        symlinkSync(outsideFile, join(dir, 'escape-link-file.mjs'));
+        commitAll(dir, 'add symlinks pointing outside the repo');
+      } catch (err) {
+        if (err.code === 'EPERM' || err.code === 'EACCES') {
+          symlinkCreated = false;
+        } else {
+          throw err;
+        }
+      }
+    }
 
     const ticketDir = mkdtempSync(join(tmpdir(), 'hollow-symlink-ticket-'));
     ticketPath = join(ticketDir, 'ticket.json');
@@ -1519,10 +1533,10 @@ describe('CLI: --target/--rails reject a symlink that escapes the repo root', ()
     rmSync(outsideDir, { recursive: true, force: true });
   });
 
-  it('exits 1 (NOT 0) for a --target path through a symlink that escapes the repo root', () => {
+  it('exits 1 (NOT 0) for a --target path through a symlink that escapes the repo root', { skip: process.platform === 'win32' || !symlinkCreated }, () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'escape-link/secret.mjs',
         '--max', '10',
@@ -1549,10 +1563,10 @@ describe('CLI: --target/--rails reject a symlink that escapes the repo root', ()
     );
   });
 
-  it('exits 1 (NOT 0) for a --rails glob matching a symlink that escapes the repo root', () => {
+  it('exits 1 (NOT 0) for a --rails glob matching a symlink that escapes the repo root', { skip: process.platform === 'win32' || !symlinkCreated }, () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--rails', ticketPath,
         '--max', '10',
@@ -1600,7 +1614,7 @@ describe('CLI: --target on a file that also appears in the diff mutates the whol
 
   it('diff-only run (no --target): untested() sits outside the diff-changed lines and is never mutated', () => {
     const result = runCli(
-      ['--test-cmd', 'node --test test/*.test.mjs', '--base', 'HEAD~1', '--max', '10', '--json'],
+      ['--test-cmd', 'node --test', '--base', 'HEAD~1', '--max', '10', '--json'],
       dir
     );
     assert.equal(result.status, 0,
@@ -1618,7 +1632,7 @@ describe('CLI: --target on a file that also appears in the diff mutates the whol
   it('--target on the same file drops the diff-line restriction and reaches untested(), producing a survivor', () => {
     const result = runCli(
       [
-        '--test-cmd', 'node --test test/*.test.mjs',
+        '--test-cmd', 'node --test',
         '--base', 'HEAD~1',
         '--target', 'src/overlap.mjs',
         '--max', '10',

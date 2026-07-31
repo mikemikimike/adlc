@@ -5,8 +5,9 @@ import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveRevision, sha256 } from '@adlc/core';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = resolve(new URL('../../../', import.meta.url).pathname);
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 describe('codex plugin smoke script', () => {
   it('validates marketplace, manifest, and skill sentinels offline', () => {

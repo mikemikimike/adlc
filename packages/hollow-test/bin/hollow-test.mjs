@@ -177,7 +177,8 @@ const diffEligibleFiles = filterTargetFiles(changedLines, { testGlobs, sourceGlo
 // globs can only ever match `git ls-files` output and therefore can never
 // escape the repo, --target has no such structural guarantee on its own.
 function escapesRoot(relPath) {
-  return relPath === '' || relPath.split(sep)[0] === '..' || isAbsolute(relPath);
+  const parts = relPath.split(/[/\\]/);
+  return relPath === '' || parts[0] === '..' || isAbsolute(relPath);
 }
 
 // Textual containment (escapesRoot() above) only catches `..`/absolute
@@ -206,7 +207,7 @@ function symlinkEscapesRoot(absolutePath) {
 
 const explicitTargets = (values.target ?? []).map((t) => {
   const abs = resolve(cwd, t);
-  const rel = relative(root, abs);
+  const rel = relative(root, abs).replaceAll('\\', '/');
   if (escapesRoot(rel)) {
     opError(
       `--target ${t} resolves outside the repository root (${root}) — refusing to read or mutate it`

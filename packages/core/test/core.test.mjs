@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, utimesSync, chmodSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, utimesSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,8 +15,9 @@ import {
 } from '../lib/tickets.mjs';
 import { generateMutants, applyMutant, changedLinesFromDiff, OPERATORS } from '../lib/mutate.mjs';
 import { resolveRevision as resolveWorktreeRevision } from '../lib/revision.mjs';
+import { fileURLToPath } from 'node:url';
 
-const repoRoot = new URL('../../../', import.meta.url).pathname;
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 test('extractJson: plain object', () => {
   assert.deepEqual(extractJson('{"a": 1}'), { a: 1 });
@@ -80,7 +81,7 @@ test('canonicalJson: sorts object keys recursively while preserving array order'
 });
 
 test('index.d.ts: public declarations match runtime signatures used by consumers', () => {
-  const types = readFileSync(join(repoRoot, 'packages/core/index.d.ts'), 'utf8');
+  const types = readFileSync(join(repoRoot, 'packages/core/index.d.ts'), 'utf8').replace(/\r\n/g, '\n');
   const rootDeclarations = new Set(
     [...types.matchAll(/^export (?:async )?function (\w+)|^export const (\w+)|^export namespace (\w+)/gm)]
       .map((match) => match[1] ?? match[2] ?? match[3])
@@ -585,6 +586,7 @@ test('resolveRevision: untracked source content changes the fingerprint', () => 
 });
 
 test('resolveRevision: handles dirty files whose paths contain newlines', () => {
+  if (process.platform === 'win32') return;
   const { dir, g } = gitRepo();
   try {
     const file = join(dir, 'multi\nline.txt');
@@ -790,11 +792,14 @@ test('agy provider: ADLC_AGY=false/0 do NOT enable the provider', () => {
 // real process.env, without needing the real Antigravity CLI installed.
 test('complete: injected env reaches the agy provider send() (timeout/sandbox honored, not process.env)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'adlc-agy-stub-'));
-  const stubPath = join(dir, 'fake-agy.sh');
-  // Drain stdin fully before exiting — otherwise the parent's stdin.end()
-  // can race the child's exit and surface as an unrelated EPIPE.
-  writeFileSync(stubPath, '#!/bin/sh\ncat >/dev/null\necho "ARGS: $@"\n');
-  chmodSync(stubPath, 0o755);
+  const isWin = process.platform === 'win32';
+  const stubPath = join(dir, isWin ? 'fake-agy.cmd' : 'fake-agy.sh');
+  if (isWin) {
+    writeFileSync(stubPath, '@echo off\necho ARGS: %*\n');
+  } else {
+    writeFileSync(stubPath, '#!/bin/sh\ncat >/dev/null\necho "ARGS: $@"\n');
+    chmodSync(stubPath, 0o755);
+  }
 
   // Leave a DIFFERENT value in real process.env to prove it is NOT what
   // gets used — if the bug regresses, this is what `agySend` would read.
@@ -820,6 +825,72 @@ test('complete: injected env reaches the agy provider send() (timeout/sandbox ho
     else process.env.ADLC_AGY_SANDBOX = prevSandbox;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('complete: ADLC_AGY path with cmd metacharacters is rejected (no shell injection)', async () => {
+  const marker = join(tmpdir(), `adlc-agy-inject-${process.pid}.marker`);
+  try {
+    if (existsSync(marker)) rmSync(marker, { force: true });
+    const hostile = process.platform === 'win32'
+      ? `agy.cmd & echo pwned > "${marker}"`
+      : `agy; touch "${marker}"`;
+    await assert.rejects(
+      () => complete({ tier: 'mid', prompt: 'hi', provider: 'agy' }, { ADLC_AGY: hostile }),
+      /shell metacharacters/,
+    );
+    assert.equal(existsSync(marker), false, 'payload must not have run');
+  } finally {
+    try { rmSync(marker, { force: true }); } catch { /* ignore */ }
+  }
+});
+
+test('complete: every cmd.exe metacharacter in ADLC_AGY is rejected, and legal path chars are not', async () => {
+  // The denylist is a char class, so the previous test's `;`/`&` alone leave
+  // the rest of it unpinned — each character gets its own assertion.
+  for (const ch of ['\r', '\n', '&', '|', '<', '>', '^', '%', ';']) {
+    await assert.rejects(
+      () => complete(
+        { tier: 'mid', prompt: 'hi', provider: 'agy' },
+        { ADLC_AGY: `/nonexistent/agy${ch}payload` },
+      ),
+      /ADLC_AGY contains shell metacharacters/,
+      `${JSON.stringify(ch)} must be rejected as a shell metacharacter`,
+    );
+  }
+  // '=' is legal in a path and must NOT be refused BY THE DENYLIST. This path
+  // still fails — it does not exist, and an override that does not resolve to a
+  // real executable fails closed rather than being handed to a shell — but the
+  // reason must be resolution, never "contains shell metacharacters". Asserting
+  // the negative is the whole point: a denylist that grew '=' would turn a legal
+  // path into a security refusal, and only this distinction catches that.
+  await assert.rejects(
+    () => complete(
+      { tier: 'mid', prompt: 'hi', provider: 'agy' },
+      { ADLC_AGY: '/nonexistent/dir=1/agy' },
+    ),
+    (e) => !/metacharacters/.test(e.message) && /does not resolve to an executable/.test(e.message),
+  );
+});
+
+test('complete: ADLC_AGY_TIMEOUT/model with cmd metacharacters rejected on win32 shell path', async () => {
+  // Default ADLC_AGY=1 uses agy.cmd → shell:true on Windows; timeout/model
+  // enter that cmd line and must be refused. On POSIX there is no shell, so
+  // the same values are argv-safe and we only assert the Windows gate here.
+  if (process.platform !== 'win32') return;
+  await assert.rejects(
+    () => complete(
+      { tier: 'mid', prompt: 'hi', provider: 'agy' },
+      { ADLC_AGY: '1', ADLC_AGY_TIMEOUT: '5s & echo pwned' },
+    ),
+    /ADLC_AGY_TIMEOUT contains shell metacharacters/,
+  );
+  await assert.rejects(
+    () => complete(
+      { tier: 'mid', prompt: 'hi', provider: 'agy' },
+      { ADLC_AGY: '1', ADLC_MODEL_MID: 'evil & calc' },
+    ),
+    /model contains shell metacharacters/,
+  );
 });
 
 // --- per-invocation provider selection (issue #63) ---
@@ -1230,9 +1301,14 @@ test('complete: openai/gemini providers ignore the cacheable flag without errori
 
 test('agy provider: onUsage is never called (no metered usage available) — text still returned normally', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'adlc-agy-usage-'));
-  const stubPath = join(dir, 'fake-agy.sh');
-  writeFileSync(stubPath, '#!/bin/sh\ncat >/dev/null\necho "stub output"\n');
-  chmodSync(stubPath, 0o755);
+  const isWin = process.platform === 'win32';
+  const stubPath = join(dir, isWin ? 'fake-agy.cmd' : 'fake-agy.sh');
+  if (isWin) {
+    writeFileSync(stubPath, '@echo off\necho stub output\n');
+  } else {
+    writeFileSync(stubPath, '#!/bin/sh\ncat >/dev/null\necho "stub output"\n');
+    chmodSync(stubPath, 0o755);
+  }
   let called = false;
   try {
     const out = await complete(

@@ -31,7 +31,7 @@ describe('record: writeReproArtifact', () => {
 
     // Check JSON artifact
     assert.ok(existsSync(reproPath), 'repro artifact should exist');
-    assert.ok(reproPath.includes('.adlc/gate-defeats/test-id.json'));
+    assert.ok(reproPath.replaceAll('\\', '/').includes('.adlc/gate-defeats/test-id.json'));
 
     const content = JSON.parse(readFileSync(reproPath, 'utf8'));
     assert.equal(content.id, 'test-id');

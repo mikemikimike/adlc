@@ -39,7 +39,12 @@ describe('@adlc/core resolveRevision — symlinked ignore paths', () => {
     // form that broke ignore-matching before the fix.
     const aliasParent = realpathSync.native(mkdtempSync(join(tmpdir(), 'rev-alias-')));
     const alias = join(aliasParent, 'link');
-    symlinkSync(real, alias);
+    try {
+      symlinkSync(real, alias, 'junction');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+      return; // Skip test on Windows if symlinks/junctions fail
+    }
     const aliasEvidence = join(alias, 'evidence.txt');
 
     const rev1 = resolveRevision({ cwd: real, ignorePaths: [aliasEvidence] });

@@ -63,11 +63,15 @@ test('archive rejects noncanonical and symlinked archive roots before writing a 
       () => archiveTicket(active, outside, 'A', { root, authorized: true }),
       (error) => error.code === 'UNSAFE_ARCHIVE_PATH',
     );
-    symlinkSync(outside, join(root, '.adlc/ticket-archive'));
-    assert.throws(
-      () => archiveTicket(active, join(root, '.adlc/ticket-archive'), 'A', { root, authorized: true }),
-      (error) => error.code === 'UNSAFE_STORE_PATH',
-    );
-    assert.equal(existsSync(join(outside, ticketFilename('A'))), false);
+    try {
+      symlinkSync(outside, join(root, '.adlc/ticket-archive'), 'dir');
+      assert.throws(
+        () => archiveTicket(active, join(root, '.adlc/ticket-archive'), 'A', { root, authorized: true }),
+        (error) => error.code === 'UNSAFE_STORE_PATH',
+      );
+      assert.equal(existsSync(join(outside, ticketFilename('A'))), false);
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally { rmSync(parent, { recursive: true, force: true }); }
 });

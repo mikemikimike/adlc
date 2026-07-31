@@ -35,6 +35,33 @@ function repo() {
 }
 const clean = (d) => rmSync(d, { recursive: true, force: true });
 
+function addGitSymlink(g, cwd, target, linkPath) {
+  const rel = linkPath.replace(/\\/g, '/').replace(`${cwd.replace(/\\/g, '/')}/`, '');
+  try {
+    symlinkSync(target, linkPath);
+    g('add', '-A');
+  } catch (err) {
+    if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) {
+      const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { cwd, input: target, encoding: 'utf8' }).trim();
+      g('update-index', '--add', '--cacheinfo', `120000,${blob},${rel}`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+function workingTreeSymlink(target, linkPath) {
+  try {
+    symlinkSync(target, linkPath);
+    return true;
+  } catch (err) {
+    if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) {
+      return false;
+    }
+    throw err;
+  }
+}
+
 // A branch carrying one reviewed change.
 function withChange({ dir, g }, mutate = (d) => writeFileSync(join(d, 'src', 'app.mjs'), 'export const x = 1;\n')) {
   g('checkout', '-q', '-b', 'feat');
@@ -117,8 +144,16 @@ describe('resolveChangeSetRevision (#365) — identity bound to the reviewed cha
       r.g('add', '-A'); r.g('commit', '-qm', 'add hook');
       const before = resolveChangeSetRevision({ cwd: r.dir, base: 'main' });
 
-      chmodSync(join(r.dir, 'hook.sh'), 0o755);
-      r.g('add', '-A'); r.g('commit', '-qm', 'chmod +x');
+      if (process.platform === 'win32') {
+        const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], {
+          cwd: r.dir, input: '#!/bin/sh\necho hi\n', encoding: 'utf8',
+        }).trim();
+        r.g('update-index', '--add', '--cacheinfo', `100755,${blob},hook.sh`);
+      } else {
+        chmodSync(join(r.dir, 'hook.sh'), 0o755);
+        r.g('add', '-A');
+      }
+      r.g('commit', '-qm', 'chmod +x');
       const after = resolveChangeSetRevision({ cwd: r.dir, base: 'main' });
       assert.notEqual(after, before,
         'chmod +x must be visible in the identity — otherwise it is invisible after review');
@@ -278,14 +313,14 @@ describe('resolveChangeSetRevision (#365) — identity bound to the reviewed cha
       mkdirSync(join(r.dir, 'otherdir'), { recursive: true });
       writeFileSync(join(r.dir, 'realdir', 'a.txt'), 'hi\n');
       writeFileSync(join(r.dir, 'otherdir', 'b.txt'), 'yo\n');
-      symlinkSync('realdir', join(r.dir, 'linkdir'));
-      r.g('add', '-A'); r.g('commit', '-qm', 'add a symlink to a directory');
+      addGitSymlink(r.g, r.dir, 'realdir', join(r.dir, 'linkdir'));
+      r.g('commit', '-qm', 'add a symlink to a directory');
       r.g('checkout', '-q', '-b', 'feat');
 
       // The DIRECTORY symlink must itself be in the change set — that is the case hash-object
       // cannot survive. Retarget it in the WORKING TREE, so --raw reports dstsha as zeros too.
-      rmSync(join(r.dir, 'linkdir'));
-      symlinkSync('otherdir', join(r.dir, 'linkdir'));
+      rmSync(join(r.dir, 'linkdir'), { force: true });
+      if (!workingTreeSymlink('otherdir', join(r.dir, 'linkdir'))) return;
 
       // Fixture sanity: this is exactly what would kill a hash-object-based implementation.
       assert.throws(
@@ -297,15 +332,15 @@ describe('resolveChangeSetRevision (#365) — identity bound to the reviewed cha
       assert.match(retargeted, /^git-change:/);
 
       // A DANGLING symlink is the second case hash-object cannot open.
-      symlinkSync('nowhere-at-all', join(r.dir, 'dangling'));
+      if (!workingTreeSymlink('nowhere-at-all', join(r.dir, 'dangling'))) return;
       r.g('add', '-A');
       const withDangling = resolveChangeSetRevision({ cwd: r.dir, base: 'main' });
       assert.ok(withDangling, 'a dangling symlink must not crash the resolver either');
       assert.notEqual(withDangling, retargeted, 'adding a symlink is part of the reviewed change');
 
       // The identity tracks the TARGET STRING, which is what git stores for a symlink blob.
-      rmSync(join(r.dir, 'linkdir'));
-      symlinkSync('realdir', join(r.dir, 'linkdir')); // back to the original target
+      rmSync(join(r.dir, 'linkdir'), { force: true });
+      if (!workingTreeSymlink('realdir', join(r.dir, 'linkdir'))) return;
       assert.notEqual(resolveChangeSetRevision({ cwd: r.dir, base: 'main' }), withDangling,
         'retargeting a symlink changes what was reviewed');
     } finally { clean(r.dir); }

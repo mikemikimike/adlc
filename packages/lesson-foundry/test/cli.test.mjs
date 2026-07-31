@@ -5,10 +5,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { clusterId, findingHash } from '../lib/route.mjs';
 
-const BIN = resolve(new URL('../bin/lesson-foundry.mjs', import.meta.url).pathname);
+const BIN = fileURLToPath(new URL('../bin/lesson-foundry.mjs', import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Helpers

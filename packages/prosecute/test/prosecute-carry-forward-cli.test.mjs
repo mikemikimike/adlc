@@ -14,9 +14,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/adlc-prosecute.mjs', import.meta.url));
 
 process.env.ADLC_MANIFEST_KEY = 'test-carry-forward-cli-signing-key';
 

@@ -10,9 +10,9 @@
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -32,7 +32,7 @@ function setupRepo(initialBranch = 'main') {
 
 function writeFile(dir, rel, content) {
   const full = join(dir, rel);
-  mkdirSync(full.substring(0, full.lastIndexOf('/')), { recursive: true });
+  mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content);
 }
 
@@ -101,7 +101,7 @@ describe('freeze baseline: committed rail edits are caught (no --base)', () => {
     assert.equal(result.status, 0, `expected clean pass; stderr: ${result.stderr}`);
 
     const manifest = join(dir, '.adlc', 'manifest.jsonl');
-    const lines = execFileSync('cat', [manifest], { encoding: 'utf8' }).trim().split('\n');
+    const lines = readFileSync(manifest, 'utf8').trim().split('\n');
     const entry = JSON.parse(lines[lines.length - 1]);
     assert.equal(entry.type, 'rails-check');
     assert.notEqual(entry.base, 'HEAD', 'recorded base must be the resolved merge-base, not HEAD');

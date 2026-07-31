@@ -11,8 +11,9 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
-const BIN = resolve(new URL('../bin/consensus-fix.mjs', import.meta.url).pathname);
+const BIN = fileURLToPath(new URL('../bin/consensus-fix.mjs', import.meta.url));
 
 function makeTmp() {
   return mkdtempSync(join(tmpdir(), 'consensus-fix-bin-test-'));

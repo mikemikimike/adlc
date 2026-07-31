@@ -14,6 +14,7 @@
 //   ADLC_AGY_SANDBOX   set to 1 to pass --sandbox
 
 import { spawn } from 'node:child_process';
+import { resolveOnPath, winCmdArgs, winShell } from './spawn-safe.mjs';
 
 // agy's timeout marker is its ENTIRE output on failure. Matching it as a
 // bare substring would false-trip whenever a model quotes the phrase in a
@@ -31,14 +32,66 @@ function envEnabled(v) {
   return v !== undefined && v !== '' && !['0', 'false', 'no', 'off', 'disabled'].includes(v.toLowerCase());
 }
 
+// cmd.exe (`&|<>^%`) plus POSIX shell command separators (`;`) — path
+// overrides must be rejected on every platform, not only when shell:true.
+const CMD_META = /[\r\n&|<>^%;]/;
+
 function agySend({ apiKey, model, system, prompt }, env = process.env) {
-  // apiKey carries the binary path ('1'/'true' mean default 'agy').
-  const bin = apiKey === '1' || apiKey === 'true' ? 'agy' : apiKey;
-  const args = ['--print', '--print-timeout', env.ADLC_AGY_TIMEOUT ?? '300s', '--model', model];
+  // apiKey carries the binary path ('1'/'true' mean the trusted default).
+  const isDefault = apiKey === '1' || apiKey === 'true';
+  // VALIDATE BEFORE RESOLVING. Every check below is a property of the CALLER'S
+  // INPUT, so it must not be gated behind whether a binary happens to be
+  // installed: putting resolution first made a machine without agy report
+  // "not found" for an input that should have been refused outright, which both
+  // hides the real fault and makes the refusal depend on the host.
+  if (!isDefault && CMD_META.test(apiKey)) {
+    return Promise.reject(new Error('ADLC_AGY contains shell metacharacters'));
+  }
+  const timeout = env.ADLC_AGY_TIMEOUT ?? '300s';
+  // CONSERVATIVE and resolution-INDEPENDENT: on Windows the resolved binary may
+  // turn out to be a `.cmd` (a bare `ADLC_AGY=agy` legitimately resolves to
+  // `agy.cmd`), so the env-chosen timeout/model can reach a cmd.exe line no
+  // matter what the raw input looked like. Deciding this from the raw input
+  // would skip the denylist for exactly that case; deciding it from the RESOLVED
+  // path would make input validation depend on what happens to be installed.
+  // Validating whenever a shell is POSSIBLE is strictly safer and does neither.
+  if (process.platform === 'win32') {
+    if (CMD_META.test(String(timeout))) {
+      return Promise.reject(new Error('ADLC_AGY_TIMEOUT contains shell metacharacters'));
+    }
+    if (CMD_META.test(String(model))) {
+      return Promise.reject(new Error('model contains shell metacharacters'));
+    }
+  }
+  // RESOLVE TO AN ABSOLUTE PATH — for the override too, not just the default.
+  // cmd.exe resolves a bare or `.\`-prefixed name against the CURRENT DIRECTORY
+  // before PATH, and cwd here is the repository under analysis, so `agy.cmd`
+  // sitting in that repo would be executed with the prompt on its stdin. The
+  // metacharacter denylist above does not stop that: `agy.cmd` contains no
+  // metacharacters. An override naming a bare command is therefore resolved
+  // through PATH as well, and an absolute override is kept as given.
+  // Fails closed — never falls back to the unresolved name (see spawn-safe.mjs).
+  const bin = isDefault ? resolveOnPath('agy', { env }) : resolveOnPath(apiKey, { env });
+  if (!bin) {
+    return Promise.reject(new Error(
+      isDefault ? 'agy not found on PATH' : `ADLC_AGY does not resolve to an executable: ${apiKey}`,
+    ));
+  }
+  // Decided from the RESOLVED path: a bare `agy` resolves to `agy.cmd` on
+  // Windows, and a batch file spawned without cmd.exe simply fails to launch.
+  const needsWinShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
+  const args = ['--print', '--print-timeout', timeout, '--model', model];
   if (env.ADLC_AGY_SANDBOX === '1') args.push('--sandbox');
   const input = system ? `${system}\n\n---\n\n${prompt}` : prompt;
   return new Promise((resolve, reject) => {
-    const p = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const opts = { stdio: ['pipe', 'pipe', 'pipe'] };
+    // `.cmd`/`.bat` need cmd.exe, but NOT Node's `shell: true`: that joins argv
+    // with spaces and no quoting, so an argument containing `>` is reparsed as a
+    // redirection. Drive cmd.exe ourselves with every element quoted, and pass
+    // windowsVerbatimArguments so Node does not re-quote the line we built.
+    const p = needsWinShell
+      ? spawn(winShell(env), winCmdArgs(bin, args), { ...opts, windowsVerbatimArguments: true })
+      : spawn(bin, args, opts);
     let out = '';
     let err = '';
     p.stdout.on('data', (d) => (out += d));

@@ -16,11 +16,12 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, extname } from 'node:path';
 import { fail } from './errors.mjs';
 import { createGit, parseJson, resolveTrustedBase, trackedAt } from './git.mjs';
 import { pathHasCodeowner } from './codeowners.mjs';
 import { committedManifestAtHead } from './manifest.mjs';
+import { winShell, winCmdArgs } from '@adlc/core';
 import {
   assertArraySuperset,
   assertExistingSignersUnchanged,
@@ -148,6 +149,21 @@ export function runBootstrapCheck({ cwd, base, env }) {
 }
 
 /**
+ * Name the private runner copy so Windows executes the right file type.
+ * Always using `.cmd` (prior bug) made audited `.exe` bytes run as a batch file.
+ * @param {string} runnerPath
+ * @param {Buffer} runnerBytes
+ */
+export function signedRunnerCopyBasename(runnerPath, runnerBytes) {
+  if (process.platform !== 'win32') return 'adlc-runner';
+  const ext = extname(runnerPath).toLowerCase();
+  if (ext === '.exe' || ext === '.cmd' || ext === '.bat') return `adlc-runner${ext}`;
+  // Extensionless: PE (MZ) → .exe; otherwise a batch shim (common in fixtures).
+  const isPe = runnerBytes.length >= 2 && runnerBytes[0] === 0x4d && runnerBytes[1] === 0x5a;
+  return isPe ? 'adlc-runner.exe' : 'adlc-runner.cmd';
+}
+
+/**
  * Signed mode: prove we are on the dedicated runner pool and that the runner binary at
  * ADLC_RUNNER_PATH is the audited one.
  *
@@ -188,7 +204,7 @@ function verifySignedRunner({ trusted, env }) {
   let runnerTmpDir = '';
   try {
     runnerTmpDir = mkdtempSync(join(tmpdir(), 'adlc-runner-'));
-    const runnerCopy = join(runnerTmpDir, 'adlc-runner');
+    const runnerCopy = join(runnerTmpDir, signedRunnerCopyBasename(runnerPath, runnerBytes));
     writeFileSync(runnerCopy, runnerBytes, { mode: 0o500 });
     chmodSync(runnerCopy, 0o500); // writeFileSync's mode is subject to umask; this is not
 
@@ -201,13 +217,29 @@ function verifySignedRunner({ trusted, env }) {
       TMPDIR: env.TMPDIR || tmpdir(),
       USER: env.USER || '',
     };
+    // `.cmd`/`.bat` copies need a shell; `.exe` must NOT — shell would re-parse argv
+    // and would also be wrong for PE binaries previously mis-suffixed as `.cmd`.
+    const needsWinShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(runnerCopy);
     const probe = (args, label) => {
-      const result = spawnSync(runnerCopy, args, {
-        encoding: 'utf8',
-        timeout: RUNNER_PROBE_TIMEOUT_MS,
-        env: runnerEnv,
-        cwd: runnerTmpDir,
-      });
+      // `shell: true` joins argv unquoted and leaves the INTERPRETER an
+      // unqualified `cmd.exe`. Both matter here: runnerTmpDir comes from TEMP,
+      // so a perfectly valid path like `C:\CI&A\Temp` is reparsed at the `&`
+      // and the trust-root probe fails (or runs unintended shell syntax), while
+      // an unset ComSpec would let a cwd-local cmd.exe interpret it.
+      const result = needsWinShell
+        ? spawnSync(winShell(runnerEnv), winCmdArgs(runnerCopy, args), {
+            encoding: 'utf8',
+            timeout: RUNNER_PROBE_TIMEOUT_MS,
+            env: runnerEnv,
+            cwd: runnerTmpDir,
+            windowsVerbatimArguments: true,
+          })
+        : spawnSync(runnerCopy, args, {
+            encoding: 'utf8',
+            timeout: RUNNER_PROBE_TIMEOUT_MS,
+            env: runnerEnv,
+            cwd: runnerTmpDir,
+          });
       if (result.error) fail(`${label}: ${result.error.message}`);
       if (result.signal) fail(`${label} timed out or was killed by ${result.signal}`);
       return result;

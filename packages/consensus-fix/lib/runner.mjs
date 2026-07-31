@@ -4,11 +4,14 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { takeSnapshot, restoreSnapshot, applyChanges } from './snapshot.mjs';
+import { takeSnapshot, restoreSnapshot, applyChanges, resolveTargetPath } from './snapshot.mjs';
+// Re-exported so existing importers keep one name for it; the single definition
+// lives in snapshot.mjs, which is where the apply path also consumes it.
+export { resolveTargetPath };
 import { totalHunkChangedLines } from './hunks.mjs';
 import { groupByChangeset, selectWinner, isAllDivergent } from './agreement.mjs';
 import { buildPrompt } from './prompt.mjs';
-import { extractJson } from '@adlc/core';
+import { extractJson, winShell } from '@adlc/core';
 
 /**
  * Run the given shell command, returning { exitCode, output }.
@@ -16,10 +19,19 @@ import { extractJson } from '@adlc/core';
  */
 export function runCommand(cmd) {
   try {
-    const stdout = execFileSync('sh', ['-c', cmd], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const stdout = process.platform === 'win32'
+      // winShell(), not `ComSpec || 'cmd.exe'`: this runs OPERATOR-supplied
+      // test/rails commands with cwd at the repo under fix, and a bare or
+      // relative interpreter is resolved against that directory first.
+      ? execFileSync(winShell(process.env), ['/d', '/s', '/c', cmd], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsVerbatimArguments: true,
+        })
+      : execFileSync('sh', ['-c', cmd], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
     return { exitCode: 0, output: stdout };
   } catch (err) {
     const output = (err.stdout ?? '') + (err.stderr ?? '');
@@ -46,19 +58,27 @@ function isWellFormedHunk(hunk) {
  * file content).
  * Returns { valid: true, changes } or { valid: false, reason }.
  */
-export function validateCandidate(parsed, allowedPaths) {
+export function validateCandidate(parsed, allowedPaths, platform = process.platform) {
   if (!parsed || typeof parsed !== 'object') {
     return { valid: false, reason: 'response is not an object' };
   }
   if (!Array.isArray(parsed.changes)) {
     return { valid: false, reason: 'missing or non-array "changes" field' };
   }
-  const allowedSet = new Set(allowedPaths);
+  // Validation must use the SAME equivalence rule as application. It normalized
+  // separators on every platform while resolveTargetPath does so only on win32,
+  // so on POSIX a candidate naming `src/a.mjs` for `--files src\a.mjs` PASSED
+  // validation and then threw inside applyChanges — and runConsensusFix has no
+  // catch around that call, so one malformed candidate aborted the whole
+  // ensemble instead of being discarded as the single bad candidate it is.
+  const foldSeparators = platform === 'win32';
+  const canon = (v) => (foldSeparators ? String(v).replaceAll('\\', '/') : String(v));
+  const allowedSet = new Set(allowedPaths.map(canon));
   for (const change of parsed.changes) {
     if (typeof change.file !== 'string' || !Array.isArray(change.hunks)) {
       return { valid: false, reason: 'each change must have a string "file" and an array "hunks"' };
     }
-    if (!allowedSet.has(change.file)) {
+    if (!allowedSet.has(canon(change.file))) {
       return { valid: false, reason: `file "${change.file}" is not in the provided list` };
     }
     if (change.hunks.length === 0) {

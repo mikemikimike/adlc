@@ -4,9 +4,10 @@ import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync, existsSync, rmSync, cpSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { FIXTURE_REVISION, gitRepo, killedFinding, repoRoot, reviewPacket, tmpAdlc, transcript } from './helpers.mjs';
 
-const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/adlc-prosecute.mjs', import.meta.url));
 
 describe('adlc-prosecute cli', () => {
   it('exits 0 for two dry passes', () => {
@@ -33,7 +34,7 @@ describe('adlc-prosecute cli', () => {
         { lens: 'behavior', findings: [], dry_evidence: 'no findings in behavior pass' },
       ],
     }));
-    const bin = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+    const bin = BIN;
     // Trust-root tiering is WORKING-TREE-INCLUSIVE by design (see adlc-prosecute.mjs):
     // it diffs the repo at `cwd` against --base, uncommitted changes included, so an
     // uncommitted trust-root edit can't evade the gate. That means `--base HEAD` is
@@ -70,7 +71,7 @@ describe('adlc-prosecute cli', () => {
 
   it('accepts the bundled docs fixture from the repository root', () => {
     const dir = tmpAdlc();
-    const bin = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+    const bin = BIN;
     // Isolated repo for the same WORKING-TREE-INCLUSIVE-tiering reason as above.
     // --input still points at the REAL bundled docs fixture via an absolute path
     // (read as-is, not cwd-resolved), but the transcript/review_packet paths INSIDE

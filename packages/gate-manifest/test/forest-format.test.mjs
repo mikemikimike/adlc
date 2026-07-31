@@ -300,7 +300,12 @@ describe('forest verify() — AC1 adversarial rejections', () => {
       const real = join(dir, 'real.jsonl');
       writeFileSync(real, buildChainLines([{ gate: 'x', anchor: null }]).join('\n') + '\n');
       mkdirSync(join(adlc, 'manifest.d'), { recursive: true });
-      symlinkSync(real, join(adlc, 'manifest.d', 'feat-01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl'));
+      try {
+        symlinkSync(real, join(adlc, 'manifest.d', 'feat-01ARZ3NDEKTSV4RRFFQ69G5FAV.jsonl'));
+      } catch (err) {
+        if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+        throw err;
+      }
       const result = verify(adlc);
       assert.equal(result.valid, false);
       assert.match(result.message, /symlink/);
@@ -314,7 +319,12 @@ describe('forest verify() — AC1 adversarial rejections', () => {
       const realDir = join(dir, 'real-manifest.d');
       mkdirSync(realDir, { recursive: true });
       mkdirSync(adlc, { recursive: true });
-      symlinkSync(realDir, join(adlc, 'manifest.d'));
+      try {
+        symlinkSync(realDir, join(adlc, 'manifest.d'));
+      } catch (err) {
+        if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+        throw err;
+      }
       const result = verify(adlc);
       assert.equal(result.valid, false);
       assert.match(result.message, /symlink/);
@@ -329,7 +339,12 @@ describe('forest verify() — AC1 adversarial rejections', () => {
       // Never create the target: existsSync(segDir) follows the link and
       // returns false for a dangling one, which would skip the symlink
       // check entirely if discoverSegments checked existsSync first.
-      symlinkSync(join(dir, 'never-created'), join(adlc, 'manifest.d'));
+      try {
+        symlinkSync(join(dir, 'never-created'), join(adlc, 'manifest.d'));
+      } catch (err) {
+        if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+        throw err;
+      }
       const result = verify(adlc);
       assert.equal(result.valid, false);
       assert.match(result.message, /symlink/);

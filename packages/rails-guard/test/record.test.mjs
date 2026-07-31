@@ -6,7 +6,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -28,7 +28,7 @@ function setupRepo() {
 
 function writeFile(dir, rel, content) {
   const full = join(dir, rel);
-  mkdirSync(full.substring(0, full.lastIndexOf('/')), { recursive: true });
+  mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content);
 }
 

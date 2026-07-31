@@ -34,7 +34,7 @@ test('generated-loader source reads equivalent legacy and sharded snapshots', ()
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('generated-loader rejects symlinked stores and symlinked store parents', () => {
+test('generated-loader rejects symlinked stores and symlinked store parents', { skip: process.platform === 'win32' }, () => {
   const parent = mkdtempSync(join(tmpdir(), 'adlc-generated-reader-symlink-'));
   try {
     const ticket = { id: 'T1', title: 'Reader fixture' };

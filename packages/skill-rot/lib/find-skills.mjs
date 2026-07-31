@@ -45,7 +45,7 @@ function collectSkills(dir, results) {
     if (entry.isDirectory()) {
       collectSkills(fullPath, results);
     } else if (entry.isFile() && entry.name === 'SKILL.md') {
-      results.push(fullPath);
+      results.push(fullPath.replaceAll('\\', '/'));
     }
   }
 }

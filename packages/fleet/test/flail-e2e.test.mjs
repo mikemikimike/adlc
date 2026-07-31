@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildLiveDeps, fleetLogPath, defaultIo } from '../lib/live-deps.mjs';
+import { withWin32Platform } from './platform-mock.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ADLC_BIN = resolve(HERE, '../../cli/bin/adlc.mjs');
@@ -45,7 +46,12 @@ function makeIo(workerOutput, workerResult = {}) {
     git: () => (...args) => (args[0] === 'rev-parse' ? 'SHA' : ''),
     // No `?? ADLC_BIN` fallback: the bin must arrive from config, or these
     // tests would quietly exercise an ambient install instead of this worktree.
-    adlc: (args, opts = {}) => spawnSync(opts.bin, args, { encoding: 'utf8', maxBuffer: opts.maxBuffer }),
+    adlc: (args, opts = {}) => {
+      if (process.platform === 'win32' && typeof opts.bin === 'string' && /\.mjs$/i.test(opts.bin)) {
+        return spawnSync(process.execPath, [opts.bin, ...args], { encoding: 'utf8', maxBuffer: opts.maxBuffer });
+      }
+      return spawnSync(opts.bin, args, { encoding: 'utf8', maxBuffer: opts.maxBuffer });
+    },
     adlcAsync: async () => ({ status: 0, stdout: '' }),
     spawnWorker: async () => ({ status: 0, stdout: workerOutput, stderr: '', ...workerResult }),
     readFile: () => undefined,
@@ -104,6 +110,23 @@ test('defaultIo().adlc spawns the given bin and returns a real spawnSync result'
   assert.ok(r, 'must return the spawn result, not null');
   assert.equal(r.status, 2, 'the configured bin ran and reported the flail verdict');
   assert.equal(JSON.parse(r.stdout).verdict, 'flail');
+});
+
+// The win32 arm of the same primitive: a `.mjs` adlcBin must be spawned as
+// `node <bin>`, since CreateProcess cannot run one. Unreachable on a POSIX
+// runner without forcing the platform, so it had no coverage — and a null return
+// here fail-opens every flail consultation on Windows without a single red test.
+test('defaultIo().adlc routes a .mjs bin through node on win32 and returns the real spawn result', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-e2e-'));
+  const bin = join(dir, 'probe-detector.mjs');
+  writeFileSync(bin, 'process.stdout.write("probe:" + process.argv.slice(2).join(","));\n');
+
+  const r = withWin32Platform(() => defaultIo().adlc(['flail-detector', '--json'], { bin }));
+
+  assert.ok(r, 'must return the spawnSync result, not null');
+  assert.equal(r.error, undefined, r.error?.message);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, 'probe:flail-detector,--json', 'the .mjs bin ran under node with its args intact');
 });
 
 test('defaultIo().appendLog creates missing parent directories and appends', async () => {

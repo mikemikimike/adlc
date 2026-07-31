@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, chmodSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, chmodSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordOverride as realRecordOverride } from '../lib/override.mjs';
@@ -76,7 +76,11 @@ test('recordOverride returns false (never throws) when the ledger directory cann
   withTempDir((dir) => {
     const adlcDir = join(dir, '.adlc');
     // Make the parent read-only so mkdir/append fails; simulate an unwritable repo.
-    chmodSync(dir, 0o500);
+    if (process.platform === 'win32') {
+      writeFileSync(adlcDir, 'not-a-directory');
+    } else {
+      chmodSync(dir, 0o500);
+    }
     let ok;
     assert.doesNotThrow(() => {
       ok = recordOverride({ ticketId: 'T1', signals: [], depth: 1, sessionBytes: 1, reason: 'x', dir: adlcDir });

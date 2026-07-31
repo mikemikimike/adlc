@@ -505,10 +505,12 @@ test('signed mode rejects runner hash mismatches before executing the runner', (
 test('signed mode accepts a matching runner that passes all probes', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'adlc-runner-ok-'));
   try {
-    const runnerPath = join(tmp, 'adlc-runner');
-    writeFileSync(
-      runnerPath,
-      [
+    // On Windows use an explicit `.cmd` shim — copying PE bytes to `.cmd` was the
+    // prior bug; extensionless batch content still maps to `.cmd` via basename helper.
+    const runnerPath = join(tmp, process.platform === 'win32' ? 'adlc-runner.cmd' : 'adlc-runner');
+    const runnerCode = process.platform === 'win32'
+      ? '@echo off\nif "%1"=="--version" exit /b 0\nif "%2"=="--help" exit /b 0\nexit /b 1\n'
+      : [
         '#!/bin/sh',
         'if [ "$1" = "--version" ]; then exit 0; fi',
         'if [ "$2" = "--help" ]; then',
@@ -518,9 +520,8 @@ test('signed mode accepts a matching runner that passes all probes', () => {
         'fi',
         'exit 1',
         '',
-      ].join('\n'),
-      { mode: 0o700 }
-    );
+      ].join('\n');
+    writeFileSync(runnerPath, runnerCode, { mode: 0o700 });
     const digest = createHash('sha256').update(readFileSync(runnerPath)).digest('hex');
     const signedBase = {
       ...BASE_UNSIGNED,
@@ -1216,7 +1217,7 @@ test('#283: a base directory store with an unsupported manifest version fails cl
 // (non-blob/symlink/nested at base, symlink-skip + malformed at head) — this is
 // the security-defense code, so a silent regression must break a test.
 
-test('#283: a base shard that is a symlink (non-100644 blob) fails closed', () => {
+test('#283: a base shard that is a symlink (non-100644 blob) fails closed', { skip: process.platform === 'win32' }, () => {
   const result = runRailFreezeScenario({
     baseConfig: BASE_UNSIGNED,
     headConfig: BASE_UNSIGNED,
@@ -1255,7 +1256,7 @@ test('#283: a malformed HEAD shard fails closed', () => {
   assert.match(result.stderr, /INVALID_JSON: invalid (shard|JSON in)/);
 });
 
-test('#283: a HEAD shard replaced by a symlink is never followed', () => {
+test('#283: a HEAD shard replaced by a symlink is never followed', { skip: process.platform === 'win32' }, () => {
   const result = runRailFreezeScenario({
     baseConfig: BASE_UNSIGNED,
     headConfig: BASE_UNSIGNED,

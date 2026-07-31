@@ -131,6 +131,37 @@ const SEGMENTS = [
   ['docs app', 'node --test apps/docs/test/*.test.mjs'],
 ];
 
+// Resolve a `node --test <target>` argument to the literal file list Node
+// should run — expanding a `dir/*.test.mjs`-style glob ourselves instead of
+// relying on the shell to. Pure and I/O-only-via-fs, so it's directly
+// unit-testable without spawning anything.
+//
+// @param {string} targetPattern  the argument after `node --test ` (a glob or
+//   a single explicit file path)
+// @returns {string[]} matching file paths (repo-relative), or [] if none —
+//   callers treat an empty result as "let the shell try instead"
+export function expandGlobTarget(targetPattern) {
+  if (targetPattern.includes('*')) {
+    const dir = dirname(targetPattern);
+    const filePattern = targetPattern.slice(dir.length + 1);
+    if (!existsSync(dir)) return [];
+    const regex = new RegExp('^' + filePattern.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$');
+    return readdirSync(dir).filter((f) => regex.test(f)).map((f) => join(dir, f));
+  }
+  return existsSync(targetPattern) ? [targetPattern] : [];
+}
+
+export function runSegment(command, env) {
+  if (command.startsWith('node --test ')) {
+    const targetPattern = command.slice('node --test '.length).trim();
+    const fileList = expandGlobTarget(targetPattern);
+    if (fileList.length > 0) {
+      return spawnSync(process.execPath, ['--test', ...fileList], { stdio: 'inherit', env });
+    }
+  }
+  return spawnSync(command, { shell: true, stdio: 'inherit', env });
+}
+
 function main() {
   const { env: segmentEnv, scrubbed } = buildSegmentEnv(process.env);
   if (scrubbed.length) {
@@ -147,7 +178,7 @@ function main() {
   const failed = [];
   for (const [name, command] of segments) {
     console.log(`\n─── ${name}`);
-    const result = spawnSync(command, { shell: true, stdio: 'inherit', env: segmentEnv });
+    const result = runSegment(command, segmentEnv);
     // A signal (status null) is a failure too — never let a killed segment read as a pass.
     if (result.status !== 0) failed.push({ name, status: result.status, signal: result.signal });
   }

@@ -10,6 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { winSystemExe } from '@adlc/core';
 
 /**
  * Verify a single claim.
@@ -30,6 +31,21 @@ export function verifyClaim(claim, ctx) {
   }
 }
 
+// INTERNAL cmd.exe commands only — this set is consulted on win32 alone, and a
+// name in it is certified WITHOUT consulting `where.exe`, so anything that is
+// not genuinely built into cmd.exe would be falsely reported present.
+//
+// The POSIX names that used to live here (`ls`, `cat`, `rm`, `cp`, `mv`, `pwd`,
+// `clear`, `touch`, `which`, `export`) are NOT cmd.exe builtins. On a stock
+// Windows box `touch` does not exist, yet skill-rot answered `ok` for it —
+// certifying a command that cannot run and weakening the verification this
+// module exists to perform. They are removed so they fall through to the real
+// `where.exe` lookup, which correctly finds them when Git-Bash/WSL supplies
+// them and correctly fails when nothing does.
+const COMMON_BUILTINS = new Set([
+  'cd', 'dir', 'echo', 'set', 'type', 'copy', 'move', 'del', 'mkdir', 'rmdir', 'cls', 'path', 'exit',
+]);
+
 /**
  * Verify a command exists via `command -v <tok>` or in ./node_modules/.bin.
  */
@@ -41,8 +57,27 @@ function verifyCommand(cmd, repoRoot) {
 
   // Check ./node_modules/.bin first
   const nmBin = join(repoRoot, 'node_modules', '.bin', cmd);
-  if (existsSync(nmBin)) {
+  if (
+    existsSync(nmBin) ||
+    (process.platform === 'win32' && (existsSync(`${nmBin}.cmd`) || existsSync(`${nmBin}.exe`)))
+  ) {
     return { status: 'ok' };
+  }
+
+  if (process.platform === 'win32') {
+    if (COMMON_BUILTINS.has(cmd.toLowerCase())) {
+      return { status: 'ok' };
+    }
+    try {
+      // ABSOLUTE `where.exe`. skill-rot runs with cwd at the repository root,
+      // and Windows resolves a bare executable name against the current
+      // directory before the system directories — so a checkout shipping its
+      // own `where.exe` would run on every non-builtin claim verified.
+      execFileSync(winSystemExe('where.exe'), [cmd], { stdio: 'pipe', timeout: 5000 });
+      return { status: 'ok' };
+    } catch {
+      return { status: 'stale', reason: `command not found: ${cmd}` };
+    }
   }
 
   // Use `command -v` via sh to check for shell builtins and PATH binaries

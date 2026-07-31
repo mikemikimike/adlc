@@ -1,0 +1,13 @@
+{
+  "body": "GitHub issue #352 (portability half). Make the ADLC toolkit `packages/*` and `scripts/*` test suites pass on Windows. Restoring `install.ps1`, a required `windows-latest` CI job, and ADR/docs claim updates remains a follow-on once this gate is green in CI.\n\n=== PROBLEM ===\nA windows-latest CI run of the core gate suites passed only 6 of 28 packages. The recurring signature is a doubled drive letter (`D:\\D:\\...` / `C:\\C:\\...`) from treating `new URL(...).pathname` as a filesystem path on Windows (leading `/C:/` joined onto a root), plus related gaps: `import.meta.url` vs argv equality, spawn of `.cmd` stubs, `PATH`/`Path` env-key duplication, CRLF/diff parsing, and directory-symlink privilege assumptions in tests.\n\n=== REQUIRED BEHAVIOR ===\n1. Bin/path resolution never doubles a Windows drive letter; use `fileURLToPath` for file URL → path.\n2. CLI entrypoint checks use `pathToFileURL(process.argv[1]).href === import.meta.url` where applicable.\n3. Child-process launches that need Windows `.cmd` stubs set `shell: true` only where required; generated lesson-foundry check scripts use `execFileSync` with argv arrays and MUST NOT pass `shell: true` for `git`.\n4. Test fixtures that need chmod +x or symlinks use `git update-index --cacheinfo` (100755 / 120000) or EPERM early-return on win32 so the suite is hermetic without admin rights — do not reach for node:test's per-test skip option (rails-guard treats that marker as a suppression).\n5. `node scripts/run-tests.mjs packages` and `node scripts/run-tests.mjs scripts` exit 0 on Windows.\n\n=== VERIFICATION ===\n- `node scripts/run-tests.mjs packages` exits 0 (29/29 segments).\n- `node scripts/run-tests.mjs scripts` exits 0.\n- `node --test packages/lesson-foundry/test/cli.test.mjs` exits 0.\n- `adlc hollow-test --test-cmd \"node scripts/run-tests.mjs packages\" --base origin/main` exits 0.\n\n=== OUT OF SCOPE (follow-on) ===\n- Restore `apps/docs/public/install.ps1` + required windows-latest CI job + tripwire/docs/ADR-0010 Decision 6 update (#352 remaining DoD).\n- packages/fleet Windows parity.",
+  "category": "bugfix",
+  "duration": 3,
+  "edges": [],
+  "id": "T-01KYQR3X1BA9S26V9R978TCJYR",
+  "rails": [],
+  "scope": [
+    "packages/**",
+    "scripts/**"
+  ],
+  "title": "Make ADLC packages and scripts suites green on Windows (#352)"
+}

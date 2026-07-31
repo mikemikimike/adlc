@@ -27,8 +27,12 @@ test('resolveRailPath: plain existing file resolves to its lexical relative path
 test('resolveRailPath: symlinked file resolves to the real rail target', () => {
   const root = makeRepo();
   try {
-    symlinkSync(join(root, '.adlc', 'tickets.json'), join(root, 'alias.json'));
-    assert.equal(resolveRailPath('alias.json', root), '.adlc/tickets.json');
+    try {
+      symlinkSync(join(root, '.adlc', 'tickets.json'), join(root, 'alias.json'));
+      assert.equal(resolveRailPath('alias.json', root), '.adlc/tickets.json');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -37,8 +41,12 @@ test('resolveRailPath: symlinked file resolves to the real rail target', () => {
 test('resolveRailPath: symlinked parent directory resolves through to the real dir', () => {
   const root = makeRepo();
   try {
-    symlinkSync(join(root, '.adlc'), join(root, 'harmless'));
-    assert.equal(resolveRailPath('harmless/tickets.json', root), '.adlc/tickets.json');
+    try {
+      symlinkSync(join(root, '.adlc'), join(root, 'harmless'), 'junction');
+      assert.equal(resolveRailPath('harmless/tickets.json', root), '.adlc/tickets.json');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -47,9 +55,13 @@ test('resolveRailPath: symlinked parent directory resolves through to the real d
 test('resolveRailPath: not-yet-existing file under a symlinked ancestor still resolves', () => {
   const root = makeRepo();
   try {
-    symlinkSync(join(root, '.adlc'), join(root, 'harmless'));
-    // a `write` creating a new file through the symlinked dir
-    assert.equal(resolveRailPath('harmless/current-ticket.json', root), '.adlc/current-ticket.json');
+    try {
+      symlinkSync(join(root, '.adlc'), join(root, 'harmless'), 'junction');
+      // a `write` creating a new file through the symlinked dir
+      assert.equal(resolveRailPath('harmless/current-ticket.json', root), '.adlc/current-ticket.json');
+    } catch (err) {
+      if (process.platform !== 'win32' || (err.code !== 'EPERM' && err.code !== 'ENOTSUP')) throw err;
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

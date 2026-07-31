@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ function writeManifest(dir, entries) {
 }
 
 function runCLI(args, cwd) {
-  const cli = new URL('../bin/model-router.mjs', import.meta.url).pathname;
+  const cli = fileURLToPath(new URL('../bin/model-router.mjs', import.meta.url));
   try {
     const out = execFileSync(process.execPath, [cli, ...args], {
       cwd,

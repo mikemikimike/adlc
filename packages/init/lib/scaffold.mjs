@@ -236,11 +236,16 @@ function rejectSymlinkComponents(root, relativePath) {
   }
 }
 
+// Windows' fs layer has no O_NOFOLLOW; passing the bit there makes openSync reject valid paths.
+export function noFollowFlag(platform = process.platform) {
+  return platform === 'win32' ? 0 : (constants.O_NOFOLLOW ?? 0);
+}
+
 function writeFileNoFollow(path, content, { exclusive = false } = {}) {
-  const noFollow = constants.O_NOFOLLOW ?? 0;
+  const noFollow = noFollowFlag();
   const flags = exclusive
     ? constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollow
-    : constants.O_WRONLY | constants.O_TRUNC | noFollow;
+    : constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow;
   const descriptor = openSync(path, flags, 0o666);
   try {
     writeFileSync(descriptor, content);

@@ -27,8 +27,11 @@
 // the issue untouched, or the signal becomes noise and gets muted.
 
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { runTicketPrune } from '../packages/ticket-prune/lib/run.mjs';
 import { resolveActiveTicketId } from '../packages/tickets/lib/pointer.mjs';
+import { resolveOnPath, winShell, winCmdArgs } from '../packages/core/lib/spawn-safe.mjs';
 
 // The DURABLE identity of the managed issue. Labels can be stripped by hand; the
 // marker survives in the body, and findExistingIssue falls back to sweeping open
@@ -568,8 +571,58 @@ export function decideAction({ drift, existingIssue, activeTicketId = null, acti
 
 // ---- I/O shell (deliberately branch-free; all decisions live above) ----
 
-const gh = (args, input) =>
-  execFileSync('gh', args, { encoding: 'utf8', input, maxBuffer: GH_MAX_BUFFER });
+// Resolve `gh` from PATH without preferring a system `.exe` over a PATH-prefix
+// `.cmd` mock (the previous `where.exe` + "find .exe" path did that and broke
+// the exit-contract fixture). Per directory: `.cmd` before `.exe`. Real GitHub
+// CLI installs are `.exe` and run with `shell: false`. `.cmd`/`.bat` shims still
+// need a shell on Windows — only after every argv is free of cmd metacharacters,
+// so ticket-derived `--title` / `--comment` strings cannot inject.
+let cachedGhBin;
+export function resolveGhBin() {
+  if (cachedGhBin) return cachedGhBin;
+  // resolveOnPath, not a hand-rolled PATH walk. The previous loop skipped EMPTY
+  // components but not RELATIVE ones, and fell back to the bare name `gh` when
+  // nothing matched — so on `PATH=.;...`, or with gh simply absent, a checkout
+  // shipping `gh.cmd` was executed. The shared resolver rejects relative and
+  // empty components alike and returns null instead of a bare name.
+  const resolved = resolveOnPath('gh');
+  if (resolved) {
+    cachedGhBin = resolved;
+    return cachedGhBin;
+  }
+  throw new Error('ceremony-drift: gh not found on PATH');
+}
+
+const CMD_META = /[\r\n&|<>^%]/;
+
+const gh = (args, input) => {
+  const bin = resolveGhBin();
+  const needsWinShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin);
+  if (needsWinShell) {
+    for (const a of args) {
+      if (CMD_META.test(String(a))) {
+        throw new Error(
+          'ceremony-drift: refusing to pass shell metacharacters to gh via cmd.exe'
+        );
+      }
+    }
+  }
+  // `shell: true` would join argv unquoted and leave the INTERPRETER itself an
+  // unqualified `cmd.exe`. Drive the resolved shell with every element quoted.
+  if (needsWinShell) {
+    return execFileSync(winShell(), winCmdArgs(bin, args), {
+      encoding: 'utf8',
+      input,
+      maxBuffer: GH_MAX_BUFFER,
+      windowsVerbatimArguments: true,
+    });
+  }
+  return execFileSync(bin, args, {
+    encoding: 'utf8',
+    input,
+    maxBuffer: GH_MAX_BUFFER,
+  });
+};
 
 /** Idempotent; --force makes re-creating an existing label a no-op. */
 function ensureLabel() {
@@ -710,8 +763,10 @@ async function main() {
   }
 }
 
+import { pathToFileURL } from 'node:url';
+
 // Only run main() when executed directly, so the test can import the pure parts.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((e) => {
     // EXIT-CODE CONTRACT — two different failures, deliberately treated apart:
     //

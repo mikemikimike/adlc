@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 import { appendManifestEntry as realAppendManifestEntry, record as realRecord, buildEntry, parseData, parseFileList, readLastRawLine } from '../lib/record.mjs';
@@ -434,7 +435,7 @@ describe('repairChain', () => {
 
   it('CLI: a p6-accept record prints the ticket-completion reminder to stderr, a plain gate does not (T74)', () => {
     const dir = makeTmp();
-    const bin = new URL('../bin/gate-manifest.mjs', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../bin/gate-manifest.mjs', import.meta.url));
     try {
       // p6-accept names a ticket → the bin must print the "you still have to complete it"
       // reminder on stderr (not stdout, so --json stays clean). Guards the `if (reminder)`
@@ -454,7 +455,7 @@ describe('repairChain', () => {
   // function in isolation) — a reverted/typoed/negation-flipped flag would fail here.
   it('CLI: --allow-legacy-unsigned tolerates a legacy-unsigned-prefix manifest; omitting it still fails strict', () => {
     const dir = makeTmp();
-    const bin = new URL('../bin/gate-manifest.mjs', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../bin/gate-manifest.mjs', import.meta.url));
     const env = { ...process.env, [KEY_ENV]: 'test-key' };
     try {
       withKey(null, () => {
@@ -489,7 +490,7 @@ describe('repairChain', () => {
 
   it('requires and audits explicit unsigned attestation through the CLI', () => {
     const dir = makeTmp();
-    const bin = new URL('../bin/gate-manifest.mjs', import.meta.url).pathname;
+    const bin = fileURLToPath(new URL('../bin/gate-manifest.mjs', import.meta.url));
     const env = { ...process.env, [KEY_ENV]: 'test-key' };
     try {
       withKey('test-key', () => record({ gate: 'rails-bypass', dir }));

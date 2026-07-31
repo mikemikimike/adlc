@@ -18,9 +18,10 @@ import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { sha256 } from '@adlc/core';
 import { migrateLegacyStore } from '@adlc/tickets';
+import { fileURLToPath } from 'node:url';
 import { resolveProsecutionRevision } from '../lib/run.mjs';
 
-const BIN = new URL('../bin/adlc-prosecute.mjs', import.meta.url).pathname;
+const BIN = fileURLToPath(new URL('../bin/adlc-prosecute.mjs', import.meta.url));
 
 // #326 hardening: record-cross-model signs and the readers verify, both under this key.
 process.env.ADLC_MANIFEST_KEY = 'test-cross-model-cli-signing-key';

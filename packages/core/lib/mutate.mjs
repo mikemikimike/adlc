@@ -341,7 +341,8 @@ export function changedLinesFromDiff(diffText) {
   let currentFile = null;
   let newLine = 0;
   for (const line of diffText.split('\n')) {
-    const fileMatch = line.match(/^\+\+\+ b\/(.+)$/);
+    const cleanLine = line.trimEnd();
+    const fileMatch = cleanLine.match(/^\+\+\+ [^/\s]+\/(.+)$/);
     if (fileMatch) {
       currentFile = fileMatch[1];
       result[currentFile] = result[currentFile] ?? new Set();

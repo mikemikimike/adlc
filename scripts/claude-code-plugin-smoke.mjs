@@ -690,7 +690,7 @@ for (const filePath of guidanceFiles) {
   const source = readFileSync(filePath, 'utf8');
   const matches = source.match(bareCommandPattern);
   if (matches) {
-    const relPath = filePath.slice(repo.length + 1);
+    const relPath = filePath.slice(repo.length + 1).split(sep).join('/');
     fail(
       `bare, non-namespaced command reference found in ${relPath}: ${[...new Set(matches)].join(', ')}\n` +
       `  The plugin is namespaced "adlc" — the actual invocable form inside Claude Code is\n` +

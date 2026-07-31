@@ -25,6 +25,8 @@ test('buildSettings allowlists gate/init/allowed commands + read-only git, never
   assert.ok(!allow.some((r) => /git commit/.test(r)), 'the worker must NOT be allowed to commit');
 });
 
+import { join } from 'node:path';
+
 test('provision writes only the allowlist settings file to the worktree .claude dir (AC4)', async () => {
   const written = [];
   const r = provision({
@@ -33,7 +35,7 @@ test('provision writes only the allowlist settings file to the worktree .claude 
     writeJson: (path, obj) => written.push({ path, obj }),
   });
   assert.equal(written.length, 1, 'provision writes exactly one file');
-  assert.equal(written[0].path, '/wt/.claude/settings.local.json');
+  assert.equal(written[0].path, join('/wt', '.claude', 'settings.local.json'));
   assert.deepEqual(r.settings, written[0].obj);
 });
 

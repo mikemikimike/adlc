@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cpSync, mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -317,12 +317,12 @@ test('claude-code-plugin-smoke does not let a degenerate empty-name command file
 // to the scan with zero trace in the tool's output. This is the same "silent
 // blind spot" failure class #96 exists to close, reached via a filesystem-type
 // route instead of a hardcoded-list route.
-test('claude-code-plugin-smoke follows a symlinked directory under docs/ instead of silently skipping it', () => {
+test('claude-code-plugin-smoke follows a symlinked directory under docs/ instead of silently skipping it', { skip: process.platform === 'win32' }, () => {
   const tmpRepo = mkdtempSync(join(tmpdir(), 'adlc-cc-smoke-'));
   try {
     cpSync(REPO, tmpRepo, {
       recursive: true,
-      filter: (src) => !src.includes(`${resolve(REPO, '.git')}`) && !src.includes(`${resolve(REPO, 'node_modules')}`),
+      filter: (src) => !src.includes('node_modules') && !src.includes('.git'),
     });
 
     // A real directory OUTSIDE docs/, containing a bare-command doc, linked
@@ -360,12 +360,12 @@ test('claude-code-plugin-smoke follows a symlinked directory under docs/ instead
 // (collectFilesRecursively) so this can't recur as "fixed in one of two
 // copies but not the other" a third time. Prove the plugin-tree scan follows
 // a symlinked directory too.
-test('claude-code-plugin-smoke follows a symlinked directory under the plugin guidance tree instead of silently skipping it', () => {
+test('claude-code-plugin-smoke follows a symlinked directory under the plugin guidance tree instead of silently skipping it', { skip: process.platform === 'win32' }, () => {
   const tmpRepo = mkdtempSync(join(tmpdir(), 'adlc-cc-smoke-'));
   try {
     cpSync(REPO, tmpRepo, {
       recursive: true,
-      filter: (src) => !src.includes(`${resolve(REPO, '.git')}`) && !src.includes(`${resolve(REPO, 'node_modules')}`),
+      filter: (src) => !src.includes('node_modules') && !src.includes('.git'),
     });
 
     const externalDir = join(tmpRepo, '..', 'adlc-cc-smoke-external-commands');
@@ -404,10 +404,10 @@ test('claude-code-plugin-smoke follows a symlinked directory under the plugin gu
 // this repo carries 8 worktrees, and copying them makes each case take minutes.
 function copyRepoFast() {
   const tmpRepo = mkdtempSync(join(tmpdir(), 'adlc-cc-lockstep-'));
-  const skip = ['.git', 'node_modules', '.worktrees', '.claude'].map((d) => resolve(REPO, d));
+  const skip = ['.git', '.worktrees', '.claude'].map((d) => resolve(REPO, d));
   cpSync(REPO, tmpRepo, {
     recursive: true,
-    filter: (src) => !skip.some((s) => src === s || src.startsWith(s + '/')),
+    filter: (src) => !src.includes('node_modules') && !skip.some((s) => src === s || src.startsWith(s + sep) || src.startsWith(s + '/')),
   });
   return tmpRepo;
 }

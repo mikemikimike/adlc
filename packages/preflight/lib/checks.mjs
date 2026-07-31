@@ -6,7 +6,7 @@
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
-import { detectProvider } from '@adlc/core';
+import { detectProvider, resolveOnPath } from '@adlc/core';
 import { git } from '@adlc/core';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -15,9 +15,21 @@ import { git } from '@adlc/core';
  * Run a command and return { exitCode, stdout, stderr }.
  * Never throws — failures are captured in the result.
  */
-async function runCmd(cmd, args = [], opts = {}) {
+export async function runCmd(cmd, args = [], opts = {}) {
   return new Promise((resolve) => {
-    const proc = spawn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+    let actualCmd = cmd;
+    let actualArgs = args;
+    let shell = opts.shell;
+    if (process.platform === 'win32') {
+      if (cmd === 'echo') {
+        shell = true;
+      } else if (cmd === 'sh' && args[0] === '-c') {
+        shell = true;
+        actualCmd = args[1];
+        actualArgs = [];
+      }
+    }
+    const proc = spawn(actualCmd, actualArgs, { ...opts, shell, stdio: ['ignore', 'pipe', 'pipe'] });
     const stdout = [];
     const stderr = [];
     proc.stdout.on('data', (d) => stdout.push(d));
@@ -38,18 +50,86 @@ function tailLines(text, n = 10) {
 
 // ── required checks ──────────────────────────────────────────────────────────
 
-/** REQUIRED: bash — spawn 'echo preflight-ok' and verify output. */
-export async function checkBash() {
+/**
+ * A one-liner only a POSIX shell runs correctly: two variable assignments and a
+ * quoted parameter expansion. cmd.exe cannot run it (it fails on `a=preflight`),
+ * and a shim that merely echoes its argument back cannot produce the expected
+ * output either — the expected string never appears literally in the script.
+ * That is the point: `echo` working proves nothing about `sh -c` semantics.
+ */
+const POSIX_PROBE = 'a=preflight; b=ok; echo "${a}-${b}"';
+const POSIX_PROBE_EXPECT = 'preflight-ok';
+
+/**
+ * Shells to try, in the order the runtime would prefer them.
+ *
+ * POSIX hosts lead with the literal `/bin/sh` that fleet's runGateCommand
+ * spawns. Windows has no `/bin/sh`, but Git for Windows and WSL both put a real
+ * bash on PATH — so Windows is probed, not condemned.
+ */
+export function posixShellCandidates(platform = process.platform) {
+  if (platform === 'win32') return ['bash.exe', 'sh.exe', 'bash', 'sh'];
+  return ['/bin/sh', 'sh', 'bash'];
+}
+
+/** One-line reason a candidate shell did not satisfy the probe. */
+function probeFailure(shell, { exitCode, stdout, stderr }) {
+  if (exitCode === -1) return `${shell}: ${(stderr.split('\n')[0] || 'not runnable').trim()}`;
+  if (exitCode !== 0) return `${shell}: exited ${exitCode}`;
+  return `${shell}: ran but produced ${JSON.stringify(stdout.trim().split('\n')[0] ?? '')}`;
+}
+
+/**
+ * Find the first candidate that executes POSIX_PROBE with POSIX semantics.
+ * Returns { ok, shell, attempts } and never throws. `run` is injectable so the
+ * "no usable shell" path is testable without uninstalling the host's shell.
+ */
+export async function probePosixShell({ candidates, run = runCmd, resolve = resolveOnPath } = {}) {
+  const list = candidates ?? posixShellCandidates();
+  const attempts = [];
+  for (const shell of list) {
+    // RESOLVE BEFORE SPAWNING. These candidates are bare interpreter names, and
+    // preflight runs with cwd at the repository being checked — on Windows a
+    // checkout shipping its own `bash.exe` would be executed here, and an empty
+    // PATH component does the same on POSIX. An absolute candidate (`/bin/sh`)
+    // passes through unchanged; anything unresolvable is skipped rather than
+    // handed to spawn.
+    const resolved = resolve(shell);
+    if (!resolved) {
+      attempts.push(`${shell}: not found on PATH`);
+      continue;
+    }
+    const result = await run(resolved, ['-c', POSIX_PROBE]);
+    if (result.exitCode === 0 && result.stdout.includes(POSIX_PROBE_EXPECT)) {
+      return { ok: true, shell: resolved, attempts };
+    }
+    attempts.push(probeFailure(shell, result));
+  }
+  return { ok: false, shell: null, attempts };
+}
+
+/**
+ * REQUIRED: bash — prove a POSIX shell able to run `sh -c <command>` is present.
+ *
+ * Gate commands are executed as `['/bin/sh', '-c', command]` (fleet's
+ * runGateCommand), so a host without a POSIX shell must fail HERE rather than
+ * mid-run inside a gate.
+ */
+export async function checkBash(opts = {}) {
   const name = 'bash';
   try {
-    const { exitCode, stdout } = await runCmd('echo', ['preflight-ok']);
-    if (exitCode !== 0) {
-      return { name, status: 'fail', detail: `echo exited ${exitCode}` };
+    const { ok, shell, attempts } = await probePosixShell(opts);
+    if (ok) {
+      return { name, status: 'pass', detail: `POSIX shell '${shell}' ran 'sh -c' probe` };
     }
-    if (!stdout.includes('preflight-ok')) {
-      return { name, status: 'fail', detail: `unexpected echo output: ${stdout.trim()}` };
-    }
-    return { name, status: 'pass', detail: 'echo preflight-ok succeeded' };
+    return {
+      name,
+      status: 'fail',
+      detail:
+        "no working POSIX shell — gate commands run as '/bin/sh -c <command>' and will fail. " +
+        'On Windows install Git for Windows or WSL and put bash on PATH. ' +
+        `Tried: ${attempts.join('; ')}`,
+    };
   } catch (err) {
     return { name, status: 'fail', detail: String(err.message ?? err) };
   }

@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CODEX_AGENT_TEMPLATES, scaffold } from '../index.mjs';
+import { noFollowFlag } from '../lib/scaffold.mjs';
 import { loadTicketSnapshot } from '@adlc/tickets';
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin/adlc-init.mjs');
@@ -78,7 +79,12 @@ test('scaffold refuses repository symlinks that would escape the supplied root',
     const target = join(outside, 'adlc');
     mkdirSync(root, { recursive: true });
     mkdirSync(target, { recursive: true });
-    symlinkSync(target, join(root, '.adlc'), 'dir');
+    try {
+      symlinkSync(target, join(root, '.adlc'), 'junction');
+    } catch (err) {
+      if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+      throw err;
+    }
     assert.throws(() => scaffold({ root }), /refusing to follow symlink/);
     assert.equal(existsSync(join(target, 'specs')), false);
   });
@@ -89,12 +95,23 @@ for (const relativePath of ['.gitignore', '.adlc', '.codex']) {
     fixture((root, parent) => {
       const outside = join(parent, `outside-${relativePath.replace('.', '')}`);
       mkdirSync(root, { recursive: true });
-      symlinkSync(outside, join(root, relativePath));
+      try {
+        symlinkSync(outside, join(root, relativePath), relativePath === '.gitignore' ? 'file' : 'junction');
+      } catch (err) {
+        if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+        throw err;
+      }
       assert.throws(() => scaffold({ root }), /refusing to follow symlink/);
       assert.equal(existsSync(outside), false);
     });
   });
 }
+
+test('noFollowFlag drops O_NOFOLLOW only on win32, where openSync rejects it', () => {
+  assert.equal(noFollowFlag('win32'), 0);
+  assert.equal(noFollowFlag('darwin'), constants.O_NOFOLLOW ?? 0);
+  assert.equal(noFollowFlag('linux'), constants.O_NOFOLLOW ?? 0);
+});
 
 test('scaffold repairs a whole-directory ADLC ignore so committed state can be re-included', () => {
   fixture((root) => {
@@ -256,8 +273,14 @@ test('the ticket-store step is idempotent: a second scaffold reports it unchange
 test('scaffold refuses to provision the store through a symlinked .adlc/tickets', () => {
   fixture((root, parent) => {
     const outside = join(parent, 'outside-store');
+    mkdirSync(outside, { recursive: true });
     mkdirSync(join(root, '.adlc'), { recursive: true });
-    symlinkSync(outside, join(root, '.adlc/tickets'), 'dir');
+    try {
+      symlinkSync(outside, join(root, '.adlc/tickets'), 'junction');
+    } catch (err) {
+      if (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'ENOTSUP')) return;
+      throw err;
+    }
     assert.throws(() => scaffold({ root, codexAgents: false }), /refusing to follow symlink/);
     assert.equal(existsSync(join(outside, '.store.json')), false);
   });

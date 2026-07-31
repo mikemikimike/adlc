@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { scopeViolations, checkFlail, runGates } from '../lib/gates.mjs';
 import { Sandbox, SANDBOX_MODES } from '../lib/sandbox.mjs';
+import { withWin32Platform } from './platform-mock.mjs';
 
 const T = (scope) => ({ id: 'T1', scope });
 
@@ -51,4 +55,37 @@ test('checkFlail FAILS OPEN on any error (§12 backstop)', async () => {
   const r = checkFlail('/log', [], { exec: () => { throw new Error('adlc not found'); } });
   assert.equal(r.flail, false);
   assert.equal(r.failedOpen, true);
+});
+
+// checkFlail's DEFAULT exec is what production gets when no runner is injected,
+// and its win32 arm — `node <detector>.mjs` for a `.mjs` adlcBin, since
+// CreateProcess cannot run one directly — is unreachable on a POSIX runner.
+// Every other test here injects `exec`, so a defaultExec that returned nothing
+// would ship green while every consultation silently fail-opened. A real
+// subprocess over a real .mjs detector is the only way to prove the verdict
+// travelled back: execFileSync is not an injectable seam inside defaultExec.
+test('checkFlail default exec runs a .mjs detector through node on win32 and returns its verdict', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-gates-'));
+  try {
+    const bin = join(dir, 'fake-detector.mjs');
+    // The detector's real contract: the document on stdout, exit 2 for a flail
+    // verdict (which execFileSync surfaces as a throw carrying `stdout`).
+    writeFileSync(bin, [
+      'const doc = { verdict: "flail", signals: [{ type: "repeated-error", argv: process.argv.slice(2) }], bytes: 41 };',
+      'process.stdout.write(JSON.stringify(doc));',
+      'process.exit(2);',
+      '',
+    ].join('\n'));
+
+    const r = withWin32Platform(() => checkFlail('/tmp/session.log', ['src/**'], { adlcBin: bin }));
+
+    assert.equal(r.failedOpen, undefined, `defaultExec produced no usable document (${r.reason})`);
+    assert.equal(r.flail, true, 'the real subprocess verdict must reach the caller');
+    assert.deepEqual(r.signals, [{
+      type: 'repeated-error',
+      argv: ['flail-detector', '--json', '--scope=src/**', '--', '/tmp/session.log'],
+    }], 'the detector ran as `node <bin> <args>` with its argv intact');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

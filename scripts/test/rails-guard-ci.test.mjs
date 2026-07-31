@@ -179,7 +179,7 @@ test('legacy-to-directory migration requires hash-bound evidence', () => {
   assert.equal(runMigrationScenario({ evidence: 'invalid' }), 2);
 });
 
-test('#314: a migration whose manifest is a SYMLINK is denied (working-tree type-confusion)', () => {
+test('#314: a migration whose manifest is a SYMLINK is denied (working-tree type-confusion)', { skip: process.platform === 'win32' }, () => {
   // The migration branch is the one path that reads the working-tree manifest. A symlink to
   // an allow-listed target (../.gitignore) passes the diff-shape allow-list, so the lstat
   // regular-file guard is what stops readFileSync from following the link to forged evidence.
@@ -337,7 +337,7 @@ test('#314: an untracked, gitignored .adlc/manifest.jsonl does NOT trigger a fal
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: a manifest committed as a SYMLINK is denied (type-confusion fail-closed)', () => {
+test('#314: a manifest committed as a SYMLINK is denied (type-confusion fail-closed)', { skip: process.platform === 'win32' }, () => {
   // git show returns a symlink's TARGET STRING, not the target's content — so a manifest
   // symlinked to a whitespace target would slip past a content-only `.trim()` check while
   // downstream readers that follow the link consume forged evidence. The committed-object
@@ -393,7 +393,7 @@ test('#314: deleting a base-tracked manifest at HEAD denies as "absent at HEAD" 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: replacing a base manifest with a SYMLINK at HEAD is denied (append-only type-confusion)', () => {
+test('#314: replacing a base manifest with a SYMLINK at HEAD is denied (append-only type-confusion)', { skip: process.platform === 'win32' }, () => {
   // Base has a real tracked manifest. A PR turns it into a symlink pointing at a decoy that
   // starts with the base content — so a working-tree readFileSync + startsWith would PASS,
   // then downstream readers follow the link to forged evidence. The committed-object mode
@@ -458,7 +458,7 @@ test('#314: a TRACKED non-empty manifest on the first-bootstrap path is still re
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('#314: an ancestor .adlc committed as a SYMLINK is denied (ancestor type-confusion)', () => {
+test('#314: an ancestor .adlc committed as a SYMLINK is denied (ancestor type-confusion)', { skip: process.platform === 'win32' }, () => {
   // git ls-tree does NOT descend a symlinked `.adlc`, so the leaf lookup would report the
   // manifest absent while filesystem consumers follow `.adlc` → `state/manifest.jsonl` and
   // read forged evidence. The `.adlc`-is-a-tree ancestor guard denies it.

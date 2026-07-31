@@ -84,7 +84,7 @@ export function gitDiff(base = 'HEAD', cwd = process.cwd()) {
   // splits raw -z bytes and FAILS CLOSED on any path it cannot decode faithfully
   // (#249) — so that set is trustworthy where these header paths are not. Marker
   // and content detection match on line bodies, not header paths.
-  return git(['-c', 'core.quotepath=false', 'diff', base, '--'], { cwd });
+  return git(['-c', 'core.quotepath=false', '-c', 'diff.mnemonicprefix=false', '-c', 'diff.noprefix=false', 'diff', base, '--'], { cwd });
 }
 
 /** True if `ref` resolves to a commit in this repo. */

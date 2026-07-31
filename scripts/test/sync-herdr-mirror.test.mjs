@@ -115,7 +115,7 @@ test('syncMirror REFUSES to sync into the source repo itself even when it is a g
   assert.ok(existsSync(join(root, 'plugins', 'adlc-herdr', 'herdr-plugin.toml')), 'the source tree is left untouched');
 });
 
-test('syncMirror resolves symlinks before the overlap check (a target symlinked to the source is refused, not wiped)', () => {
+test('syncMirror resolves symlinks before the overlap check (a target symlinked to the source is refused, not wiped)', { skip: process.platform === 'win32' }, () => {
   const root = fakeRepo();
   mkdirSync(join(root, '.git')); // make the source look like a valid checkout so only the overlap guard can stop it
   const link = join(mkdtempSync(join(tmpdir(), 'adlc-mirror-lnk-')), 'target-link');
@@ -124,7 +124,7 @@ test('syncMirror resolves symlinks before the overlap check (a target symlinked 
   assert.ok(existsSync(join(root, 'plugins', 'adlc-herdr', 'herdr-plugin.toml')), 'the source tree is left untouched');
 });
 
-test('syncMirror FAILS CLOSED if the plugin tree contains a symlink (no write-through, no shipped symlink)', () => {
+test('syncMirror FAILS CLOSED if the plugin tree contains a symlink (no write-through, no shipped symlink)', { skip: process.platform === 'win32' }, () => {
   const root = fakeRepo();
   const plugin = join(root, 'plugins', 'adlc-herdr');
   const secret = join(mkdtempSync(join(tmpdir(), 'adlc-mirror-sec-')), 'secret.txt');
@@ -136,7 +136,7 @@ test('syncMirror FAILS CLOSED if the plugin tree contains a symlink (no write-th
   assert.equal(readFileSync(secret, 'utf8'), 'top secret', 'the symlink target file was NOT written through');
 });
 
-test('syncMirror FAILS CLOSED if the monorepo LICENSE is a symlink (the license copy is covered by the guard, not shipped)', () => {
+test('syncMirror FAILS CLOSED if the monorepo LICENSE is a symlink (the license copy is covered by the guard, not shipped)', { skip: process.platform === 'win32' }, () => {
   const root = fakeRepo();
   const outside = join(mkdtempSync(join(tmpdir(), 'adlc-mirror-sec-')), 'secret.pem');
   writeFileSync(outside, 'PRIVATE KEY');

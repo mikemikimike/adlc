@@ -44,7 +44,9 @@ function assertDetectorExits(expected, logFile, scope) {
   const args = ['flail-detector', '--json'];
   for (const g of scope ?? []) args.push(`--scope=${g}`);
   args.push('--', logFile);
-  const probe = spawnSync(ADLC_BIN, args, { encoding: 'utf8' });
+  const probe = process.platform === 'win32' && /\.mjs$/i.test(ADLC_BIN)
+    ? spawnSync(process.execPath, [ADLC_BIN, ...args], { encoding: 'utf8' })
+    : spawnSync(ADLC_BIN, args, { encoding: 'utf8' });
   assert.equal(probe.error, undefined, `precondition: ${ADLC_BIN} must be spawnable`);
   assert.equal(
     probe.status, expected,
@@ -217,7 +219,15 @@ test('injected exec may signal the flail verdict the way execFileSync does (thro
 // ---------------------------------------------------------------------------
 
 /** io shim whose `adlc` is spawnSync over the real binary, as production's is. */
-const realIo = { adlc: (args, opts = {}) => spawnSync(opts.bin ?? 'adlc', args, { encoding: 'utf8' }) };
+const realIo = {
+  adlc: (args, opts = {}) => {
+    const bin = opts.bin ?? 'adlc';
+    if (process.platform === 'win32' && /\.mjs$/i.test(bin)) {
+      return spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8' });
+    }
+    return spawnSync(bin, args, { encoding: 'utf8' });
+  },
+};
 
 test('the production flailExec adapter reports a REAL flail verdict', async () => {
   const log = makeLog('Writing /etc/passwd\n');

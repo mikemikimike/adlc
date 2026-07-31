@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { parseCriteria } from '../lib/parse.mjs';
 import { classifyCriterion, classifyAll, applyLlmDemotion } from '../lib/classify.mjs';
@@ -15,14 +16,14 @@ import { buildVacuousPrompt } from '../lib/llm.mjs';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const FIXTURES = new URL('./fixtures/', import.meta.url).pathname;
+const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 
 function fixture(name) {
   return join(FIXTURES, name);
 }
 
 function runCli(args, opts = {}) {
-  const bin = new URL('../bin/spec-lint.mjs', import.meta.url).pathname;
+  const bin = fileURLToPath(new URL('../bin/spec-lint.mjs', import.meta.url));
   try {
     const out = execFileSync(process.execPath, [bin, ...args], {
       encoding: 'utf8',

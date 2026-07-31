@@ -11,6 +11,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { inScope } from '@adlc/core';
+import { isWinMjsCommand } from './spawn-async.mjs';
 
 /**
  * Run one gate command inside the sandbox. Returns { ok, output }. A non-zero
@@ -149,5 +150,8 @@ export function checkFlail(logFile, scope, { adlcBin = 'adlc', exec = defaultExe
 export const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 
 function defaultExec(bin, args) {
+  if (isWinMjsCommand(bin)) {
+    return execFileSync(process.execPath, [bin, ...args], { encoding: 'utf8', maxBuffer: MAX_OUTPUT_BYTES });
+  }
   return execFileSync(bin, args, { encoding: 'utf8', maxBuffer: MAX_OUTPUT_BYTES });
 }

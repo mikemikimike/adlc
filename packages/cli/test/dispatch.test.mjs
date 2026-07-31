@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { packageJsonPath, resolveBin, resolveRunnerBin } from '../lib/dispatch.mjs';
+import { packageJsonPath, resolveBin, resolveRunnerBin, npxCliJsCandidates } from '../lib/dispatch.mjs';
 import { isTool, suggest, TOOLS } from '../lib/registry.mjs';
 import { renderHelp } from '../lib/help.mjs';
 
@@ -65,15 +65,15 @@ test('suggest returns near misses only', () => {
 });
 
 test('resolves package-local tool bins without PATH lookup', () => {
-  assert.match(resolveBin('spec-lint') ?? '', /packages\/spec-lint\/bin\/spec-lint\.mjs$/);
-  assert.match(resolveBin('prosecute') ?? '', /packages\/prosecute\/bin\/adlc-prosecute\.mjs$/);
-  assert.match(resolveBin('ticket') ?? '', /packages\/tickets\/bin\/adlc-tickets\.mjs$/);
-  assert.match(resolveBin('ticket-prune') ?? '', /packages\/ticket-prune\/bin\/ticket-prune\.mjs$/);
-  assert.match(resolveBin('init') ?? '', /packages\/init\/bin\/adlc-init\.mjs$/);
+  assert.match(resolveBin('spec-lint') ?? '', /packages[/\\\\]spec-lint[/\\\\]bin[/\\\\]spec-lint\.mjs$/);
+  assert.match(resolveBin('prosecute') ?? '', /packages[/\\\\]prosecute[/\\\\]bin[/\\\\]adlc-prosecute\.mjs$/);
+  assert.match(resolveBin('ticket') ?? '', /packages[/\\\\]tickets[/\\\\]bin[/\\\\]adlc-tickets\.mjs$/);
+  assert.match(resolveBin('ticket-prune') ?? '', /packages[/\\\\]ticket-prune[/\\\\]bin[/\\\\]ticket-prune\.mjs$/);
+  assert.match(resolveBin('init') ?? '', /packages[/\\\\]init[/\\\\]bin[/\\\\]adlc-init\.mjs$/);
   // spend shares the gate-manifest package but resolves to its OWN bin entry
   // (binName: 'adlc-spend'), not gate-manifest's default 'gate-manifest' bin —
   // proves multi-bin resolution picks the requested binName, not the first key.
-  assert.match(resolveBin('spend') ?? '', /packages\/gate-manifest\/bin\/spend\.mjs$/);
+  assert.match(resolveBin('spend') ?? '', /packages[/\\\\]gate-manifest[/\\\\]bin[/\\\\]spend\.mjs$/);
   assert.equal(resolveBin('definitely-not-real'), null);
 });
 
@@ -110,7 +110,22 @@ test('external verbs like "review" have no local bin to resolve (they are npx pa
 });
 
 test('resolves runner bin for run and accept verbs', () => {
-  assert.match(resolveRunnerBin() ?? '', /packages\/runner\/bin\/adlc\.mjs$/);
+  assert.match(resolveRunnerBin() ?? '', /packages[/\\\\]runner[/\\\\]bin[/\\\\]adlc\.mjs$/);
+});
+
+// #352 windows-compat: `npx.cmd` never reaches the argv, so the JS entry must
+// be found under BOTH installer layouts npxCliJsCandidates covers — fnm/nvs
+// (npm sibling to the node binary) and official/hostedtoolcache (npm one
+// level up, under lib/). Each candidate's exact path is asserted so a
+// mutation to either join() call, or to which directory it's built from, is
+// observable.
+test('npxCliJsCandidates covers both the fnm/nvs and hostedtoolcache npm layouts', () => {
+  const execPath = join('/prefix', 'bin', 'node');
+  const candidates = npxCliJsCandidates(execPath);
+  assert.deepEqual(candidates, [
+    join('/prefix', 'bin', 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+    join('/prefix', 'bin', '..', 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+  ]);
 });
 
 test('help lists every routed tool and exits 0', () => {

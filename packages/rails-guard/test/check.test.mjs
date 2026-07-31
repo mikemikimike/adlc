@@ -4,7 +4,7 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { runChecks } from '../lib/check.mjs';
@@ -16,7 +16,7 @@ function git(args, cwd) {
 }
 
 function setupRepo() {
-  const dir = mkdtempSync(join(tmpdir(), 'rails-guard-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'rails-guard-check-'));
   git(['init', '-b', 'main'], dir);
   git(['config', 'user.email', 'test@example.com'], dir);
   git(['config', 'user.name', 'Test'], dir);
@@ -25,7 +25,7 @@ function setupRepo() {
 
 function writeFile(dir, rel, content) {
   const full = join(dir, rel);
-  mkdirSync(full.substring(0, full.lastIndexOf('/')), { recursive: true });
+  mkdirSync(dirname(full), { recursive: true });
   writeFileSync(full, content);
 }
 
