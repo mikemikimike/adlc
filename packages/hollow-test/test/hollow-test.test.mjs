@@ -14,7 +14,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 
 // ── git helpers ──────────────────────────────────────────────────────────────
 
@@ -1653,5 +1653,136 @@ describe('CLI: no-args and --help', () => {
     assert.equal(result.status, 0);
     assert.ok(result.stdout.includes('hollow-test'));
     assert.ok(result.stdout.includes('--test-cmd'));
+  });
+});
+
+// ── interrupted runs must never leave a mutant behind ─────────────────────────
+//
+// hollow-test mutates source IN PLACE. Every restore path is process-local, so a
+// run that dies mid-trial can strand a live mutant in the working tree as an
+// unstaged edit — and the next run's refusal ("commit or stash first") reads as if
+// the USER's work is in the way, so the reflex is to commit the mutant.
+//
+// Observed for real: a 10-minute tool timeout (SIGTERM) stranded `? 130 :` flipped
+// to `? 131 :` in a plugin CLI. A `authorized = false` -> `true` flip has been
+// stranded the same way before.
+//
+// These assert on STRUCTURE (file content, marker file, a `recovered` field in
+// --json), never on message prose, because the mutation gate rewrites string
+// literals and a test pinned to wording fails for the wrong reason.
+
+function createSlowRepo(dir) {
+  initRepo(dir);
+  mkdirSync(join(dir, 'src'));
+  mkdirSync(join(dir, 'test'));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'slow', type: 'module', private: true }));
+  writeFileSync(join(dir, 'src', 'thing.mjs'), [
+    'export function classify(n) {',
+    "  if (n > 10) return 'big';",
+    "  return 'small';",
+    '}',
+    '',
+    'export function scale(n) {',
+    '  return n * 2;',
+    '}',
+    '',
+  ].join('\n'));
+  writeFileSync(join(dir, 'test', 'thing.test.mjs'), [
+    "import { test } from 'node:test';",
+    "import assert from 'node:assert/strict';",
+    "import { classify, scale } from '../src/thing.mjs';",
+    "test('classify', () => {",
+    "  assert.equal(classify(50), 'big');",
+    "  assert.equal(classify(1), 'small');",
+    '});',
+    "test('scale', () => { assert.equal(scale(3), 6); });",
+    // Deliberately slow, so a signal lands while a trial is in flight rather than
+    // between them — the window this whole feature is about.
+    "test('slow', async () => { await new Promise((r) => setTimeout(r, 3000)); });",
+    '',
+  ].join('\n'));
+  commitAll(dir);
+  git(['checkout', '-b', 'feature'], dir);
+  const src = readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8');
+  writeFileSync(join(dir, 'src', 'thing.mjs'), src.replace('return n * 2;', 'return n * 2 + 0;'));
+  commitAll(dir, 'change');
+}
+
+const SLOW_TEST_CMD = 'node --test test/thing.test.mjs';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function startCli(dir) {
+  return spawn('node', [
+    BIN, '--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD,
+  ], { cwd: dir, stdio: 'ignore' });
+}
+
+/** Resolve once a mutant is actually written to disk, so the signal lands mid-trial. */
+async function waitForMutantOnDisk(dir, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (git(['status', '--porcelain'], dir).trim() !== '') return true;
+    await sleep(50);
+  }
+  return false;
+}
+
+function committedContent(dir) {
+  return git(['show', 'HEAD:src/thing.mjs'], dir);
+}
+
+for (const signal of ['SIGTERM', 'SIGHUP']) {
+  describe(`CLI: ${signal} mid-run restores the mutated file`, () => {
+    let dir;
+    before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-signal-')); createSlowRepo(dir); });
+    after(() => { rmSync(dir, { recursive: true, force: true }); });
+
+    it(`leaves no mutant behind when killed by ${signal}`, async () => {
+      const child = startCli(dir);
+      const exited = new Promise((r) => child.on('exit', r));
+      assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
+      child.kill(signal);
+      await exited;
+      await sleep(500);
+
+      assert.equal(
+        git(['status', '--porcelain'], dir).trim(),
+        '',
+        `${signal} stranded a mutant: ${git(['diff'], dir)}`,
+      );
+      assert.equal(readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8'), committedContent(dir));
+    });
+  });
+}
+
+describe('CLI: a mutant stranded by an unhandleable kill is recovered by the next run', () => {
+  let dir;
+  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-recover-')); createSlowRepo(dir); });
+  after(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('restores the file instead of blaming the user for a dirty tree', async () => {
+    const child = startCli(dir);
+    const exited = new Promise((r) => child.on('exit', r));
+    assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
+    // SIGKILL cannot be trapped: no handler can save this, only durable state can.
+    child.kill('SIGKILL');
+    await exited;
+    await sleep(300);
+    assert.notEqual(git(['status', '--porcelain'], dir).trim(), '', 'SIGKILL should have stranded a mutant');
+
+    const result = runCli(
+      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD, '--json'],
+      dir,
+    );
+
+    // It must NOT have bailed out as an operational error on a dirty tree.
+    assert.notEqual(result.status, 1, `refused to run instead of recovering: ${result.stderr}`);
+
+    const parsed = JSON.parse(result.stdout);
+    assert.ok(parsed.recovered, 'expected the run to report what it recovered');
+    assert.equal(parsed.recovered.file, 'src/thing.mjs');
+
+    assert.equal(readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8'), committedContent(dir));
+    assert.equal(git(['status', '--porcelain'], dir).trim(), '', 'run left the tree dirty');
   });
 });

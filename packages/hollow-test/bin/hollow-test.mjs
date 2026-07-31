@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // hollow-test — diff-scoped mutation gate (ADLC C4)
-// Refuses to run on a dirty working tree. Mutates files in place and
-// restores them via finally blocks + SIGINT handler.
+// Refuses to run on a dirty working tree. Mutates files in place and restores
+// them via finally blocks, a handler for every catchable termination signal, and
+// an on-disk in-flight record that the NEXT run recovers from when the kill was
+// not catchable at all.
 
-import { writeFileSync, realpathSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, unlinkSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { parseArgs, pass, gateFail, opError, printJson } from '@adlc/core';
 import { gitDiff, isDirty, isGitRepo, resolveBase, mutate, git, repoRoot } from '@adlc/core';
@@ -89,6 +91,109 @@ if (isNaN(timeoutMs) || timeoutMs < 1)   opError('--timeout-ms must be a positiv
 
 if (!isGitRepo(cwd)) {
   opError('not a git repository');
+}
+
+// ── recover a mutant stranded by an interrupted run ─────────────────────────
+//
+// MUST run before the dirty-tree refusal below, because the dirt is very often
+// OUR OWN. Every in-process restore path — the runner's finally, the signal
+// handlers — dies with the process, so a SIGKILL, an OOM kill or a power loss
+// mid-trial leaves a live mutant in the working tree as an unstaged edit. The
+// next run then refuses with "commit or stash first", which reads as if the
+// USER's work is in the way; the reflex is to commit it, and that is how a
+// mutant ships. Observed for real: a tool timeout stranded `? 130 :` flipped to
+// `? 131 :`, and an `authorized = false` -> `true` flip before that.
+//
+// So record the file and its ORIGINAL bytes on disk before each mutation, and
+// put them back here. The record lives in the git dir: never committed, and
+// per-worktree (`--git-dir` resolves to .git/worktrees/<name> in a linked
+// worktree), so parallel worktrees cannot recover each other's files.
+const INFLIGHT_NAME = 'adlc-hollow-test-inflight.json';
+
+let inflightPath = null;
+try {
+  inflightPath = resolve(cwd, git(['rev-parse', '--git-dir'], { cwd }).trim(), INFLIGHT_NAME);
+} catch {
+  // No git dir means no durable record; the signal handlers still apply.
+  inflightPath = null;
+}
+
+function clearInflight() {
+  if (inflightPath === null) return;
+  try {
+    if (existsSync(inflightPath)) unlinkSync(inflightPath);
+  } catch { /* best effort — never fail a run over bookkeeping */ }
+}
+
+function recordInflight(absolutePath, original) {
+  if (inflightPath === null) return;
+  try {
+    writeFileSync(
+      inflightPath,
+      JSON.stringify({ version: 1, pid: process.pid, file: absolutePath, original }),
+      'utf8',
+    );
+  } catch { /* best effort */ }
+}
+
+// EPERM means the pid exists but belongs to someone else — still alive.
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === 'EPERM';
+  }
+}
+
+function recoverInflight() {
+  if (inflightPath === null || !existsSync(inflightPath)) return null;
+  let record;
+  try {
+    record = JSON.parse(readFileSync(inflightPath, 'utf8'));
+  } catch {
+    clearInflight();
+    return null;
+  }
+  if (
+    record === null || typeof record !== 'object' || record.version !== 1 ||
+    typeof record.file !== 'string' || typeof record.original !== 'string'
+  ) {
+    clearInflight();
+    return null;
+  }
+  // A LIVE owner is a concurrent run, not a corpse. Restoring its file mid-trial
+  // would corrupt that run and could report its mutant as killed.
+  if (typeof record.pid === 'number' && record.pid !== process.pid && pidAlive(record.pid)) {
+    return null;
+  }
+  let current;
+  try {
+    current = readFileSync(record.file, 'utf8');
+  } catch {
+    clearInflight();
+    return null;
+  }
+  if (current === record.original) {
+    // The previous run restored it after all; the record is just litter.
+    clearInflight();
+    return null;
+  }
+  try {
+    writeFileSync(record.file, record.original, 'utf8');
+  } catch {
+    return null; // leave the record: a later run with permission can still fix it
+  }
+  clearInflight();
+  return { file: relative(cwd, record.file) || record.file, pid: record.pid ?? null };
+}
+
+const recoveredInflight = recoverInflight();
+if (recoveredInflight !== null && !useJson) {
+  console.warn(
+    `hollow-test: restored ${recoveredInflight.file} from an interrupted run ` +
+    `(pid ${recoveredInflight.pid}) — that edit was a mutant, not your work`,
+  );
 }
 
 if (isDirty(cwd)) {
@@ -403,12 +508,25 @@ function emergencyRestore() {
       // Best-effort — we're in a signal handler.
     }
   }
+  clearInflight();
 }
 
-process.on('SIGINT', () => {
-  emergencyRestore();
-  process.exit(1);
-});
+// EVERY catchable termination signal, not just Ctrl-C.
+//
+// SIGINT was the only one handled, and it is the one signal automation never
+// sends: `timeout(1)`, CI job cancellation, process supervisors and agent tool
+// timeouts all send SIGTERM, and closing a terminal sends SIGHUP. Both took the
+// default disposition — immediate death, no restore, mutant left on disk. The
+// handled signal was the one that mattered least.
+//
+// SIGKILL is deliberately absent because it cannot be caught; that case is what
+// the on-disk in-flight record above exists for.
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    emergencyRestore();
+    process.exit(1);
+  });
+}
 
 // ── mutation loop ────────────────────────────────────────────────────────────
 
@@ -439,9 +557,11 @@ for (const target of fileTargets) {
       continue;
     }
 
-    // Register for emergency SIGINT restore.
+    // Register for emergency restore twice over: in memory for a signal we can
+    // catch, and on disk for one we cannot.
     currentFilePath = target.absolutePath;
     currentOriginal = content;
+    recordInflight(target.absolutePath, content);
 
     const trial = runMutant(
       target.absolutePath,
@@ -452,9 +572,10 @@ for (const target of fileTargets) {
       cwd
     );
 
-    // Trial done; clear emergency state.
+    // Trial done; the file is restored, so clear both emergency records.
     currentFilePath = null;
     currentOriginal = null;
+    clearInflight();
 
     results.push({
       file: target.file,
@@ -516,7 +637,12 @@ const survivors = results.filter((r) => !r.killed && !r.invalid);
 const invalidMutants = results.filter((r) => r.invalid);
 
 if (useJson) {
-  printJson(buildJsonReport(results));
+  // `recovered` is reported as data, not just a log line, so a caller running
+  // --json can tell that this run began by cleaning up after an interrupted one.
+  printJson({
+    ...buildJsonReport(results),
+    ...(recoveredInflight !== null ? { recovered: recoveredInflight } : {}),
+  });
 } else {
   printTable(results);
 }
