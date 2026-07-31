@@ -91,6 +91,32 @@ export function orderLocalByDependency(tickets) {
   return order;
 }
 
+// Root + THIS checkout's own open segment (T-MANIFEST-FOREST), never any OTHER
+// lineage's — same scoping as reassign.mjs's planManifestMigration.
+//
+// allowRecovery: true (T-MANIFEST-FOREST, fourth round — supersedes the
+// round-2/round-3 strict-only reasoning) lets this find the segment even when
+// this checkout's own `.lineage` token is lost (fresh clone, or a branch
+// switch that overwrote it). Earlier rounds kept this strict because
+// publishing a GitHub label/comment is a remote trust-boundary mutation, and
+// the OLD recovery matched on the derived filename slug — a LOSSY,
+// attacker-controllable identity that could publish a FOREIGN lineage's
+// status as this branch's own. Recovery now matches on the EXACT `branch`
+// field every segment's first entry carries (spec §4.4) — non-lossy — but
+// exact identity is not authenticity (adversarial-review finding, round 2):
+// an UNSIGNED segment can still claim any branch by name. `key` is passed
+// through so readOwnChains filters recovered entries to only those that are
+// actually signature-verified, and disables recovery entirely when no key is
+// available (push has no field to mark a rendered label "unauthenticated"
+// the way doctor.mjs does, so an unverifiable recovery must not be trusted
+// at all here — see readOwnChains's own doc). A genuinely ambiguous recovery
+// (two committed segments both declaring this branch) propagates as a real
+// thrown error rather than silently rendering a status computed from root
+// alone, which could remove a real, earned status label.
+function readOwnChainsOrRefuse(adlcDir, cwd, key) {
+  return readOwnChains(adlcDir, { cwd, allowRecovery: true, key });
+}
+
 /** Serialize a ticket's body: prose + canonical block (or prose-only when no block). */
 function ticketBody(prose, block, key) {
   return block ? serializeBlock(prose, block, { key }) : `${prose.prefix ?? ''}${prose.suffix ?? ''}`;
@@ -142,14 +168,16 @@ export async function push({
   let expectedSnapshotHash = localState.hash;
   let expectedStoreAbsent = localState.absent;
   const sidecar = readSidecar(dir, { strict: write });
-  // Root + THIS checkout's own open segment (T-MANIFEST-FOREST), never any OTHER
-  // lineage's — same scoping as reassign.mjs's planManifestMigration, which this
-  // mirrors; readOwnChains's causal chain order plus outcomes.mjs's chain-position
-  // priority is what makes "latest per gate" meaningful once a ticket's evidence
-  // can live in more than one chain (adversarial-review finding: this used to read
-  // root only, so post-cutover P5 outcomes recorded in a segment never surfaced in
-  // push's rendered status).
-  let outcomes = reduceTicketOutcomes(manifestEntries ?? readOwnChains(join(dir, '.adlc'), { cwd: dir }));
+  // outcomes drives every label/comment this run publishes — see
+  // readOwnChainsOrRefuse's doc above for why recovery is safe here now, and
+  // why a genuinely ambiguous recovery must still refuse rather than silently
+  // render from root alone.
+  let outcomes;
+  try {
+    outcomes = reduceTicketOutcomes(manifestEntries ?? readOwnChainsOrRefuse(join(dir, '.adlc'), dir, key));
+  } catch (error) {
+    return { exitCode: 1, errors: [`cannot determine gate status: ${error.message}`] };
+  }
 
   // Mutable working state (reassignment rewrites tickets store-wide).
   let tickets = localTickets.map((t) => ({ ...t }));
@@ -202,7 +230,22 @@ export async function push({
       if (recoveredEvidence && manifestEntries === undefined) {
         // Re-read for the same reason as the initial load above (a resumed
         // migration just re-attested evidence, possibly into a segment).
-        outcomes = reduceTicketOutcomes(readOwnChains(join(dir, '.adlc'), { cwd: dir }));
+        // Same recover-or-refuse rule as the initial load — see
+        // readOwnChainsOrRefuse's doc above.
+        try {
+          outcomes = reduceTicketOutcomes(readOwnChainsOrRefuse(join(dir, '.adlc'), dir, key));
+        } catch (error) {
+          // Adversarial-review finding: a failure here used to just set `failed`
+          // and fall through into Pass 1/2, which still render remote labels and
+          // comments from the STALE pre-migration `outcomes` map. Since a resumed
+          // migration moves evidence from the local id to the GitHub id, the
+          // stale map commonly has NO entry for the now-current ticket id —
+          // renderAndPush would then remove a real status label and publish a
+          // false "no evidence recorded yet" comment, even though the function
+          // ultimately returns exitCode 1. Abort before any remote mutation
+          // instead: a status we cannot verify must never be published.
+          return { exitCode: 1, errors: [...errors, `cannot determine gate status after resuming evidence re-attestation: ${error.message}`] };
+        }
       }
     }
 

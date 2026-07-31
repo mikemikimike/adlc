@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sha256 } from '@adlc/core';
-import { recordTicketEvidence, resolveOpenSegment, segmentPath, readForestEntries, canonicalJson } from '@adlc/tickets';
+import { recordTicketEvidence, resolveOpenSegment, segmentPath, readForestEntries, canonicalJson, lineagePath } from '@adlc/tickets';
 import { reassignId, planManifestMigration, migrateManifestEvidence } from '../lib/reassign.mjs';
 
 // ---- reassignId (pure, store-wide edge rewrite) ----
@@ -228,13 +228,54 @@ test('migrateManifestEvidence routes to the segment writer once segmented — ro
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+// T-MANIFEST-FOREST lineage-durability finding — DELIBERATELY NOT "fixed" by
+// recovering here (distinct-provider adversarial-review finding, second round):
+// migrateSegmentedSet stays on readOwnChains's strict default (no allowRecovery),
+// never the slug-based recovery. Recovering across a lost `.lineage` token here
+// would re-sign whatever a lossy, attacker-controllable branch-slug match finds
+// as a FRESH re-attestation under the new id — a malicious branch could launder
+// an unrelated lineage's evidence into a validly-signed entry nobody actually
+// approved for this ticket.
+//
+// T-MANIFEST-FOREST, fourth round: migrateManifestEvidence now recovers real
+// evidence across a lost `.lineage` token (recoverOpenSegment matches on the
+// EXACT `branch` field every segment's first entry carries, not the lossy
+// filename slug — see recoverOpenSegment's own doc), so this no longer
+// strands T7's real evidence under the abandoned old id. A key is required
+// (recovery filters to only signature-verified entries — see readOwnChains's
+// own doc; an unsigned source is never trusted regardless of identity match).
+test('migrateManifestEvidence recovers real evidence across a lost .lineage token (fresh-clone/branch-switch case) — never strands it', () => {
+  const { root, dir } = gitRepo();
+  const KEY = 'reassign-recovery-key';
+  try {
+    activate(dir);
+    recordTicketEvidence(root, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T7',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: KEY,
+    });
+    rmSync(lineagePath(dir), { force: true });
+    const result = migrateManifestEvidence(root, 'T7', 'gh:acme/app#7', { now: '2026-06-27T00:00:00Z', key: KEY });
+    assert.equal(result.migrated, 1, 'a lost token must not hide real, committed evidence');
+    assert.equal(result.entries[0].data.migratedFrom, 'T7');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 // Adversarial-review finding: an UNSIGNED source entry (recorded without a key —
 // indistinguishable, on the wire, from an attacker's forgery written by anyone
 // with local filesystem access) must never be trusted as a genuine candidate to
 // re-attest once a signing key IS available at migration time. Without the
 // entrySigValid check, this function would sign the copied data FRESH under the
 // new id, laundering an unsigned claim into a validly HMAC-signed attestation.
-test('migrateManifestEvidence never signs a re-attestation sourced from an UNSIGNED entry, even in this checkout\'s own segment', () => {
+//
+// T-MANIFEST-FOREST, seventh round: this segment is entirely unsigned, and
+// readOwnChains now refuses the WHOLE read for an entirely-unsigned
+// token-matched segment when a key is available (not just filter out its
+// entries downstream) — a commit-capable attacker without the key could
+// otherwise append forged entries to a chain that simply never adopted
+// signing, and nothing would ever refuse it just because it's "always been
+// like that". This subsumes the original per-entry protection: the call
+// now refuses outright rather than silently returning 0 migrated sources.
+test('migrateManifestEvidence refuses (never signs) when this checkout\'s own segment is entirely unsigned but a key is available', () => {
   const { root, dir } = gitRepo();
   try {
     activate(dir);
@@ -245,10 +286,11 @@ test('migrateManifestEvidence never signs a re-attestation sourced from an UNSIG
       ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
     });
 
-    const result = migrateManifestEvidence(root, 'T7', 'gh:acme/app#9', {
-      now: '2026-06-27T00:00:00Z', key: 'migration-time-key',
-    });
-    assert.equal(result.migrated, 0, 'an unsigned source must never be laundered into a freshly signed attestation');
+    assert.throws(
+      () => migrateManifestEvidence(root, 'T7', 'gh:acme/app#9', { now: '2026-06-27T00:00:00Z', key: 'migration-time-key' }),
+      /has no signed entries/,
+      'an entirely unsigned segment must never be trusted for a fresh signed re-attestation, even for entries that individually fail their own check',
+    );
     const resolved = resolveOpenSegment(dir, { cwd: root });
     const raw = readFileSync(segmentPath(dir, resolved.name), 'utf8').trim().split('\n');
     assert.equal(raw.length, 1, 'nothing was appended for the refused migration');
@@ -298,6 +340,7 @@ test('migrateManifestEvidence mints a segment whose FIRST entry carries an ancho
     const raw = readFileSync(segmentPath(dir, resolved.name), 'utf8').trim().split('\n');
     const first = JSON.parse(raw[0]);
     assert.equal(Object.hasOwn(first, 'anchor'), true, 'the segment\'s first entry must carry the anchor');
+    assert.equal(first.branch, 'feat/reassign-test', 'the segment\'s first entry must also carry the exact minting branch (T-MANIFEST-FOREST, fourth round)');
     assert.equal(first.data.migratedFrom, 'T7', 'it re-attests the ROOT evidence forward, not a no-op mint');
     assert.equal(first.sigVersion, 2, 'an anchor-carrying entry must be signed at v2');
     const { sig: _sig, segment: _segment, ...signed } = first;

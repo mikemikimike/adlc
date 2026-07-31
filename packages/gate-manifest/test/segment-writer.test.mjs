@@ -8,7 +8,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, symlinkSync, chmodSync, renameSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import { appendManifestEntry as realAppendManifestEntry, record as realRecord } from '../lib/record.mjs';
 import { verify as realVerify } from '../lib/verify.mjs';
 import { discoverSegments, readManifestForest, segmentPath, ulidOf } from '../lib/forest.mjs';
-import { isSegmentedRepo, markerPath, lineagePath, resolveOpenSegment, deriveSlug, generateSegmentUlid, currentBranch } from '../lib/lineage.mjs';
+import { isSegmentedRepo, markerPath, lineagePath, resolveOpenSegment, recoverOpenSegment, deriveSlug, generateSegmentUlid, currentBranch } from '../lib/lineage.mjs';
 import { verifyEntrySig, KEY_ENV } from '../lib/sign.mjs';
 import { sha256 } from '@adlc/core';
 
@@ -396,6 +396,43 @@ describe('appendManifestEntry routes to the segment writer once segmented (spec 
     } finally { clean(root); }
   });
 
+  // T-MANIFEST-FOREST, fourth round: the first (anchor-carrying) entry must
+  // also carry the EXACT minting branch, alongside `anchor` — this is what
+  // recoverOpenSegment now matches on instead of the lossy filename slug.
+  it('the anchor-carrying first entry also carries the exact minting branch; continuation entries never do', () => {
+    const { root, dir } = gitRepo('feat/branch-field');
+    try {
+      activate(dir);
+      const first = appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const second = appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      assert.equal(first.branch, 'feat/branch-field');
+      assert.equal(Object.hasOwn(second, 'branch'), false);
+    } finally { clean(root); }
+  });
+
+  it('a detached-HEAD mint carries no branch field at all (not a null sentinel — there is no identity to record)', () => {
+    const { root, dir, g } = gitRepo();
+    try {
+      activate(dir);
+      g('checkout', '-q', '--detach', 'HEAD');
+      const entry = appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      assert.equal(Object.hasOwn(entry, 'branch'), false);
+    } finally { clean(root); }
+  });
+
+  it('the branch field is inside the signed byte range — tampering with it invalidates the v2 signature', () => {
+    const { root, dir } = gitRepo('feat/branch-signed');
+    try {
+      activate(dir);
+      withKey('branch-sig-key', () => {
+        const entry = appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+        assert.equal(entry.branch, 'feat/branch-signed');
+        const tampered = { ...entry, branch: 'feat/some-other-branch' };
+        assert.equal(verifyEntrySig('branch-sig-key', tampered), false, 'a forged branch claim must invalidate the signature');
+      });
+    } finally { clean(root); }
+  });
+
   it('a continuation entry (not the anchor-carrying first one) signs at the default v2, not some other version', () => {
     const { root, dir } = gitRepo();
     try {
@@ -431,6 +468,23 @@ describe('appendManifestEntry routes to the segment writer once segmented (spec 
       assert.throws(
         () => appendManifestEntry({ gate: 'evidence', anchor: { segment: 'root', seq: 1, lineHash: 'x' } }, dir, { cwd: root }),
         /reserved chain field: anchor/,
+      );
+    } finally { clean(root); }
+  });
+
+  // T-MANIFEST-FOREST, fourth round, adversarial-review finding: a caller-
+  // supplied `branch` used to be silently overwritten by (and, before that
+  // fix, could silently OVERWRITE) the writer's own `currentBranch()` value,
+  // since `normalized` (built from `...payload`) was spread AFTER the
+  // writer-computed `branch`. A payload claiming a false branch, once
+  // v2-signed, would authenticate a lie recoverOpenSegment later trusts.
+  it('reserved field "branch" is refused before it ever reaches the segment writer', () => {
+    const { root, dir } = gitRepo('feat/real-branch');
+    try {
+      activate(dir);
+      assert.throws(
+        () => appendManifestEntry({ gate: 'evidence', branch: 'main' }, dir, { cwd: root }),
+        /reserved chain field: branch/,
       );
     } finally { clean(root); }
   });
@@ -535,6 +589,316 @@ describe('appendManifestEntry routes to the segment writer once segmented (spec 
         () => appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root }),
         /could not acquire ledger lock/,
         'must retry the LOCK first (and time out on it), not fail fast on a stale-outside-the-lock verify() read',
+      );
+    } finally { clean(root); }
+  });
+});
+
+// recoverOpenSegment (T-MANIFEST-FOREST lineage-durability finding): peekOpenSegment
+// alone returns null whenever the local, gitignored `.lineage` token is absent or
+// stale — a fresh clone (the token never travels with `git clone`) or a checkout
+// that switched away and back to this branch (another branch's open-segment
+// resolution overwrites the single token file) — even when a real, COMMITTED
+// segment for this branch exists on disk. recoverOpenSegment adds a read-only
+// fallback: scan committed segments for one whose derived slug matches this
+// branch's, exact match only (never a prefix match, which would wrongly cross-match
+// e.g. branch "feat" against branch "feat-x"'s segment).
+describe('recoverOpenSegment (lineage-durability finding)', () => {
+  it('delegates to peekOpenSegment when the token is present and matches — identical result', () => {
+    const { root, dir } = gitRepo();
+    try {
+      activate(dir);
+      const first = appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const recovered = recoverOpenSegment(dir, { cwd: root });
+      assert.ok(recovered, 'the just-written segment must be found');
+      assert.equal(recovered.isNew, false);
+      const raw = readFileSync(segmentPath(dir, recovered.name), 'utf8').trim().split('\n');
+      assert.equal(JSON.parse(raw[0]).data?.transactionId, first.data?.transactionId ?? undefined);
+    } finally { clean(root); }
+  });
+
+  it('returns null when this branch genuinely has no segment yet (not an error)', () => {
+    const { root, dir } = gitRepo();
+    try {
+      activate(dir);
+      assert.equal(recoverOpenSegment(dir, { cwd: root }), null);
+    } finally { clean(root); }
+  });
+
+  it('AC1: finds a committed segment on a FRESH CLONE, which never has a local .lineage token', () => {
+    const { root, dir, g } = gitRepo('feat/clone-recovery');
+    let clonedRoot;
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const { valid } = discoverSegments(dir);
+      assert.equal(valid.length, 1, 'precondition: exactly one segment was minted');
+      // Commit the marker and the segment — NOT .lineage, which stays local per
+      // spec §4.8/§7 point 1, exactly like a real gitignored checkout.
+      g('add', '.adlc/manifest.d/.store.json', `.adlc/manifest.d/${valid[0]}`);
+      g('commit', '-q', '-m', 'segment evidence');
+
+      clonedRoot = mkdtempSync(join(tmpdir(), 'gate-manifest-clone-'));
+      execFileSync('git', ['clone', '-q', '--branch', 'feat/clone-recovery', root, clonedRoot], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const clonedDir = join(clonedRoot, '.adlc');
+      assert.equal(existsSync(lineagePath(clonedDir)), false, 'precondition: the fresh clone has no local .lineage token');
+
+      const recovered = recoverOpenSegment(clonedDir, { cwd: clonedRoot });
+      assert.ok(recovered, 'a fresh clone must still find its branch\'s committed segment');
+      assert.equal(recovered.name, valid[0]);
+    } finally {
+      clean(root);
+      if (clonedRoot) clean(clonedRoot);
+    }
+  });
+
+  it('AC2: a checkout switching A -> B -> A does not lose visibility into A\'s own segment, despite B overwriting the token', () => {
+    const { root, dir, g } = gitRepo('feat/branch-a');
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const { valid: segmentsOnA } = discoverSegments(dir);
+      assert.equal(segmentsOnA.length, 1);
+      const aSegment = segmentsOnA[0];
+
+      g('checkout', '-q', '-b', 'feat/branch-b');
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root }); // mints B's own segment, overwrites .lineage
+      const { valid: segmentsOnB } = discoverSegments(dir);
+      assert.equal(segmentsOnB.length, 2, 'precondition: branch B minted its own, separate segment');
+      const token = JSON.parse(readFileSync(lineagePath(dir), 'utf8'));
+      assert.equal(token.branch, 'feat/branch-b', 'precondition: the token now names B, not A');
+
+      g('checkout', '-q', 'feat/branch-a');
+      assert.equal(currentBranch(root), 'feat/branch-a', 'precondition: checked out back to A');
+      // peekOpenSegment alone would return null here: the token names branch B, not A.
+      const recovered = recoverOpenSegment(dir, { cwd: root });
+      assert.ok(recovered, 'recoverOpenSegment must find A\'s own segment despite the token now naming B');
+      assert.equal(recovered.name, aSegment, 'must resolve to A\'s real segment, never B\'s');
+    } finally { clean(root); }
+  });
+
+  it('AC3: refuses to guess when more than one committed segment declares this branch as its own', () => {
+    const { root, dir, g } = gitRepo('feat/ambiguous');
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const { valid: before } = discoverSegments(dir);
+      assert.equal(before.length, 1);
+      const slug = deriveSlug('feat/ambiguous');
+      // A second, independently-minted segment genuinely owned by the SAME branch —
+      // legitimate per spec §7 point 1 (two branches forked from the same rootless
+      // state can each mint independently without coordinating; the same branch can
+      // equally end up with two if a token was lost mid-stream and a second mint
+      // happened). Simulated here by hand-writing a second well-formed segment whose
+      // first entry declares the SAME `branch` field the real one does, then
+      // discarding the token so neither is preferred by the fast path.
+      const secondName = `${slug}-${generateSegmentUlid(Date.now() + 1000)}.jsonl`;
+      writeFileSync(
+        segmentPath(dir, secondName),
+        `${JSON.stringify({ seq: 1, gate: 'evidence', ts: new Date().toISOString(), data: {}, files: {}, prev: null, anchor: null, branch: 'feat/ambiguous' })}\n`,
+      );
+      g('add', `.adlc/manifest.d/${secondName}`);
+      g('commit', '-q', '-m', 'second ambiguous segment');
+      rmSync(lineagePath(dir), { force: true }); // no token to disambiguate
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /ambiguous/,
+        'must refuse to silently pick one of two candidate segments',
+      );
+    } finally { clean(root); }
+  });
+
+  it('a branch whose derived filename slug is a PREFIX of another branch\'s never cross-matches (exact `branch`-field match only)', () => {
+    const { root, dir, g } = gitRepo('feat');
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root }); // mints "feat-<ULID>.jsonl"
+      const { valid: onFeat } = discoverSegments(dir);
+      assert.equal(onFeat.length, 1);
+
+      g('checkout', '-q', '-b', 'feat-x'); // filename slug "feat-x" — "feat-" is a PREFIX of "feat-x-<ULID>.jsonl" too
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const { valid: onFeatX } = discoverSegments(dir);
+      assert.equal(onFeatX.length, 2);
+
+      g('checkout', '-q', 'feat');
+      rmSync(lineagePath(dir), { force: true }); // force recovery, not the fast token path
+      const recovered = recoverOpenSegment(dir, { cwd: root });
+      assert.ok(recovered, 'branch "feat" must still find its own segment');
+      assert.equal(recovered.name, onFeat[0], 'must resolve to "feat"\'s own segment, never "feat-x"\'s, despite the prefix overlap');
+    } finally { clean(root); }
+  });
+
+  it('returns null on detached HEAD — no branch identity to recover by', () => {
+    const { root, dir, g } = gitRepo();
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      g('checkout', '-q', '--detach', 'HEAD');
+      assert.equal(currentBranch(root), null, 'precondition: detached HEAD');
+      assert.equal(recoverOpenSegment(dir, { cwd: root }), null);
+    } finally { clean(root); }
+  });
+
+  // Adversarial-review finding, T-MANIFEST-FOREST sixth/seventh rounds:
+  // recovery used to read and split the WHOLE segment file just to inspect
+  // its first line, so scan cost grew with the total size of every
+  // discovered segment. A segment whose first entry alone exceeds the
+  // bounded-read cap must REFUSE (round 7 — never silently exclude it as
+  // "not a candidate", since nothing on the write side caps entry size, so
+  // a legitimately large evidence payload could hit this exact case and
+  // silently vanish from recovery the same way the original bug worked).
+  it('an oversized first entry (larger than the bounded read cap) makes recovery refuse, never silently excludes the segment', () => {
+    const { root, dir } = gitRepo('feat/oversized-first-entry');
+    try {
+      activate(dir);
+      const slug = deriveSlug('feat/oversized-first-entry');
+      const oversizedName = `${slug}-${generateSegmentUlid()}.jsonl`;
+      // A first "entry" whose JSON alone is well over 64 KiB — real segment
+      // entries are a few hundred bytes; nothing legitimate is ever this large.
+      const oversized = {
+        seq: 1, gate: 'evidence', ts: new Date().toISOString(), data: { padding: 'x'.repeat(200_000) },
+        files: {}, prev: null, anchor: null, branch: 'feat/oversized-first-entry',
+      };
+      writeFileSync(segmentPath(dir, oversizedName), `${JSON.stringify(oversized)}\n`);
+      rmSync(lineagePath(dir), { force: true });
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /exceeds the .+-byte bounded-read cap/,
+        'an oversized first entry must refuse the whole recovery attempt, not be silently excluded as a non-candidate',
+      );
+    } finally { clean(root); }
+  });
+
+  // Round 8 of the same finding: a MALFORMED (non-JSON) first entry hit the
+  // SAME silent-exclusion bug the oversized case above already closed —
+  // firstEntryOf's catch block returned `null` for a JSON.parse failure
+  // exactly like it does for a genuinely empty file, so recoverOpenSegment
+  // treated a corrupted segment as "not a candidate" instead of "cannot
+  // determine". A truncated write, disk fault, or malicious commit can
+  // produce exactly this shape; the branch is unknowable, not absent.
+  it('a malformed (non-JSON) first entry makes recovery refuse, never silently excludes the segment', () => {
+    const { root, dir } = gitRepo('feat/malformed-first-entry');
+    try {
+      activate(dir);
+      const slug = deriveSlug('feat/malformed-first-entry');
+      const malformedName = `${slug}-${generateSegmentUlid()}.jsonl`;
+      writeFileSync(segmentPath(dir, malformedName), '{not valid json at all\n');
+      rmSync(lineagePath(dir), { force: true });
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /first entry could not be read or parsed/,
+        'a malformed first entry must refuse the whole recovery attempt, not be silently excluded as a non-candidate',
+      );
+    } finally { clean(root); }
+  });
+
+  // firstEntryOf's OTHER catch — openSync itself failing — is a distinct code
+  // path from the JSON.parse failure above: discoverSegments already
+  // confirmed this name exists as a regular file at discovery time (its own
+  // lstatSync), so the only way open can still fail here is a permissions
+  // change or a TOCTOU race between discovery and this read. A chmod'd-
+  // unreadable file exercises exactly that gap deterministically.
+  it('a segment that exists but cannot be opened (permission denied) makes recovery refuse, never silently excludes it', { skip: process.platform === 'win32' }, () => {
+    const { root, dir } = gitRepo('feat/unreadable-first-entry');
+    try {
+      activate(dir);
+      const slug = deriveSlug('feat/unreadable-first-entry');
+      const unreadableName = `${slug}-${generateSegmentUlid()}.jsonl`;
+      const unreadablePath = segmentPath(dir, unreadableName);
+      writeFileSync(unreadablePath, `${JSON.stringify({ seq: 1, gate: 'evidence', ts: new Date().toISOString(), data: {}, files: {}, prev: null, anchor: null, branch: 'feat/unreadable-first-entry' })}\n`);
+      chmodSync(unreadablePath, 0o000);
+      rmSync(lineagePath(dir), { force: true });
+
+      try {
+        assert.throws(
+          () => recoverOpenSegment(dir, { cwd: root }),
+          /first entry could not be read or parsed/,
+          'a segment that cannot be opened must refuse the whole recovery attempt, not be silently excluded as a non-candidate',
+        );
+      } finally { chmodSync(unreadablePath, 0o644); } // restore before clean()'s rmSync
+    } finally { clean(root); }
+  });
+
+  // Round 9 of the same finding: recoverOpenSegment only ever scanned
+  // discoverSegments(dir).valid, silently ignoring .invalid — a real segment
+  // renamed to a bad-grammar name, replaced with a symlink, or otherwise
+  // turned into a non-conforming filesystem object became indistinguishable
+  // from "never existed", the same silent-exclusion bug already closed for
+  // oversized/malformed/unreadable first entries, just at the discovery
+  // layer instead of the read layer.
+  it('recoverOpenSegment refuses when an INVALID filesystem object exists under manifest.d/, never silently excludes it', () => {
+    const { root, dir } = gitRepo('feat/invalid-object-present');
+    try {
+      activate(dir);
+      appendManifestEntry({ gate: 'evidence' }, dir, { cwd: root });
+      const segDir = join(dir, 'manifest.d');
+      const segName = readdirSync(segDir).find((n) => n.endsWith('.jsonl'));
+      // Rename the real, valid segment to a bad-grammar name — discoverSegments
+      // now reports it under `invalid`, not `valid`.
+      renameSync(join(segDir, segName), join(segDir, 'not-a-conforming-name.jsonl.bak'));
+      rmSync(lineagePath(dir), { force: true });
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /non-conforming filesystem object/,
+        'an invalid object anywhere under manifest.d/ must refuse recovery, not be silently treated as absent',
+      );
+    } finally { clean(root); }
+  });
+
+  // Round 9 of the same finding: a genuinely EMPTY (zero-byte) segment file
+  // is not a legitimate "nothing here" state — this package's own
+  // verifyChain treats an empty segment as INVALID ("has no first entry to
+  // carry the required anchor"), since every real segment's mint atomically
+  // writes its anchor-carrying first entry. A zero-byte segment can only
+  // mean a crash between file creation and first append, or truncation.
+  it('recoverOpenSegment refuses when a real segment file exists but is empty, never silently excludes it', () => {
+    const { root, dir } = gitRepo('feat/empty-segment-present');
+    try {
+      activate(dir);
+      const slug = deriveSlug('feat/empty-segment-present');
+      const emptyName = `${slug}-${generateSegmentUlid()}.jsonl`;
+      writeFileSync(segmentPath(dir, emptyName), '');
+      rmSync(lineagePath(dir), { force: true });
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /first entry could not be read or parsed/,
+        'an empty segment file must refuse recovery, not be silently treated as a non-candidate',
+      );
+    } finally { clean(root); }
+  });
+
+  // Pins the EXACT bounded-read cap value (64 KiB), not just "very large":
+  // a first line whose JSON body is exactly 65536 bytes places its trailing
+  // newline at byte offset 65536 — the 65537th byte, one past a 65536-byte
+  // read window. A cap even one byte larger would read far enough to see
+  // that newline and successfully parse this line; the real cap must not.
+  it('the bounded-read cap is exactly 64 KiB: a first line whose newline sits one byte past it makes recovery refuse', () => {
+    const { root, dir } = gitRepo('feat/exact-cap-boundary');
+    try {
+      activate(dir);
+      const branch = 'feat/exact-cap-boundary';
+      const slug = deriveSlug(branch);
+      const boundaryName = `${slug}-${generateSegmentUlid()}.jsonl`;
+      const base = { seq: 1, gate: 'evidence', ts: '2026-01-01T00:00:00.000Z', data: { padding: '' }, files: {}, prev: null, anchor: null, branch };
+      const baseLength = JSON.stringify(base).length;
+      const CAP = 65536;
+      assert.ok(baseLength < CAP, 'precondition: padding must be able to grow, not shrink, to hit the cap exactly');
+      base.data.padding = 'x'.repeat(CAP - baseLength);
+      const firstLine = JSON.stringify(base);
+      assert.equal(firstLine.length, CAP, 'precondition: the first line body is exactly at the cap — its trailing newline is the (CAP+1)th byte');
+      writeFileSync(segmentPath(dir, boundaryName), `${firstLine}\n`);
+      rmSync(lineagePath(dir), { force: true });
+
+      assert.throws(
+        () => recoverOpenSegment(dir, { cwd: root }),
+        /exceeds the .+-byte bounded-read cap/,
+        'a first line landing its newline exactly one byte past the cap must refuse, not parse',
       );
     } finally { clean(root); }
   });

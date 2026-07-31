@@ -340,6 +340,45 @@ describe('carryForwardCrossModelReview (#365 B)', () => {
     } finally { clean(dir); }
   });
 
+  // T-MANIFEST-FOREST, fourth round: carry-forward now recovers a prior approve
+  // across a lost `.lineage` token (recoverOpenSegment matches on the EXACT
+  // `branch` field every segment's first entry carries, not the lossy filename
+  // slug — see recoverOpenSegment's own doc), so a fresh clone or a branch
+  // switch no longer forces a redundant fresh review. `prior`'s own signature
+  // is independently re-verified regardless of how it was found (below), so
+  // this stays safe against an unsigned/forged segment.
+  it('recovers a prior approve across a lost .lineage token (fresh-clone/branch-switch case) — still verifies its signature', () => {
+    const dir = gitLedger();
+    try {
+      activateSegments(dir);
+      seed(dir, rev(BASE1)); // lands in the newly-opened segment, writes .lineage
+      rmSync(join(dir, 'manifest.d', '.lineage'), { force: true });
+
+      const carried = carry(dir, rev(BASE1), rev(BASE2));
+      assert.equal(carried.data.revision, rev(BASE2));
+      assert.equal(carried.data.verdict, 'approve');
+      assert.equal(carried.data.carryDepth, 1);
+    } finally { clean(dir); }
+  });
+
+  // The signature check on the recovered entry is load-bearing, not incidental:
+  // an UNSIGNED segment (no key at record time) must still refuse, even though
+  // the branch field matches exactly — identity alone is not authenticity.
+  it('an exact branch match does NOT bypass signature verification — an unsigned recovered entry still refuses', () => {
+    const dir = gitLedger();
+    try {
+      activateSegments(dir);
+      withoutKey(() => seed(dir, rev(BASE1))); // lands in the segment, UNSIGNED
+      rmSync(join(dir, 'manifest.d', '.lineage'), { force: true });
+
+      assert.throws(
+        () => carry(dir, rev(BASE1), rev(BASE2)),
+        /not signature-verified/,
+        'an exact branch-field match must not substitute for a real signature check',
+      );
+    } finally { clean(dir); }
+  });
+
   // Adversarial-review finding: the "latest entry" lookup must be scoped to root +
   // THIS checkout's own segment ONLY — no total order exists across independent
   // lineages. An UNRELATED segment (never opened via this checkout's .lineage

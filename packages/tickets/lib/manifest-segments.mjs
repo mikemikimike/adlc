@@ -228,6 +228,39 @@ function chainIsIntact(lines, key = null) {
   return true;
 }
 
+// chainIsIntact deliberately tolerates a chain with an unsigned PREFIX (a
+// legacy chain that predates signing, or a repo that never adopted it — see
+// chainIsIntact's own callers): its rule is "once signed, stays signed
+// forward", which says nothing about entries BEFORE the first signature.
+// That tolerance is structurally correct (an honest chain really can adopt
+// signing partway through) but was wrong to also treat as a TRUST decision
+// (adversarial-review finding, T-MANIFEST-FOREST eighth round): a
+// commit-capable attacker without the key can plant an unsigned forged entry
+// FIRST, then have it laundered into trust by ANY later, unrelated, genuinely
+// signed append sharing the same chain — signing entry N proves only entry
+// N's own provenance, not that anyone reviewed an earlier unsigned entry's
+// content. Filtering to entries with a genuinely valid signature (rather than
+// merely checking "does at least one exist") closes this without
+// reintroducing the round 4/5 per-entry-filter bug: this filter only ever
+// runs AFTER chainIsIntact has already refused the whole read on any entry
+// with an INVALID signature, so every entry reaching this filter either has
+// a valid signature or was never signed at all — dropping the never-signed
+// ones cannot make a tampered entry silently disappear the way the round 4/5
+// bug did. Mirrors reassign.mjs's planManifestMigration, which already
+// applies this exact per-entry filter for the identical reason.
+//
+// No try/catch around JSON.parse here (mutation-gate: a mutant swallowing a
+// parse failure as "signed" survived, because there is no reachable input
+// that could ever trigger one): every caller runs chainIsIntact(lines, key)
+// first and only reaches this filter when it returned true, and
+// chainIsIntact's own loop already JSON.parses every one of these SAME
+// `lines` and returns false on the first failure — so by the time this
+// filter runs, all of `lines` is guaranteed parseable. A defensive catch
+// here would be untestable dead code, not a real safety net.
+function signedEntriesOnly(lines, key) {
+  return lines.filter((line) => entrySigValid(key, JSON.parse(line)));
+}
+
 /**
  * True iff root's chain AND every discovered segment's chain are each
  * internally intact (adversarial-review finding: a corrupted OTHER segment
@@ -271,13 +304,216 @@ export function readForestEntries(dir) {
  * root+own-segment scoping used by storeHashBindingCheck and
  * carryForwardCrossModelReview — no total order exists across UNRELATED
  * segments, so this deliberately never reads them.
+ *
+ * `allowRecovery` (T-MANIFEST-FOREST lineage-durability finding, default
+ * false — opt IN, not opt out): when true, falls back to recoverOpenSegment's
+ * exact `branch`-field scan when peekOpenSegment's token doesn't resolve a
+ * segment, so a fresh clone or a branch switch that overwrote `.lineage` does
+ * not silently look like "this branch has no segment" when a real, committed
+ * one exists on disk. Throws if the recovery scan finds more than one
+ * candidate — a READ must fail closed rather than guess; callers should let
+ * that propagate as a real failure, never swallow it into "no evidence".
+ *
+ * `key` gates recovery's TRUST, not just its identity match (adversarial-
+ * review finding, T-MANIFEST-FOREST fourth round, round 2): matching on the
+ * exact `branch` field only proves a segment CLAIMS to belong to this branch
+ * — that claim is only as trustworthy as its signature. Some consumers of
+ * this function (reassignment, carry-forward) already independently verify
+ * the SPECIFIC entries they mint a fresh signature from before trusting them
+ * — but push.mjs does not (it renders a display status straight from what
+ * this returns), so an unsigned, exact-branch-claiming forged segment could
+ * publish a fabricated P5 pass.
+ *
+ * The recovered segment's WHOLE chain is verified with `chainIsIntact`
+ * (round 2 of the SAME finding, not a per-entry filter): an earlier version
+ * of this fix dropped individually-invalid entries from the returned array
+ * rather than refusing the read. A tampered LATER entry (a real, once-signed
+ * "blocked"/revocation verdict edited by someone without the key, which
+ * invalidates its own signature) would simply vanish under a per-entry
+ * filter, leaving an EARLIER, still-validly-signed "clear" verdict as the
+ * apparent latest — resurrecting a stale pass past its own revocation.
+ * `chainIsIntact` enforces "once this chain has a signed entry, every LATER
+ * entry must also carry a valid signature" and throws the whole read out on
+ * any violation, the same whole-chain precondition reassignment
+ * (forestChainsIntact) and carry-forward (manifestChainTrustworthy) already
+ * require before trusting anything they read.
+ *
+ * When `key` is null, nothing can be verified, so recovery is disabled
+ * entirely and this degrades to the strict, token-only default — the same
+ * "cannot verify, cannot trust" boundary `doctor.mjs`'s
+ * `authenticated: key !== null` already expresses elsewhere. Every
+ * production consumer now opts in (closes the ticket's original AC1/AC2,
+ * superseding the third round's "nobody opts in" conclusion). The THIRD
+ * round correctly found that the OLD recoverOpenSegment matched on the
+ * derived filename slug — a LOSSY, CALLER-CONTROLLED identity (`deriveSlug`
+ * lowercases, collapses, and truncates, and nothing stops a branch from
+ * deriving the same slug as an unrelated committed segment's) — which made
+ * recovery unsafe for every consumer, informational or signing. Matching on
+ * the exact `branch` field instead (spec §4.4) closes the CROSS-BRANCH
+ * collision risk; whole-chain verification here closes the remaining
+ * FORGERY/TAMPERING risk.
+ *
+ * REFUSE, NEVER SILENTLY LOOK LIKE "NO EVIDENCE" (T-MANIFEST-FOREST, seventh
+ * round): two more situations used to fall through to `return [root]` as if
+ * genuinely nothing existed, when the truth was "cannot determine" — the
+ * exact same class of bug ambiguous recovery already refuses rather than
+ * guesses at. (1) `key === null` (a fully supported, common configuration —
+ * e.g. ordinary local dev without `ADLC_MANIFEST_KEY`) used to disable
+ * recovery outright; now it still checks whether a candidate segment
+ * EXISTS (never trusting its content) and refuses if one does, since a
+ * mutating consumer (reassignment) proceeding as if there's nothing to
+ * migrate can permanently strand real evidence under an abandoned ticket
+ * ID. (2) Detached HEAD (a common CI checkout shape) used to return `null`
+ * from recoverOpenSegment and get silently treated the same as "no
+ * segment"; now, if ANY committed segment exists anywhere in the repo, this
+ * refuses rather than assume none of them are ours.
  */
-export function readOwnChains(dir, { cwd = dirname(dir) } = {}) {
-  const root = parseLines(readRawLines(join(dir, 'manifest.jsonl')));
+export function readOwnChains(dir, { cwd = dirname(dir), allowRecovery = false, key = null } = {}) {
+  const rootRaw = readRawLines(join(dir, 'manifest.jsonl'));
+  // Root and a token-matched (peeked) segment are not identity-ambiguous the
+  // way a RECOVERED segment is — root is canonically root, and the local
+  // `.lineage` token is proof this checkout itself minted the peeked
+  // segment, not a self-reported claim from untrusted content. Both still
+  // get chainIsIntact's tamper/continuity check when a key is available
+  // (round 6 — push.mjs previously trusted root and a token-matched segment
+  // with NO verification at all, even with a real key passed in, so an
+  // attacker with commit-but-not-key access could append an unsigned forged
+  // entry there and have it published).
+  //
+  // AND (round 7 + round 8): once verified intact, only entries with a
+  // genuinely valid signature are handed back — never merely "at least one
+  // exists" (round 7's original check, closed further in round 8: see
+  // signedEntriesOnly's own doc for why an unsigned PREFIX can otherwise be
+  // laundered into trust by an unrelated later signature). Unlike the
+  // recovered path's identical requirement below, this is NOT about identity
+  // (root/peeked aren't self-claimed) — it is about not letting "this repo
+  // happens to have never signed anything yet" (or "not yet, for THIS
+  // entry") become "so nothing here needs signing, ever, even once a key
+  // exists."
+  let rootLines = rootRaw;
+  if (key !== null) {
+    if (!chainIsIntact(rootRaw, key)) {
+      throw new Error('root manifest failed chain or signature verification — refusing to trust it');
+    }
+    rootLines = signedEntriesOnly(rootRaw, key);
+    // Empty is not "unsigned" — a rootless segmented repo genuinely has
+    // nothing in root, which is not a forgery risk (nothing to distrust);
+    // only a NON-EMPTY chain with zero validly-signed entries is the concern.
+    if (rootRaw.length > 0 && rootLines.length === 0) {
+      throw new Error('root manifest has no signed entries — cannot authenticate it with the available key, refusing to trust it');
+    }
+  }
+  const root = parseLines(rootLines);
   if (!isSegmentedRepo(dir)) return [root];
   const peeked = peekOpenSegment(dir, { cwd });
-  if (!peeked) return [root];
-  return [root, parseLines(readRawLines(segmentPath(dir, peeked.name)))];
+  if (peeked) {
+    const peekedRaw = readRawLines(segmentPath(dir, peeked.name));
+    // Structural, not a trust decision (adversarial-review finding,
+    // T-MANIFEST-FOREST ninth round) — checked regardless of `key`: a
+    // segment this checkout's OWN token resolves to being zero bytes is not
+    // "nothing here" the way an empty ROOT legitimately can be. Every real
+    // segment's mint atomically writes its anchor-carrying first entry
+    // (gate-manifest's verifyChain: an empty segment "has no first entry to
+    // carry the required anchor"), so zero bytes here can only mean a crash
+    // between file creation and first append, or truncation/tampering.
+    if (peekedRaw.length === 0) {
+      throw new Error(`segment ${peeked.name} is empty — a real segment always has a first entry, refusing to trust it`);
+    }
+    let peekedLines = peekedRaw;
+    if (key !== null) {
+      if (!chainIsIntact(peekedRaw, key)) {
+        throw new Error(`segment ${peeked.name} failed chain or signature verification — refusing to trust it`);
+      }
+      peekedLines = signedEntriesOnly(peekedRaw, key);
+      // peekedRaw is never empty here — the unconditional check above already
+      // refused an empty segment before this point is reached.
+      if (peekedLines.length === 0) {
+        throw new Error(`segment ${peeked.name} has no signed entries — cannot authenticate it with the available key, refusing to trust it`);
+      }
+    }
+    return [root, parseLines(peekedLines)];
+  }
+  if (!allowRecovery) return [root];
+
+  // Beyond this point the token is missing and we are attempting recovery.
+  // Two more ways this used to silently look like "no evidence" instead of
+  // "cannot determine" (adversarial-review finding, T-MANIFEST-FOREST
+  // seventh round) — both get the SAME treatment as an ambiguous recovery
+  // match: refuse outright, since a mutating consumer (reassignment) that
+  // proceeds as if there's nothing to migrate can permanently strand real
+  // evidence under an abandoned ticket ID, and push can wrongly remove a
+  // real status label.
+  const branch = currentBranch(cwd);
+  if (branch === null) {
+    // Detached HEAD — a common CI checkout shape (e.g. a PR SHA checked out
+    // directly) — has no branch identity to check candidates against AT
+    // ALL. If ANY committed segment exists anywhere in this repo, we cannot
+    // rule out that one belongs to us; only a genuinely segment-free forest
+    // is safe to treat as "nothing to miss".
+    if (discoverSegments(dir).valid.length > 0) {
+      throw new Error(
+        'cannot identify this checkout\'s own segment: detached HEAD has no branch identity to recover by, '
+        + 'and committed segments exist — refusing to treat them as absent'
+      );
+    }
+    return [root];
+  }
+  if (key === null) {
+    // A known branch, but nothing can be signature-verified. Check
+    // EXISTENCE only via recoverOpenSegment — never trust its content for
+    // this purpose, only whether a plausible candidate exists at all — the
+    // same "existence check, not a trust decision" pattern used by
+    // reassign.mjs before this logic moved into the shared primitive.
+    let candidateExists;
+    try { candidateExists = recoverOpenSegment(dir, { cwd }) !== null; }
+    catch { candidateExists = true; } // ambiguous match — still a candidate, still refuse
+    if (candidateExists) {
+      throw new Error(
+        'a candidate segment for this branch exists but cannot be verified without a signing key — '
+        + 'refusing to treat it as absent'
+      );
+    }
+    return [root];
+  }
+
+  const recovered = recoverOpenSegment(dir, { cwd });
+  if (!recovered) return [root];
+  // WHOLE-CHAIN verification, not a per-entry filter (adversarial-review
+  // finding, T-MANIFEST-FOREST fourth round, round 2): filtering out entries
+  // that individually fail entrySigValid used to silently DROP them from the
+  // returned chain rather than refusing the read. A tampered LATER entry
+  // (e.g. a real, signed "blocked"/revocation verdict edited by someone
+  // without the key, invalidating its own signature) would vanish, leaving
+  // an EARLIER, still-validly-signed "clear" verdict as if it were the
+  // latest — resurrecting a stale pass past its own revocation. chainIsIntact
+  // enforces "once this chain has a signed entry, every LATER entry must also
+  // carry a valid signature" (see its own doc) — the SAME whole-chain
+  // precondition reassignment (forestChainsIntact) and carry-forward
+  // (manifestChainTrustworthy) already require before trusting anything they
+  // read; push.mjs was the one consumer with no such precondition of its own,
+  // which is why this belongs in the shared primitive, not each caller.
+  //
+  // chainIsIntact alone is NOT sufficient here, though (round 5 of the same
+  // finding): it deliberately tolerates a chain with an unsigned PREFIX —
+  // that legacy-unsigned-prefix tolerance is correct for
+  // forestChainsIntact's write-time precondition on a segment THIS checkout
+  // already owns via a valid token, but a RECOVERED segment is untrusted
+  // input claiming an identity this checkout never verified. An attacker
+  // without the key can trivially hand-write an entirely unsigned segment
+  // that is perfectly hash-chain-consistent and passes chainIsIntact — so
+  // recovery filters to entries with a genuinely valid signature (round 8:
+  // not merely "at least one exists" — see signedEntriesOnly's own doc for
+  // why a lone later signature must not launder an earlier unsigned forged
+  // entry into trust).
+  const rawLines = readRawLines(segmentPath(dir, recovered.name));
+  if (!chainIsIntact(rawLines, key)) {
+    throw new Error(`recovered segment ${recovered.name} failed chain or signature verification — refusing to trust it`);
+  }
+  const signedRecovered = signedEntriesOnly(rawLines, key);
+  if (signedRecovered.length === 0) {
+    throw new Error(`recovered segment ${recovered.name} failed chain or signature verification — refusing to trust it`);
+  }
+  return [root, parseLines(signedRecovered)];
 }
 
 // SECURITY: `.store.json` is repository-TRACKED, so a malicious branch can
@@ -354,13 +590,19 @@ function encodeUlidPart(value, width) {
   }
   return output;
 }
-function generateSegmentUlid(now = Date.now(), entropy = randomBytes(10)) {
+// Mirrors @adlc/gate-manifest/lib/lineage.mjs's identical validation: this was
+// previously internal-only, so a caller-supplied `now`/`entropy` was always this
+// file's own well-formed value; now exported (lineage-durability test fixtures
+// need it directly), the same guards apply as the sibling this mirrors.
+export function generateSegmentUlid(now = Date.now(), entropy = randomBytes(10)) {
+  if (!Number.isSafeInteger(now) || now < 0 || now > 0xffffffffffff) throw new RangeError('ULID timestamp out of range');
+  if (!Buffer.isBuffer(entropy) || entropy.length !== 10) throw new TypeError('ULID entropy must be 10 bytes');
   const random = BigInt(`0x${entropy.toString('hex')}`);
   return `${encodeUlidPart(BigInt(now), 10)}${encodeUlidPart(random, 16)}`;
 }
 
 // spec §7.1 slug derivation — mirrors gate-manifest/lib/lineage.mjs's deriveSlug exactly.
-function deriveSlug(branchName) {
+export function deriveSlug(branchName) {
   const lowered = String(branchName ?? '').toLowerCase();
   const substituted = lowered.replace(/[^a-z0-9-]+/g, '-');
   const collapsed = substituted.replace(/-+/g, '-').replace(/^-+|-+$/g, '');
@@ -368,7 +610,7 @@ function deriveSlug(branchName) {
   return truncated || 'segment';
 }
 
-function currentBranch(cwd) {
+export function currentBranch(cwd) {
   try {
     const out = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     return out === '' || out === 'HEAD' ? null : out; // detached HEAD never matches a cached token
@@ -443,13 +685,181 @@ export function peekOpenSegment(dir, { cwd = dirname(dir) } = {}) {
   return null;
 }
 
+// Read ONLY the first line of a segment (its anchor-carrying entry) — a
+// BOUNDED read, not readRawLines (adversarial-review finding, T-MANIFEST-
+// FOREST sixth round): the original version read and split the WHOLE
+// segment file just to inspect its first line — recoverOpenSegment's
+// per-candidate scan cost grew with the TOTAL size of every discovered
+// segment, not just the bytes actually needed. discoverSegments already
+// rejects symlinks before a name ever reaches here, so no O_NOFOLLOW
+// hardening is needed the way readBoundedJsonNoFollow's (.lineage/
+// .store.json) needs it. Mirrors @adlc/gate-manifest/lib/lineage.mjs's
+// identical helper.
+const MAX_FIRST_LINE_BYTES = 65536; // generous headroom; a real first entry is a few hundred bytes
+// Distinguishes "no first entry / malformed" (null — genuinely absent, safe
+// to treat as a non-candidate) from "first entry exists but exceeds the
+// bounded-read cap" (adversarial-review finding, T-MANIFEST-FOREST seventh
+// round): nothing on the write side caps entry size, so a legitimately large
+// evidence payload (a big `data` object or `files` map) could exceed 64 KiB
+// and previously vanished from recovery exactly like the original
+// lost-token bug, just via a different mechanism. recoverOpenSegment (below)
+// refuses instead of silently excluding an oversized segment as a candidate.
+const OVERSIZED_FIRST_ENTRY = Symbol('oversized-first-entry');
+// Returns a parsed first entry, or one of two "cannot determine, refuse"
+// sentinels — never `null` (adversarial-review finding, T-MANIFEST-FOREST
+// ninth round): a genuinely EMPTY file used to return `null` on the theory
+// that empty is always safe, but `firstEntryOf` is only ever called on a
+// name `discoverSegments` already confirmed exists as a real, discovered
+// segment file — an EXISTING segment being zero bytes is not "nothing to
+// see", it's the same anomaly gate-manifest's own verifyChain treats as
+// invalid ("empty segment file has no first entry to carry the required
+// anchor"): every real segment's mint atomically writes its anchor-carrying
+// first entry, so zero bytes can only mean a crash between file creation
+// and first append, or truncation/tampering. Folded into
+// MALFORMED_FIRST_ENTRY rather than given a third sentinel — the caller's
+// response (refuse, cannot safely exclude as a non-candidate) is identical
+// either way. Unreadable (open failure) and unparseable (JSON.parse
+// failure) get the same treatment for the same underlying reason:
+// discoverSegments already confirmed this name exists, so any failure past
+// that point is unexpected and unsafe to treat as absence.
+const MALFORMED_FIRST_ENTRY = Symbol('malformed-first-entry');
+function firstEntryOf(dir, segmentName) {
+  let fd;
+  try {
+    fd = openSync(segmentPath(dir, segmentName), fsConstants.O_RDONLY);
+  } catch {
+    return MALFORMED_FIRST_ENTRY;
+  }
+  try {
+    const buf = Buffer.alloc(MAX_FIRST_LINE_BYTES);
+    const bytesRead = readSync(fd, buf, 0, MAX_FIRST_LINE_BYTES, 0);
+    const chunk = buf.subarray(0, bytesRead).toString('utf8');
+    const newlineIndex = chunk.indexOf('\n');
+    if (newlineIndex === -1 && bytesRead >= MAX_FIRST_LINE_BYTES) return OVERSIZED_FIRST_ENTRY;
+    const firstLine = newlineIndex === -1 ? chunk : chunk.slice(0, newlineIndex);
+    if (firstLine.trim() === '') return MALFORMED_FIRST_ENTRY;
+    return JSON.parse(firstLine);
+  } catch {
+    return MALFORMED_FIRST_ENTRY;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Read-only recovery for callers that need "what evidence exists for MY
+ * branch" to survive a fresh clone or a branch switch that overwrote
+ * `.lineage` (T-MANIFEST-FOREST lineage-durability finding): `.lineage` is
+ * deliberately gitignored, so peekOpenSegment alone returns null in exactly
+ * those cases even when a real, COMMITTED segment for this branch exists on
+ * disk.
+ *
+ * IDENTITY (T-MANIFEST-FOREST, fourth round — supersedes the original
+ * slug-based version of this function): matches on the EXACT `branch` field
+ * every segment's first entry now carries (spec §4.4), never the derived
+ * FILENAME slug. `deriveSlug` is lossy by design (lowercases, collapses,
+ * truncates at 40 chars) purely so it makes a legible filename component —
+ * branch `feat/x` and a literal branch named `feat-x` derive the identical
+ * slug, so slug-based matching could recover (or, worse for a signing
+ * consumer, launder) an unrelated branch's segment as this branch's own. The
+ * `branch` field is the exact Git ref string, part of the entry's own signed
+ * content once a key is configured (an anchor-carrying entry is always
+ * v2-signed — spec §4.4), so recovery here is bounded to the SAME trust tier
+ * the segment's content already carries: cryptographically exact when
+ * signed, best-effort hash-chain-only when not, same as every other read in
+ * this codebase (see doctor's `authenticated: key !== null`). A caller that
+ * needs the recovered content to feed a FRESH signature (reassignment,
+ * carry-forward) already independently verifies the specific entries it
+ * reads (entrySigValid/verifyEntrySig) before trusting them — this function
+ * only answers "which FILE is mine", not "is its content trustworthy".
+ *
+ * Segments minted BEFORE this change carry no `branch` field and are simply
+ * never matched here — they remain reachable only via a still-valid
+ * `.lineage` token (peekOpenSegment). This is a deliberate, honest scope
+ * boundary, not an oversight: recovery becomes reliable going forward without
+ * a disruptive rewrite of already-committed segments (tracked as a follow-up
+ * — T-01KYTQ4BADHSDJNBFNZHB2ZG5V).
+ *
+ * ALSO deliberately out of scope: resolveOpenSegment (below) never consults
+ * this function, so a WRITE that happens before any read on a fresh clone
+ * (token absent) mints a fresh segment rather than continuing a real,
+ * unambiguous, already-committed one for this branch — and once that fresh
+ * segment's token exists, peekOpenSegment's fast path means this function
+ * never scans further, permanently hiding the older evidence again for the
+ * rest of that checkout's lifetime. Same follow-up ticket.
+ *
+ * NEVER mints (like peekOpenSegment) and NEVER guesses among multiple
+ * candidates: a writer resolving where to APPEND must stay precise
+ * (resolveOpenSegment, below, deliberately does not use this), but a reader
+ * recovering "what's already there" must not silently guess either — two
+ * branches forked from the same rootless state can legitimately mint
+ * independent segments without coordinating (spec §7 point 1), and the SAME
+ * branch can equally end up with two (a token lost mid-stream, then a second
+ * mint) — picking one at random could silently ignore genuine evidence in the
+ * other. Throws in that case; callers must fail closed, never report "no
+ * evidence" when the truth is "ambiguous". Mirrors
+ * @adlc/gate-manifest/lib/lineage.mjs's identical function.
+ *
+ * @returns {{ name: string, isNew: false }|null}
+ * @throws {Error} when more than one committed segment's first entry declares
+ *   this branch and the local token does not disambiguate
+ */
+export function recoverOpenSegment(dir, { cwd = dirname(dir) } = {}) {
+  const peeked = peekOpenSegment(dir, { cwd });
+  if (peeked) return peeked;
+  const branch = currentBranch(cwd);
+  if (branch === null) return null; // detached HEAD: no branch identity to recover by
+  const discovered = discoverSegments(dir);
+  // adversarial-review finding, T-MANIFEST-FOREST ninth round: this used to
+  // scan ONLY `.valid`, silently ignoring `.invalid` — a real segment
+  // renamed to a bad-grammar name, replaced with a symlink, or otherwise
+  // turned into a non-conforming filesystem object became indistinguishable
+  // from "never existed", exactly the class of silent exclusion already
+  // closed for oversized/malformed first entries below, just one layer up.
+  // forestChainsIntact (the write-time precondition) already refuses the
+  // whole forest on ANY invalid object anywhere; recovery must match that
+  // fail-closed contract rather than quietly proceed as if nothing is wrong.
+  if (discovered.invalid.length > 0) {
+    throw new Error(
+      `manifest.d/ contains ${discovered.invalid.length} non-conforming filesystem object(s) `
+      + `(${discovered.invalid.map((i) => i.name).sort().join(', ')}) — one could be a disguised or `
+      + `tampered segment belonging to this branch, so recovery refuses rather than guess`
+    );
+  }
+  const candidates = [];
+  for (const name of discovered.valid) {
+    const first = firstEntryOf(dir, name);
+    if (first === OVERSIZED_FIRST_ENTRY) {
+      throw new Error(
+        `segment ${name}'s first entry exceeds the ${MAX_FIRST_LINE_BYTES}-byte bounded-read cap — `
+        + `its branch cannot be determined, so it cannot be safely excluded as a candidate either; refusing to guess`
+      );
+    }
+    if (first === MALFORMED_FIRST_ENTRY) {
+      throw new Error(
+        `segment ${name}'s first entry could not be read or parsed — `
+        + `its branch cannot be determined, so it cannot be safely excluded as a candidate either; refusing to guess`
+      );
+    }
+    if (first?.branch === branch) candidates.push(name);
+  }
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1) {
+    throw new Error(
+      `ambiguous: ${candidates.length} committed segments declare branch "${branch}" as their own `
+      + `(${candidates.sort().join(', ')}) and no local .lineage token disambiguates them — refusing to guess`
+    );
+  }
+  return { name: candidates[0], isNew: false };
+}
+
 /**
  * Resolve which segment the next ticket-evidence append should target,
  * mirroring @adlc/gate-manifest/lib/lineage.mjs's resolveOpenSegment (spec
  * §7.1) so both producers share the SAME open segment for one branch rather
  * than each minting their own.
  *
- * @returns {{ name: string, isNew: boolean, anchor?: object|null }}
+ * @returns {{ name: string, isNew: boolean, anchor?: object|null, branch?: string }}
  */
 export function resolveOpenSegment(dir, { cwd = dirname(dir) } = {}) {
   const peeked = peekOpenSegment(dir, { cwd });
@@ -467,5 +877,8 @@ export function resolveOpenSegment(dir, { cwd = dirname(dir) } = {}) {
   const slug = deriveSlug(branch ?? '');
   const name = `${slug}-${ulid}.jsonl`;
   if (branch !== null) writeLineageToken(dir, { segment: name, ulid, branch });
-  return { name, isNew: true, anchor };
+  // branch is omitted (not `null`) on a detached-HEAD mint — see
+  // gate-manifest/lib/lineage.mjs's identical resolveOpenSegment for why no
+  // sentinel is needed the way anchor:null needs one.
+  return { name, isNew: true, anchor, ...(branch !== null ? { branch } : {}) };
 }

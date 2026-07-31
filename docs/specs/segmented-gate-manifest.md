@@ -99,6 +99,56 @@ reject payloads that supply it.
 The anchor is inside the signed byte range (v2 signs all fields), so a signed
 anchor cannot be repointed without invalidating its signature.
 
+### 4.4a Branch identity (lineage-durability, added post-slice-3)
+
+Alongside `anchor`, a segment's first entry SHOULD also carry a top-level
+`branch` field naming the EXACT Git branch that minted it — the value
+`currentBranch()` returned at mint time, unmodified (never the derived
+filename slug from §4.2, which is lossy: lowercased, collapsed, and truncated
+to 40 chars, so distinct branches can share one). `branch` is omitted (not a
+`null` sentinel) when the segment was minted from a detached HEAD, which has
+no branch identity to record.
+
+`.adlc/manifest.d/.lineage` is local and gitignored (§4.8) — it never travels
+with a clone and is overwritten whenever the checkout switches to a different
+branch with its own open segment. `branch` is what lets a reader recover
+"which committed segment is mine" without it: `recoverOpenSegment` scans
+every segment's first entry for an EXACT `branch` match, never a filename-slug
+match. Because `branch` sits inside the signed byte range on any entry
+carrying `sigVersion: 2` (forced whenever `anchor` is present, per above), a
+caller with the signing key can trust a recovered segment's claimed identity
+as much as it trusts any other signed field — a colliding derived slug is no
+longer a reachable attack, only a colliding EXACT branch name, which is a
+different git ref by construction. Segments minted before this field existed
+simply never match `recoverOpenSegment`'s scan; they remain reachable only via
+a still-valid `.lineage` token.
+
+Exact identity is not authenticity: `recoverOpenSegment` itself (gate-manifest
+and tickets alike) only matches on the `branch` field's value and does not
+verify a signature — a caller must decide, from its OWN context, whether that
+matters. `@adlc/tickets`' `readOwnChains(dir, {allowRecovery: true, key})`
+does: when `key` is non-null, entries from a recovered (not token-matched)
+segment are filtered to only those passing `entrySigValid(key, entry)`, so an
+unsigned segment that merely claims the right branch cannot get its content
+trusted; when `key` is null, nothing can be verified, so recovery is disabled
+entirely and this falls back to root-only. Consumers that mint a FRESH
+signature from recovered content (reassignment, cross-model carry-forward)
+independently re-verify the specific entries they use regardless of this
+filter — belt-and-suspenders, since those paths do not all go through
+`readOwnChains`.
+
+Two gaps remain, deliberately deferred to a follow-up
+(T-01KYTQ4BADHSDJNBFNZHB2ZG5V) rather than folded into this same change: (1)
+`resolveOpenSegment` (the WRITE side) never consults `recoverOpenSegment` — a
+write that happens before any read on a fresh clone mints a fresh segment
+rather than continuing a real, unambiguous, already-committed one for this
+branch, and once that fresh segment's token exists, recovery's fast path
+never scans further, permanently hiding the older evidence again; (2)
+segments minted before this field existed have no `branch` field and gain
+nothing from this mechanism — the original evidence-loss bug persists
+unchanged for all pre-existing segment history until a migration/re-
+attestation ceremony (or an authenticated lineage index) is designed.
+
 ### 4.5 Cutover entry (root, last entry)
 
 Recorded by the ceremony as the final root entry, always signed:
@@ -215,7 +265,9 @@ When the repo is segmented (§4.7), `appendManifestEntry`:
    its recorded lineage ULID matches, **and** the current Git branch equals the
    token's branch (detached HEAD never matches). Any mismatch mints a new
    segment: generate ULID, derive slug, and anchor its first entry (per §4.4)
-   to the current head line of the root if a root exists, else `anchor: null`.
+   to the current head line of the root if a root exists, else `anchor: null`
+   — and, per §4.4a, carry the exact minting branch as that entry's `branch`
+   field, so a reader can recover this segment later without a live token.
    The writer never chases the token's previously-named segment, or any other
    segment, as a fallback anchor target: two branches forked from the same
    root-less state legitimately mint independent `anchor: null` segments

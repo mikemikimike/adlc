@@ -20,7 +20,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,9 @@ import { pull } from '../lib/pull.mjs';
 import { push } from '../lib/push.mjs';
 import { serializeBlock } from '../lib/block.mjs';
 import { githubProvider } from '../lib/providers/github.mjs';
+import { createHmac } from 'node:crypto';
+import { recordTicketEvidence, segmentPath, canonicalJson } from '@adlc/tickets';
+import { sha256 } from '@adlc/core';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // The REAL consumer gate, resolved from the repo root (packages/ticket-sync/test → root).
@@ -337,6 +340,201 @@ test('pull still deletes a block field the remote dropped', async () => {
       .tickets.find((t) => t.id === id);
     assert.equal(ticket.category, undefined, 'a block field absent remotely is still cleared');
     assert.equal(ticket.completed, true, 'while local-only state is untouched');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// T-MANIFEST-FOREST, fourth round: push now recovers real evidence across a
+// lost `.lineage` token (recoverOpenSegment matches on the EXACT `branch`
+// field every segment's first entry carries, not the lossy filename slug —
+// see recoverOpenSegment's own doc), so it no longer wrongly refuses (or,
+// pre-round-3, wrongly rendered a stale root-only status) when a real,
+// committed segment holds real evidence — the exact scenario the original
+// ticket named: a fresh CI checkout of a branch with committed segment
+// evidence. A real signing key is required throughout: exact identity is not
+// authenticity (round-4 adversarial-review finding) — recovery filters to
+// only signature-verified entries, so an unsigned segment publishes nothing.
+test('push recovers real evidence across a lost .lineage token (fresh-clone/branch-switch case) — publishes the REAL status, not a stale/missing one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ticket-sync-push-recovery-'));
+  const KEY = 'push-recovery-key';
+  try {
+    git(dir, ['init', '-q', '-b', 'feat/push-recovery']);
+    git(dir, ['config', 'user.email', 'a@b.c']);
+    git(dir, ['config', 'user.name', 'x']);
+    mkdirSync(join(dir, '.adlc'), { recursive: true });
+    writeFileSync(
+      join(dir, '.adlc', 'tickets.json'),
+      `${JSON.stringify({ tickets: [{ id: 'T1', title: 'Do the thing', scope: ['src/**'], duration: 1 }] }, null, 2)}\n`,
+    );
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+    writeFileSync(join(dir, '.adlc', 'config.json'), JSON.stringify(PUSH_CONFIG));
+
+    // Segment first, THEN cut over — mirrors gitStoreWithSegmentedEvidence's fixture
+    // shape elsewhere in this package's tests.
+    mkdirSync(join(dir, '.adlc', 'manifest.d'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+    // Mints the segment's first (anchor + branch carrying) entry, v2-signed.
+    recordTicketEvidence(dir, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T1',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: KEY,
+    });
+    // A REAL, v2-signed P5 pass for T1, hand-appended as the segment's second
+    // entry — this is the evidence a lost token must not hide from
+    // outcomes.mjs's status reduction. Root stays untouched (rootless
+    // segmented repo), so a fallback to root-only would find NOTHING for T1,
+    // not merely a stale value.
+    const segDir = join(dir, '.adlc', 'manifest.d');
+    const segName = readdirSync(segDir).find((n) => n.endsWith('.jsonl'));
+    const segPath = segmentPath(join(dir, '.adlc'), segName);
+    const firstRawLine = readFileSync(segPath, 'utf8').trim().split('\n')[0];
+    const p5 = {
+      seq: 2, gate: 'prosecution', ts: '2026-06-01T00:00:00Z', ticket: 'T1',
+      data: { verdict: 'clear' }, files: {}, prev: sha256(firstRawLine), sigVersion: 2,
+    };
+    p5.sig = createHmac('sha256', KEY).update(canonicalJson(p5)).digest('hex');
+    writeFileSync(segPath, `${firstRawLine}\n${JSON.stringify(p5)}\n`);
+    // Discard the token — this checkout can no longer identify its own segment
+    // by token, only by the exact `branch` field the segment's first entry
+    // carries, even though a real committed segment (with real evidence) exists
+    // on disk.
+    rmSync(join(dir, '.adlc', 'manifest.d', '.lineage'), { force: true });
+
+    const gh = fakeGitHub();
+    const r = await push({ dir, provider: githubProvider(), runner: gh.runner, write: true, now: 'T', uuid: () => 'K', key: KEY });
+    assert.equal(r.exitCode, 0, `must recover and succeed, never refuse: ${JSON.stringify(r.errors)}`);
+    assert.ok(
+      gh.state.issues[0].labels.includes('adlc:passed'),
+      `recovered p5-pass evidence must be published — a lost token must never publish a missing/stale status instead: ${JSON.stringify(gh.state.issues[0]?.labels)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The forgery this exists to prevent (round-4/round-5 adversarial-review
+// findings): exact branch matching proves identity, not authenticity. An
+// ENTIRELY UNSIGNED segment claiming the right branch, with a hand-planted
+// "clear" P5 verdict, must never get published — even though push has a
+// real key available and the branch field matches perfectly. It refuses
+// outright (never silently renders a status computed from root alone,
+// which could equally remove a real label) since nothing here proves anyone
+// who held the key ever touched this segment.
+test('push refuses (never publishes a forged P5 pass) when a recovered segment is entirely unsigned, even with an exact branch match', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ticket-sync-push-forged-'));
+  const KEY = 'push-forgery-key';
+  try {
+    git(dir, ['init', '-q', '-b', 'feat/push-forged']);
+    git(dir, ['config', 'user.email', 'a@b.c']);
+    git(dir, ['config', 'user.name', 'x']);
+    mkdirSync(join(dir, '.adlc'), { recursive: true });
+    writeFileSync(
+      join(dir, '.adlc', 'tickets.json'),
+      `${JSON.stringify({ tickets: [{ id: 'T1', title: 'Do the thing', scope: ['src/**'], duration: 1 }] }, null, 2)}\n`,
+    );
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+    writeFileSync(join(dir, '.adlc', 'config.json'), JSON.stringify(PUSH_CONFIG));
+
+    mkdirSync(join(dir, '.adlc', 'manifest.d'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+    // Mints the segment's branch-carrying first entry — UNSIGNED (the attacker
+    // does not have KEY, only local/commit write access to the segment file).
+    recordTicketEvidence(dir, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T1',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+    // A forged, UNSIGNED "clear" verdict for T1 — the branch field on the
+    // FIRST entry matches exactly, but this second entry carries no valid
+    // signature at all.
+    const segDir = join(dir, '.adlc', 'manifest.d');
+    const segName = readdirSync(segDir).find((n) => n.endsWith('.jsonl'));
+    const segPath = segmentPath(join(dir, '.adlc'), segName);
+    const firstRawLine = readFileSync(segPath, 'utf8').trim().split('\n')[0];
+    const forged = {
+      seq: 2, gate: 'prosecution', ts: '2026-06-01T00:00:00Z', ticket: 'T1',
+      data: { verdict: 'clear' }, files: {}, prev: sha256(firstRawLine),
+    };
+    writeFileSync(segPath, `${firstRawLine}\n${JSON.stringify(forged)}\n`);
+    rmSync(join(dir, '.adlc', 'manifest.d', '.lineage'), { force: true });
+
+    // Push DOES have a real key available (the normal CI configuration).
+    const gh = fakeGitHub();
+    const r = await push({ dir, provider: githubProvider(), runner: gh.runner, write: true, now: 'T', uuid: () => 'K', key: KEY });
+    assert.equal(r.exitCode, 1, `an entirely unsigned recovered segment must refuse, not silently render a status computed from root alone`);
+    assert.ok(
+      r.errors.some((e) => /failed chain or signature verification/.test(e)),
+      `expected a chain/signature verification error, got: ${JSON.stringify(r.errors)}`,
+    );
+    assert.ok(
+      !(gh.state.issues[0]?.labels ?? []).includes('adlc:passed'),
+      `an unsigned forged verdict must never be published, even with an exact branch match: ${JSON.stringify(gh.state.issues[0]?.labels)}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The refuse guard above must not fire when there is genuinely nothing to
+// miss: a repo freshly cut over to segments (`.store.json` written) but with
+// no segment ever opened for this branch has no local `.lineage` token either
+// — that is the ordinary, expected state, not a lost-token failure, and push
+// must proceed normally rather than refuse every first push after cutover.
+test('push succeeds normally in a freshly segmented repo with no .lineage token, when no segment has ever been opened for this branch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ticket-sync-push-fresh-segment-'));
+  try {
+    git(dir, ['init', '-q', '-b', 'feat/push-fresh-segment']);
+    git(dir, ['config', 'user.email', 'a@b.c']);
+    git(dir, ['config', 'user.name', 'x']);
+    mkdirSync(join(dir, '.adlc'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'tickets.json'), `${JSON.stringify({ tickets: [] }, null, 2)}\n`);
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+    writeFileSync(join(dir, '.adlc', 'config.json'), JSON.stringify(PUSH_CONFIG));
+
+    // Cut over to segments — no evidence recorded, no segment ever opened, no
+    // .lineage token ever written (there's nothing yet for one to name).
+    mkdirSync(join(dir, '.adlc', 'manifest.d'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+
+    const gh = fakeGitHub();
+    const r = await push({ dir, provider: githubProvider(), runner: gh.runner, write: false, now: 'T' });
+    assert.equal(r.exitCode, 0, `must not wrongly refuse when there is no segment to miss: ${JSON.stringify(r.errors)}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The refuse guard must ALSO not fire on the ordinary happy path: a segmented
+// repo whose own `.lineage` token resolves cleanly (the normal case for every
+// checkout that has recorded its own evidence) must push exactly as it would
+// pre-lineage-durability — never refuse just because the repo happens to be
+// segmented.
+test('push succeeds normally in a segmented repo whose own .lineage token resolves cleanly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ticket-sync-push-healthy-segment-'));
+  try {
+    git(dir, ['init', '-q', '-b', 'feat/push-healthy-segment']);
+    git(dir, ['config', 'user.email', 'a@b.c']);
+    git(dir, ['config', 'user.name', 'x']);
+    mkdirSync(join(dir, '.adlc'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'tickets.json'), `${JSON.stringify({ tickets: [] }, null, 2)}\n`);
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+    writeFileSync(join(dir, '.adlc', 'config.json'), JSON.stringify(PUSH_CONFIG));
+
+    mkdirSync(join(dir, '.adlc', 'manifest.d'), { recursive: true });
+    writeFileSync(join(dir, '.adlc', 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1 }));
+    // Records real evidence AND mints the segment's own valid .lineage token —
+    // the ordinary state of any checkout that has done real work.
+    recordTicketEvidence(dir, {
+      transactionId: 'tx-1', operation: 'complete', ticketId: 'T1',
+      ticketHash: 'h'.repeat(64), storeHash: 's'.repeat(64), key: null,
+    });
+
+    const gh = fakeGitHub();
+    const r = await push({ dir, provider: githubProvider(), runner: gh.runner, write: false, now: 'T' });
+    assert.equal(r.exitCode, 0, `must not refuse when this checkout's own segment resolves cleanly: ${JSON.stringify(r.errors)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

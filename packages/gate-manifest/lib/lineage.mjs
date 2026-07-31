@@ -10,7 +10,7 @@ import { lstatSync, writeFileSync, openSync, readSync, closeSync, unlinkSync, mk
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { git, sha256, ledgerPath, ADLC_DIR } from '@adlc/core';
-import { segmentDirPath, discoverSegments, readRawLines, ulidOf } from './forest.mjs';
+import { segmentDirPath, segmentPath, discoverSegments, readRawLines, ulidOf } from './forest.mjs';
 
 const MARKER_NAME = '.store.json';
 const LINEAGE_NAME = '.lineage';
@@ -211,13 +211,190 @@ export function peekOpenSegment(dir = ADLC_DIR, { cwd = process.cwd() } = {}) {
   return null;
 }
 
+// Read ONLY the first line of a segment (its anchor-carrying entry) — a
+// BOUNDED read, not readRawLines (adversarial-review finding, T-MANIFEST-
+// FOREST sixth round): the original version read and split the WHOLE
+// segment file just to inspect its first line, so recoverOpenSegment's
+// per-candidate scan cost grew with the TOTAL size of every discovered
+// segment, not just the bytes actually needed — one oversized (but
+// grammar-valid) segment could stall or exhaust memory on every recovery
+// attempt, including a routine fresh-clone push/doctor/reassign/carry-
+// forward run. discoverSegments already rejects symlinks before a name
+// ever reaches here, so no O_NOFOLLOW hardening is needed the way
+// readBoundedJsonNoFollow's (.lineage/.store.json) needs it.
+const MAX_FIRST_LINE_BYTES = 65536; // generous headroom; a real first entry is a few hundred bytes
+// Distinguishes "no first entry / malformed" (null — genuinely absent, safe
+// to treat as a non-candidate) from "first entry exists but exceeds the
+// bounded-read cap" (adversarial-review finding, T-MANIFEST-FOREST seventh
+// round): nothing on the write side caps entry size, so a legitimately large
+// evidence payload (a big `data` object or `files` map) could exceed 64 KiB
+// and previously vanished from recovery exactly like the original
+// lost-token bug, just via a different mechanism. recoverOpenSegment (below)
+// refuses instead of silently excluding an oversized segment as a candidate.
+const OVERSIZED_FIRST_ENTRY = Symbol('oversized-first-entry');
+// Returns a parsed first entry, or one of two "cannot determine, refuse"
+// sentinels — never `null` (adversarial-review finding, T-MANIFEST-FOREST
+// ninth round): a genuinely EMPTY file used to return `null` on the theory
+// that empty is always safe, but `firstEntryOf` is only ever called on a
+// name `discoverSegments` already confirmed exists as a real, discovered
+// segment file — an EXISTING segment being zero bytes is not "nothing to
+// see", it's the same anomaly this package's own verifyChain treats as
+// invalid ("empty segment file has no first entry to carry the required
+// anchor"): every real segment's mint atomically writes its anchor-carrying
+// first entry, so zero bytes can only mean a crash between file creation
+// and first append, or truncation/tampering. Folded into
+// MALFORMED_FIRST_ENTRY rather than given a third sentinel — the caller's
+// response (refuse, cannot safely exclude as a non-candidate) is identical
+// either way. Unreadable (open failure) and unparseable (JSON.parse
+// failure) get the same treatment for the same underlying reason:
+// discoverSegments already confirmed this name exists, so any failure past
+// that point is unexpected and unsafe to treat as absence.
+const MALFORMED_FIRST_ENTRY = Symbol('malformed-first-entry');
+function firstEntryOf(dir, segmentName) {
+  let fd;
+  try {
+    fd = openSync(segmentPath(dir, segmentName), fsConstants.O_RDONLY);
+  } catch {
+    return MALFORMED_FIRST_ENTRY;
+  }
+  try {
+    const buf = Buffer.alloc(MAX_FIRST_LINE_BYTES);
+    const bytesRead = readSync(fd, buf, 0, MAX_FIRST_LINE_BYTES, 0);
+    const chunk = buf.subarray(0, bytesRead).toString('utf8');
+    const newlineIndex = chunk.indexOf('\n');
+    if (newlineIndex === -1 && bytesRead >= MAX_FIRST_LINE_BYTES) return OVERSIZED_FIRST_ENTRY;
+    const firstLine = newlineIndex === -1 ? chunk : chunk.slice(0, newlineIndex);
+    if (firstLine.trim() === '') return MALFORMED_FIRST_ENTRY;
+    return JSON.parse(firstLine);
+  } catch {
+    return MALFORMED_FIRST_ENTRY;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Read-only recovery for consumers that need "what evidence exists for MY
+ * branch" to survive a fresh clone or a branch switch that overwrote
+ * `.lineage` (T-MANIFEST-FOREST lineage-durability finding): `.lineage` is
+ * deliberately gitignored (spec §7 point 1), so peekOpenSegment alone returns
+ * null in exactly those cases even when a real, COMMITTED segment for this
+ * branch exists on disk.
+ *
+ * IDENTITY (T-MANIFEST-FOREST, fourth round — supersedes the original
+ * slug-based version of this function): matches on the EXACT `branch` field
+ * every segment's first entry now carries (spec §4.4), never the derived
+ * FILENAME slug. `deriveSlug` is lossy by design (lowercases, collapses,
+ * truncates at 40 chars) purely so it makes a legible filename component —
+ * branch `feat/x` and a literal branch named `feat-x` derive the identical
+ * slug, so slug-based matching could recover (or, worse for a signing
+ * consumer, launder) an unrelated branch's segment as this branch's own. The
+ * `branch` field is the exact Git ref string, part of the entry's own signed
+ * content once a key is configured (an anchor-carrying entry is always
+ * v2-signed — spec §4.4) — but exact identity is not authenticity: THIS
+ * FUNCTION DOES NOT VERIFY ANY SIGNATURE. An unsigned segment can still claim
+ * any branch by name; matching its `branch` field only proves the claim, not
+ * that anyone with the key made it (adversarial-review finding,
+ * T-MANIFEST-FOREST fourth round — `@adlc/tickets`' readOwnChains learned
+ * this the hard way when push.mjs published a hand-planted "clear" verdict
+ * from an unsigned but exact-branch-matching recovered segment). Every
+ * caller MUST independently verify (entrySigValid/verifyEntrySig) whatever
+ * specific entries it actually intends to trust or re-sign before doing so
+ * — this function only answers "which FILE is mine", never "is its content
+ * trustworthy". `@adlc/tickets`' readOwnChains(dir, {allowRecovery, key})
+ * does this filtering for its own callers; a caller of THIS function gets no
+ * such filtering for free.
+ *
+ * Segments minted BEFORE this change carry no `branch` field and are simply
+ * never matched here — they remain reachable only via a still-valid
+ * `.lineage` token (peekOpenSegment). This is a deliberate, honest scope
+ * boundary, not an oversight: recovery becomes reliable going forward without
+ * a disruptive rewrite of already-committed segments (tracked as a follow-up
+ * — T-01KYTQ4BADHSDJNBFNZHB2ZG5V).
+ *
+ * ALSO deliberately out of scope: resolveOpenSegment (below) never consults
+ * this function, so a WRITE that happens before any read on a fresh clone
+ * (token absent) mints a fresh segment rather than continuing a real,
+ * unambiguous, already-committed one for this branch — and once that fresh
+ * segment's token exists, peekOpenSegment's fast path means this function
+ * never scans further, permanently hiding the older evidence again for the
+ * rest of that checkout's lifetime. Same follow-up ticket.
+ *
+ * NEVER mints (like peekOpenSegment) and NEVER guesses among multiple
+ * candidates: a writer resolving where to APPEND must stay precise
+ * (resolveOpenSegment, below, deliberately does not use this), but a reader
+ * recovering "what's already there" must not silently guess either — spec's
+ * own multiple-independent-segments-per-branch possibility (§7 point 1: two
+ * branches forked from the same rootless state can legitimately mint
+ * independent segments without coordinating) means the SAME branch can
+ * legitimately own more than one committed segment (e.g. a token was lost
+ * mid-stream and a second one was minted) — picking one at random could
+ * silently ignore genuine evidence in the other. Throws in that case;
+ * callers must fail closed, never report "no evidence" when the truth is
+ * "ambiguous".
+ *
+ * @returns {{ name: string, isNew: false }|null}
+ * @throws {Error} when more than one committed segment's first entry declares
+ *   this branch and the local token does not disambiguate, or when a
+ *   discovered segment's first entry exceeds the bounded-read cap (its
+ *   branch cannot be determined, so it cannot be safely excluded either)
+ */
+export function recoverOpenSegment(dir = ADLC_DIR, { cwd = process.cwd() } = {}) {
+  const peeked = peekOpenSegment(dir, { cwd });
+  if (peeked) return peeked;
+  const branch = currentBranch(cwd);
+  if (branch === null) return null; // detached HEAD: no branch identity to recover by
+  const discovered = discoverSegments(dir);
+  // adversarial-review finding, T-MANIFEST-FOREST ninth round: this used to
+  // scan ONLY `.valid`, silently ignoring `.invalid` — a real segment
+  // renamed to a bad-grammar name, replaced with a symlink, or otherwise
+  // turned into a non-conforming filesystem object became indistinguishable
+  // from "never existed", exactly the class of silent exclusion already
+  // closed for oversized/malformed first entries below, just one layer up.
+  // The forest's own write-time precondition already refuses on ANY invalid
+  // object anywhere; recovery must match that fail-closed contract rather
+  // than quietly proceed as if nothing is wrong.
+  if (discovered.invalid.length > 0) {
+    throw new Error(
+      `manifest.d/ contains ${discovered.invalid.length} non-conforming filesystem object(s) `
+      + `(${discovered.invalid.map((i) => i.name).sort().join(', ')}) — one could be a disguised or `
+      + `tampered segment belonging to this branch, so recovery refuses rather than guess`
+    );
+  }
+  const candidates = [];
+  for (const name of discovered.valid) {
+    const first = firstEntryOf(dir, name);
+    if (first === OVERSIZED_FIRST_ENTRY) {
+      throw new Error(
+        `segment ${name}'s first entry exceeds the ${MAX_FIRST_LINE_BYTES}-byte bounded-read cap — `
+        + `its branch cannot be determined, so it cannot be safely excluded as a candidate either; refusing to guess`
+      );
+    }
+    if (first === MALFORMED_FIRST_ENTRY) {
+      throw new Error(
+        `segment ${name}'s first entry could not be read or parsed — `
+        + `its branch cannot be determined, so it cannot be safely excluded as a candidate either; refusing to guess`
+      );
+    }
+    if (first?.branch === branch) candidates.push(name);
+  }
+  if (candidates.length === 0) return null;
+  if (candidates.length > 1) {
+    throw new Error(
+      `ambiguous: ${candidates.length} committed segments declare branch "${branch}" as their own `
+      + `(${candidates.sort().join(', ')}) and no local .lineage token disambiguates them — refusing to guess`
+    );
+  }
+  return { name: candidates[0], isNew: false };
+}
+
 /**
  * Resolve which segment file the NEXT append should target (spec §7.1).
  *
- * @returns {{ name: string, isNew: boolean, anchor?: object|null }}
+ * @returns {{ name: string, isNew: boolean, anchor?: object|null, branch?: string }}
  *   `isNew: true` means this append is the segment's FIRST entry and must
- *   carry `anchor` (also returned); `isNew: false` means append as a plain
- *   continuation of the named, already-open segment.
+ *   carry `anchor` and `branch` (both also returned); `isNew: false` means
+ *   append as a plain continuation of the named, already-open segment.
  */
 export function resolveOpenSegment(dir = ADLC_DIR, { cwd = process.cwd() } = {}) {
   const peeked = peekOpenSegment(dir, { cwd });
@@ -238,5 +415,10 @@ export function resolveOpenSegment(dir = ADLC_DIR, { cwd = process.cwd() } = {})
   const slug = deriveSlug(branch ?? '');
   const name = `${slug}-${ulid}.jsonl`;
   if (branch !== null) writeLineageToken(dir, { segment: name, ulid, branch });
-  return { name, isNew: true, anchor };
+  // branch is omitted (not `null`) when detached HEAD minted this segment —
+  // recoverOpenSegment's exact-match scan simply never matches an omitted
+  // field, the same as any other unset field, so no explicit sentinel is
+  // needed the way `anchor: null` needs one (anchor is spec-mandatory on
+  // every first entry; branch is not).
+  return { name, isNew: true, anchor, ...(branch !== null ? { branch } : {}) };
 }
