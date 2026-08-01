@@ -14,6 +14,7 @@ import {
   readRailsFromTicketFile, expandRailsToFiles, isMutableSource, isSupportedSourceExtension,
 } from '../lib/targets.mjs';
 import { runMutant, runTest } from '../lib/runner.mjs';
+import { pidAlive } from '../lib/inflight.mjs';
 import { printTable, buildJsonReport } from '../lib/report.mjs';
 
 // ── arg parsing ─────────────────────────────────────────────────────────────
@@ -134,16 +135,6 @@ function recordInflight(absolutePath, original) {
       'utf8',
     );
   } catch { /* best effort */ }
-}
-
-// EPERM means the pid exists but belongs to someone else — still alive.
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
-  }
 }
 
 function recoverInflight() {

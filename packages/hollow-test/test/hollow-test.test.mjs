@@ -1699,7 +1699,7 @@ function createSlowRepo(dir) {
     "test('scale', () => { assert.equal(scale(3), 6); });",
     // Deliberately slow, so a signal lands while a trial is in flight rather than
     // between them — the window this whole feature is about.
-    "test('slow', async () => { await new Promise((r) => setTimeout(r, 3000)); });",
+    "test('slow', async () => { await new Promise((r) => setTimeout(r, 1200)); });",
     '',
   ].join('\n'));
   commitAll(dir);
@@ -1712,10 +1712,13 @@ function createSlowRepo(dir) {
 const SLOW_TEST_CMD = 'node --test test/thing.test.mjs';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --max 2 deliberately. These cases need ONE mutant to be in flight when the
+// signal lands; the default of 20 would pay the (deliberately slow) suite twenty
+// times per run, and the mutation gate re-runs this file once per mutant.
+const RUN_ARGS = ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD, '--max', '2'];
+
 function startCli(dir) {
-  return spawn('node', [
-    BIN, '--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD,
-  ], { cwd: dir, stdio: 'ignore' });
+  return spawn('node', [BIN, ...RUN_ARGS], { cwd: dir, stdio: 'ignore' });
 }
 
 /** Resolve once a mutant is actually written to disk, so the signal lands mid-trial. */
@@ -1771,10 +1774,7 @@ describe('CLI: a mutant stranded by an unhandleable kill is recovered by the nex
     await sleep(300);
     assert.notEqual(git(['status', '--porcelain'], dir).trim(), '', 'SIGKILL should have stranded a mutant');
 
-    const result = runCli(
-      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD, '--json'],
-      dir,
-    );
+    const result = runCli([...RUN_ARGS, '--json'], dir);
 
     // It must NOT have bailed out as an operational error on a dirty tree.
     assert.notEqual(result.status, 1, `refused to run instead of recovering: ${result.stderr}`);
@@ -1828,14 +1828,11 @@ describe('in-flight record: location and lifecycle', () => {
     assert.doesNotMatch(git(['status', '--porcelain'], dir), /adlc-hollow-test-inflight/);
 
     // Put the repo back for the next case.
-    runCli(['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD], dir);
+    runCli(RUN_ARGS, dir);
   });
 
   it('removes the record when a run finishes normally', () => {
-    const result = runCli(
-      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD],
-      dir,
-    );
+    const result = runCli(RUN_ARGS, dir);
     assert.ok(result.status === 0 || result.status === 2, `unexpected exit ${result.status}: ${result.stderr}`);
     assert.equal(
       existsSync(inflightPathFor(dir)),
@@ -1872,10 +1869,7 @@ describe('in-flight record: a run that is still alive owns its file', () => {
       JSON.stringify({ version: 1, pid: sleeper.pid, file: target, original }),
     );
 
-    const result = runCli(
-      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD],
-      dir,
-    );
+    const result = runCli(RUN_ARGS, dir);
 
     // Stealing the file from a running trial would corrupt it and could report
     // that run's mutant as killed, so the correct move is to leave it and refuse.
@@ -1886,11 +1880,18 @@ describe('in-flight record: a run that is still alive owns its file', () => {
     );
     assert.equal(result.status, 1, 'expected the dirty-tree refusal, since recovery must not happen here');
 
-    // Probing liveness must observe, never disturb.
-    assert.equal(sleeper.killed, false);
-    let alive = true;
-    try { process.kill(sleeper.pid, 0); } catch { alive = false; }
-    assert.equal(alive, true, 'the liveness probe signalled the process it was only meant to check');
+    // Probing liveness must observe, never disturb. Checked via the child's own
+    // exit state rather than kill(pid, 0): this process is the sleeper's parent,
+    // so a killed sleeper lingers as a ZOMBIE that still answers signal 0 until
+    // it is reaped — which would hide a probe that really did deliver SIGHUP.
+    // (lib/inflight.mjs pins the signal number directly; this is the end-to-end half.)
+    await sleep(400);
+    assert.equal(
+      sleeper.exitCode === null && sleeper.signalCode === null,
+      true,
+      `the liveness probe signalled the process it was only meant to check `
+      + `(exitCode=${sleeper.exitCode} signalCode=${sleeper.signalCode})`,
+    );
 
     writeFileSync(target, original);
     rmSync(inflightPathFor(dir), { force: true });
