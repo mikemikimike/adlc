@@ -5,7 +5,7 @@
 // an on-disk in-flight record that the NEXT run recovers from when the kill was
 // not catchable at all.
 
-import { writeFileSync, readFileSync, existsSync, unlinkSync, realpathSync } from 'node:fs';
+import { writeFileSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { parseArgs, pass, gateFail, opError, printJson } from '@adlc/core';
 import { gitDiff, isDirty, isGitRepo, resolveBase, mutate, git, repoRoot } from '@adlc/core';
@@ -14,7 +14,12 @@ import {
   readRailsFromTicketFile, expandRailsToFiles, isMutableSource, isSupportedSourceExtension,
 } from '../lib/targets.mjs';
 import { runMutant, runTest } from '../lib/runner.mjs';
-import { pidAlive } from '../lib/inflight.mjs';
+import {
+  probeOwner, isWellFormed, decideRecovery, writeRecord, readRecord, clearRecord,
+  resolveTarget, recordPathFor, writeFileDurable,
+} from '../lib/inflight.mjs';
+import { acquireRunLock, lockPathFor } from '../lib/run-lock.mjs';
+import { terminateActiveTest } from '../lib/runner.mjs';
 import { printTable, buildJsonReport } from '../lib/report.mjs';
 
 // ── arg parsing ─────────────────────────────────────────────────────────────
@@ -68,9 +73,12 @@ Options:
   --help                Show this help
 
 Exit codes:
-  0  All mutants killed (gate passes)
-  1  Operational error (dirty tree, not a git repo, bad args, nothing to mutate)
-  2  One or more mutants survived (hollow coverage)
+  0    All mutants killed (gate passes)
+  1    Operational error (dirty tree, not a git repo, bad args, nothing to mutate,
+       another run holds the lock, the in-flight record could not be written)
+  2    One or more mutants survived (hollow coverage)
+  130  Cancelled by SIGINT (128 + 2) — no verdict was reached
+  143  Cancelled by SIGTERM or SIGHUP (128 + 15) — no verdict was reached
 `);
   process.exit(values.help ? 0 : 1);
 }
@@ -94,94 +102,140 @@ if (!isGitRepo(cwd)) {
   opError('not a git repository');
 }
 
+// ── repo root ───────────────────────────────────────────────────────────────
+// Resolved BEFORE recovery, because recovery has to re-derive its write target
+// against the repository rather than trust a path out of a file.
+//
+// Repo root is NOT necessarily `cwd`: hollow-test may be invoked from any
+// subdirectory (e.g. a per-package script that `cd`s into packages/foo/ first),
+// so anything reasoning about the repo as a whole (rails-glob matching,
+// --target containment) must resolve against this.
+let root;
+try {
+  root = repoRoot(cwd);
+} catch (err) {
+  opError(`could not resolve repository root: ${err.message}`);
+}
+
+let gitDir = null;
+try {
+  gitDir = resolve(cwd, git(['rev-parse', '--git-dir'], { cwd }).trim());
+} catch {
+  gitDir = null;
+}
+
+// ── one run at a time, per worktree ─────────────────────────────────────────
+//
+// Two runs in the same worktree do not merely duplicate work, they corrupt each
+// other: both can clear the clean-tree check during the baseline window, after
+// which each one's test command observes the other's mutant and each clears the
+// other's in-flight record. The lock therefore wraps recovery, the dirty check
+// and every trial — the damage starts at the dirty check, not the first mutation.
+let releaseRunLock = () => {};
+if (gitDir !== null) {
+  const lock = acquireRunLock(lockPathFor(gitDir));
+  if (!lock.ok) {
+    opError(
+      `${lock.reason}${lock.ownerPid === null ? '' : ` (pid ${lock.ownerPid})`} — ` +
+      'hollow-test rewrites files in place, so concurrent runs in one worktree ' +
+      'would score mutants against source they did not write'
+    );
+  }
+  releaseRunLock = lock.release;
+}
+process.on('exit', () => releaseRunLock());
+
 // ── recover a mutant stranded by an interrupted run ─────────────────────────
 //
 // MUST run before the dirty-tree refusal below, because the dirt is very often
-// OUR OWN. Every in-process restore path — the runner's finally, the signal
-// handlers — dies with the process, so a SIGKILL, an OOM kill or a power loss
-// mid-trial leaves a live mutant in the working tree as an unstaged edit. The
-// next run then refuses with "commit or stash first", which reads as if the
-// USER's work is in the way; the reflex is to commit it, and that is how a
-// mutant ships. Observed for real: a tool timeout stranded `? 130 :` flipped to
-// `? 131 :`, and an `authorized = false` -> `true` flip before that.
+// OUR OWN. Every in-process restore path dies with the process, so a SIGKILL, an
+// OOM kill or a power loss mid-trial leaves a live mutant in the working tree as
+// an unstaged edit. The next run then refuses with "commit or stash first", which
+// reads as if the USER's work is in the way; the reflex is to commit it, and that
+// is how a mutant ships. Observed for real: a tool timeout stranded `? 130 :`
+// flipped to `? 131 :`, and an `authorized = false` -> `true` flip before that.
 //
-// So record the file and its ORIGINAL bytes on disk before each mutation, and
-// put them back here. The record lives in the git dir: never committed, and
-// per-worktree (`--git-dir` resolves to .git/worktrees/<name> in a linked
-// worktree), so parallel worktrees cannot recover each other's files.
-const INFLIGHT_NAME = 'adlc-hollow-test-inflight.json';
-
-let inflightPath = null;
-try {
-  inflightPath = resolve(cwd, git(['rev-parse', '--git-dir'], { cwd }).trim(), INFLIGHT_NAME);
-} catch {
-  // No git dir means no durable record; the signal handlers still apply.
-  inflightPath = null;
-}
+// The record lives in the git dir: never committed, and per-worktree
+// (`--git-dir` resolves to .git/worktrees/<name> in a linked worktree), so
+// parallel worktrees cannot recover each other's files.
+const inflightPath = gitDir === null ? null : recordPathFor(gitDir);
 
 function clearInflight() {
-  if (inflightPath === null) return;
-  try {
-    if (existsSync(inflightPath)) unlinkSync(inflightPath);
-  } catch { /* best effort — never fail a run over bookkeeping */ }
+  if (inflightPath !== null) clearRecord(inflightPath);
 }
 
-function recordInflight(absolutePath, original) {
-  if (inflightPath === null) return;
-  try {
-    writeFileSync(
-      inflightPath,
-      JSON.stringify({ version: 1, pid: process.pid, file: absolutePath, original }),
-      'utf8',
-    );
-  } catch { /* best effort */ }
-}
-
+/**
+ * Restore a file left mutated by a dead run — but ONLY when we can prove that is
+ * what it is.
+ *
+ * The proof is byte equality with the mutant we recorded. Restoring merely
+ * because the file differs from the original would overwrite whatever the
+ * developer did to it after the crash, which is the same data loss this feature
+ * exists to prevent, pointed the other way.
+ *
+ * @returns {{file: string, pid: number|null} | null}
+ */
 function recoverInflight() {
-  // Two statements rather than one `||`: with the operands combined, swapping the
-  // operator produces a mutant no test can distinguish (falling through to the
-  // read below just throws and lands on the same `return null`), so the compound
-  // form is untestable by construction rather than merely untested.
   if (inflightPath === null) return null;
-  if (!existsSync(inflightPath)) return null;
-  let record;
-  try {
-    record = JSON.parse(readFileSync(inflightPath, 'utf8'));
-  } catch {
+  const record = readRecord(inflightPath);
+  if (record === null) return null;
+  if (!isWellFormed(record)) {
     clearInflight();
     return null;
   }
-  if (
-    record === null || typeof record !== 'object' || record.version !== 1 ||
-    typeof record.file !== 'string' || typeof record.original !== 'string'
-  ) {
-    clearInflight();
+
+  const target = resolveTarget(root, record.file);
+  if (target === null) {
+    // Escapes the repo, is symlinked, or names something absent. Never write it;
+    // never silently drop it either — a human should see this.
+    console.warn(
+      `hollow-test: ignoring an in-flight record naming ${record.file}, which does ` +
+      'not resolve to a regular file inside this repository'
+    );
     return null;
   }
-  // A LIVE owner is a concurrent run, not a corpse. Restoring its file mid-trial
-  // would corrupt that run and could report its mutant as killed.
-  if (typeof record.pid === 'number' && record.pid !== process.pid && pidAlive(record.pid)) {
-    return null;
-  }
+
   let current;
   try {
-    current = readFileSync(record.file, 'utf8');
+    current = readFileSync(target, 'utf8');
   } catch {
+    return null;
+  }
+
+  const ownerState = record.pid === process.pid ? 'dead' : probeOwner(record.pid);
+  const decision = decideRecovery({ ownerState, currentContent: current, record });
+
+  if (decision.action === 'none') {
     clearInflight();
     return null;
   }
-  if (current === record.original) {
-    // The previous run restored it after all; the record is just litter.
-    clearInflight();
+  if (decision.action === 'skip') {
+    console.warn(
+      `hollow-test: leaving ${record.file} alone — ${decision.reason}. If the tree is ` +
+      'dirty, that edit may be a mutant rather than your work'
+    );
     return null;
   }
+  if (decision.action === 'conflict') {
+    // KEEP the record: it holds the only surviving copy of the original bytes.
+    console.warn(
+      `hollow-test: ${record.file} ${decision.reason}, so it was NOT restored. ` +
+      `The original bytes are preserved in ${inflightPath}`
+    );
+    return null;
+  }
+
   try {
-    writeFileSync(record.file, record.original, 'utf8');
-  } catch {
-    return null; // leave the record: a later run with permission can still fix it
+    writeFileDurable(target, record.original);
+  } catch (err) {
+    // Never clear a record whose restore failed — it is the only copy left.
+    opError(
+      `could not restore ${record.file} from the in-flight record: ${err.message}. ` +
+      `The original bytes are preserved in ${inflightPath}`
+    );
   }
   clearInflight();
-  return { file: relative(cwd, record.file) || record.file, pid: record.pid ?? null };
+  return { file: record.file, pid: record.pid ?? null };
 }
 
 const recoveredInflight = recoverInflight();
@@ -194,18 +248,6 @@ if (recoveredInflight !== null && !useJson) {
 
 if (isDirty(cwd)) {
   opError('commit or stash first — hollow-test mutates files in place and restores them');
-}
-
-// Repo root — NOT necessarily `cwd`. hollow-test may be invoked from any
-// subdirectory (e.g. a per-package script that `cd`s into packages/foo/
-// first), so anything that needs to reason about the repo as a whole
-// (rails-glob matching, --target containment) must resolve against this,
-// not `cwd`.
-let root;
-try {
-  root = repoRoot(cwd);
-} catch (err) {
-  opError(`could not resolve repository root: ${err.message}`);
 }
 
 // Symlink-free real path of the repo root, used by symlinkEscapesRoot() below.
@@ -242,7 +284,7 @@ if (base === undefined) {
 // non-zero), turning the gate into a hollow pass. Refuse to run unless the real
 // suite passes on unmutated code.
 
-const baseline = runTest(testCmd, timeoutMs, cwd);
+const baseline = await runTest(testCmd, timeoutMs, cwd);
 if (baseline.status !== 0) {
   const reason = baseline.timedOut ? 'timed out' : `exit ${baseline.status}`;
   opError(
@@ -496,15 +538,21 @@ if (starvedByBudget.length > 0) {
 let currentFilePath = null;
 let currentOriginal = null;
 
+let shuttingDown = false;
+
 function emergencyRestore() {
+  let restored = true;
   if (currentFilePath !== null && currentOriginal !== null) {
     try {
       writeFileSync(currentFilePath, currentOriginal, 'utf8');
     } catch {
       // Best-effort — we're in a signal handler.
+      restored = false;
     }
   }
-  clearInflight();
+  // Only drop the record once the file is actually back. If the restore failed,
+  // the record holds the only surviving copy of the original bytes.
+  if (restored) clearInflight();
 }
 
 // EVERY catchable termination signal, not just Ctrl-C.
@@ -519,8 +567,18 @@ function emergencyRestore() {
 // the on-disk in-flight record above exists for.
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(signal, () => {
+    // ONCE ONLY. A second signal arriving mid-cleanup must not re-enter this and
+    // race the restore it is already doing.
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Kill the test command's whole process group first, so nothing is still
+    // writing to the tree while we put the file back.
+    terminateActiveTest('SIGTERM');
     emergencyRestore();
-    process.exit(1);
+    releaseRunLock();
+    // Report cancellation, not a gate verdict: 128 + signal number, the shell
+    // convention. Exiting 0 or 2 here would let a cancelled run read as a result.
+    process.exit(signal === 'SIGINT' ? 130 : 143);
   });
 }
 
@@ -555,11 +613,30 @@ for (const target of fileTargets) {
 
     // Register for emergency restore twice over: in memory for a signal we can
     // catch, and on disk for one we cannot.
+    //
+    // FAIL CLOSED if the record cannot be written. Swallowing the error would
+    // mutate the file with no way back — precisely the SIGKILL case the record
+    // exists for, silently unprotected. The mutant bytes go in too, so recovery
+    // can PROVE the file is still what we wrote before overwriting it.
     currentFilePath = target.absolutePath;
     currentOriginal = content;
-    recordInflight(target.absolutePath, content);
+    if (inflightPath !== null) {
+      try {
+        writeRecord(inflightPath, {
+          pid: process.pid,
+          relFile: relative(root, target.absolutePath),
+          original: content,
+          mutated: mutatedContent,
+        });
+      } catch (err) {
+        opError(
+          `could not write the in-flight record (${err.message}) — refusing to mutate ` +
+          `${target.file}, because a run interrupted now could not be recovered`
+        );
+      }
+    }
 
-    const trial = runMutant(
+    const trial = await runMutant(
       target.absolutePath,
       content,
       mutatedContent,

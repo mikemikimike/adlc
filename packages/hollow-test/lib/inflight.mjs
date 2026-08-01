@@ -1,33 +1,187 @@
-// Liveness probe for the owner recorded in an in-flight mutation record.
+// The in-flight mutation record: what hollow-test writes down before it edits a
+// source file, so a run that dies mid-trial is cleaned up by the next one instead
+// of leaving a live MUTANT in the working tree.
 //
-// Extracted from bin/hollow-test.mjs so it can be tested directly. Both of the
-// properties that matter here are invisible to an integration test:
-//
-//   * the probe must OBSERVE, never disturb — signal 0 performs the permission
-//     and existence checks and delivers nothing. Any other signal number is
-//     delivered for real, so a probe that drifted to 1 would SIGHUP the very run
-//     it was checking. An integration test cannot see that reliably, because a
-//     killed child of the test process becomes a zombie and still answers
-//     `kill(pid, 0)` until it is reaped.
-//
-//   * EPERM means the pid EXISTS but belongs to another user, so the owner is
-//     alive and its file must not be touched. Provoking EPERM for real needs a
-//     process owned by somebody else, which a test cannot conjure.
-//
-// Injecting `kill` makes both observable in-process.
+// Everything here is pure or injectable, because the properties that matter are
+// the ones no integration test can reach: a liveness probe must not disturb the
+// process it probes, EPERM needs a process owned by another user, and the
+// recovery decision spans states that are painful to stage with real crashed
+// processes. It also keeps the mutation gate affordable — that gate re-runs this
+// package's tests once per mutant.
+
+import {
+  openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync,
+  readFileSync, existsSync, lstatSync,
+} from 'node:fs';
+import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
+
+export const INFLIGHT_BASENAME = 'adlc-hollow-test-inflight.json';
+export const RECORD_VERSION = 2;
 
 /**
- * Is the process that owns an in-flight record still running?
+ * Is the process that owns a record still running?
  *
- * @param {number} pid            Owner pid from the record.
- * @param {(pid: number, signal: number) => void} [kill]  Defaults to process.kill.
- * @returns {boolean} true if the owner is alive (or alive but not ours to signal).
+ * TRI-STATE on purpose. "Not definitely alive" is not "definitely gone", and only
+ * the latter may authorise overwriting a file: treating an unrecognised probe
+ * failure as death is how recovery would clobber a run that is still working.
+ *
+ * Signal 0 performs the existence and permission checks and delivers NOTHING.
+ * Any other signal number is delivered for real, so a probe that drifted to 1
+ * would SIGHUP the very run it was checking.
+ *
+ * @param {unknown} pid
+ * @param {(pid: number, signal: number) => void} [kill]
+ * @returns {'alive'|'dead'|'unknown'}
  */
-export function pidAlive(pid, kill = process.kill.bind(process)) {
+export function probeOwner(pid, kill = process.kill.bind(process)) {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return 'unknown';
   try {
     kill(pid, 0);
-    return true;
+    return 'alive';
   } catch (err) {
-    return err.code === 'EPERM';
+    if (err.code === 'ESRCH') return 'dead';
+    // Exists, but owned by another user — alive, and none of our business.
+    if (err.code === 'EPERM') return 'alive';
+    return 'unknown';
   }
+}
+
+/** Structural validation. A record we cannot read is litter, never an instruction. */
+export function isWellFormed(record) {
+  return (
+    record !== null && typeof record === 'object' &&
+    record.version === RECORD_VERSION &&
+    typeof record.file === 'string' && record.file.length > 0 &&
+    typeof record.original === 'string' &&
+    typeof record.mutated === 'string'
+  );
+}
+
+/**
+ * Is this a repo-relative path that stays inside the repo?
+ *
+ * The record names a WRITE TARGET. A record copied from another checkout, a
+ * relocated git dir, or one planted by anything able to write the git dir could
+ * otherwise direct that write anywhere on disk. Storing the path repo-relative
+ * and re-deriving it means a record only ever addresses its own repository.
+ */
+export function isContainedRelPath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) return false;
+  if (isAbsolute(relPath)) return false;
+  if (relPath.split(/[\\/]/).includes('..')) return false;
+  return true;
+}
+
+/**
+ * What should a run do about the record it found?
+ *
+ *   restore  — the file on disk is still EXACTLY the mutant we wrote; put it back.
+ *   none     — already the original; the record is litter, drop it.
+ *   skip     — the owner may still be running; leave everything alone.
+ *   conflict — neither original nor mutant, so the file has MOVED ON.
+ *
+ * `conflict` is what makes this safe. Restoring on "differs from original" alone
+ * would overwrite whatever the developer did to that file after the crash — the
+ * same data loss this feature exists to prevent, pointed the other way. On
+ * conflict we must not write AND must not clear the record: that record holds the
+ * only remaining copy of the original bytes.
+ *
+ * @returns {{action: 'restore'|'none'|'skip'|'conflict', reason: string|null}}
+ */
+export function decideRecovery({ ownerState, currentContent, record }) {
+  if (ownerState !== 'dead') {
+    return {
+      action: 'skip',
+      reason: ownerState === 'alive'
+        ? 'another hollow-test run owns this record'
+        : 'ownership of this record could not be established',
+    };
+  }
+  if (currentContent === record.original) return { action: 'none', reason: null };
+  if (currentContent === record.mutated) return { action: 'restore', reason: null };
+  return { action: 'conflict', reason: 'the file matches neither the original nor the mutant' };
+}
+
+function fsyncDir(path) {
+  // Renames and unlinks are only durable once the DIRECTORY entry is synced.
+  let fd;
+  try {
+    fd = openSync(path, 'r');
+    fsyncSync(fd);
+  } catch {
+    // Not every platform lets you open a directory for sync; the write is still
+    // atomic via rename, we simply cannot promise ordering across a power cut.
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+}
+
+/** Write bytes atomically and durably: temp file, fsync, rename, fsync dir. */
+export function writeFileDurable(path, contents) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  let fd;
+  try {
+    fd = openSync(tmp, 'w');
+    writeSync(fd, contents);
+    fsyncSync(fd);
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* ignore */ } }
+  }
+  renameSync(tmp, path);
+  fsyncDir(dirname(path));
+}
+
+/**
+ * Record that `relFile` is about to be mutated.
+ *
+ * THROWS on failure, and the caller must not mutate anything if it does. A
+ * swallowed error here means the mutation proceeds with no way back — exactly the
+ * SIGKILL case the record exists for, silently unprotected.
+ */
+export function writeRecord(recordPath, { pid, relFile, original, mutated }) {
+  writeFileDurable(
+    recordPath,
+    JSON.stringify({ version: RECORD_VERSION, pid, file: relFile, original, mutated }),
+  );
+}
+
+export function readRecord(recordPath) {
+  try {
+    return JSON.parse(readFileSync(recordPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function clearRecord(recordPath) {
+  try {
+    if (existsSync(recordPath)) {
+      unlinkSync(recordPath);
+      fsyncDir(dirname(recordPath));
+    }
+  } catch { /* best effort — a leftover record is re-evaluated, never obeyed blindly */ }
+}
+
+/**
+ * Resolve a record's target to an absolute path, refusing anything that escapes
+ * the repo or reaches it through a symlink.
+ *
+ * @returns {string|null} absolute path, or null if it must not be written
+ */
+export function resolveTarget(repoRoot, relFile) {
+  if (!isContainedRelPath(relFile)) return null;
+  const absolute = resolve(repoRoot, relFile);
+  const rel = relative(repoRoot, absolute);
+  if (rel.startsWith('..') || isAbsolute(rel)) return null;
+  try {
+    // A symlink at the target turns an in-repo path into an arbitrary write.
+    if (lstatSync(absolute).isSymbolicLink()) return null;
+  } catch {
+    return null; // missing target: nothing legitimate to restore
+  }
+  return absolute;
+}
+
+export function recordPathFor(gitDir) {
+  return join(gitDir, INFLIGHT_BASENAME);
 }

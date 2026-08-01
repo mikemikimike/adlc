@@ -1659,20 +1659,20 @@ describe('CLI: no-args and --help', () => {
 
 // ── interrupted runs must never leave a mutant behind ─────────────────────────
 //
-// hollow-test mutates source IN PLACE. Every restore path is process-local, so a
-// run that dies mid-trial can strand a live mutant in the working tree as an
-// unstaged edit — and the next run's refusal ("commit or stash first") reads as if
-// the USER's work is in the way, so the reflex is to commit the mutant.
+// hollow-test mutates source IN PLACE, and every in-process restore path dies
+// with the process. A run killed mid-trial therefore stranded a live mutant as an
+// unstaged edit, and the next run blamed the operator for it ("commit or stash
+// first") — so the reflex was to commit the mutant.
 //
-// Observed for real: a 10-minute tool timeout (SIGTERM) stranded `? 130 :` flipped
-// to `? 131 :` in a plugin CLI. A `authorized = false` -> `true` flip has been
-// stranded the same way before.
-//
-// These assert on STRUCTURE (file content, marker file, a `recovered` field in
-// --json), never on message prose, because the mutation gate rewrites string
-// literals and a test pinned to wording fails for the wrong reason.
+// Two properties are tested here, and they are different:
+//   * CANCELLATION — a catchable signal must stop the run PROMPTLY. Asserting
+//     only "exits eventually with a clean tree" is hollow: it passes with an empty
+//     handler, because the existing `finally` restores the file anyway once the
+//     loop finishes. So these count how many trials actually ran.
+//   * RECOVERY — a kill nothing can catch (SIGKILL) must be cleaned up by the
+//     NEXT run, and only when that run can prove the file is still the mutant.
 
-function createSlowRepo(dir) {
+function createSlowRepo(dir, counterPath) {
   initRepo(dir);
   mkdirSync(join(dir, 'src'));
   mkdirSync(join(dir, 'test'));
@@ -1680,6 +1680,8 @@ function createSlowRepo(dir) {
   writeFileSync(join(dir, 'src', 'thing.mjs'), [
     'export function classify(n) {',
     "  if (n > 10) return 'big';",
+    "  if (n > 5) return 'mid';",
+    "  if (n > 2) return 'low';",
     "  return 'small';",
     '}',
     '',
@@ -1694,12 +1696,12 @@ function createSlowRepo(dir) {
     "import { classify, scale } from '../src/thing.mjs';",
     "test('classify', () => {",
     "  assert.equal(classify(50), 'big');",
+    "  assert.equal(classify(7), 'mid');",
     "  assert.equal(classify(1), 'small');",
     '});',
     "test('scale', () => { assert.equal(scale(3), 6); });",
-    // Deliberately slow, so a signal lands while a trial is in flight rather than
-    // between them — the window this whole feature is about.
-    "test('slow', async () => { await new Promise((r) => setTimeout(r, 1200)); });",
+    // Slow enough that a signal lands INSIDE a trial rather than between trials.
+    "test('slow', async () => { await new Promise((r) => setTimeout(r, 900)); });",
     '',
   ].join('\n'));
   commitAll(dir);
@@ -1707,193 +1709,186 @@ function createSlowRepo(dir) {
   const src = readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8');
   writeFileSync(join(dir, 'src', 'thing.mjs'), src.replace('return n * 2;', 'return n * 2 + 0;'));
   commitAll(dir, 'change');
+  return counterPath;
 }
 
-const SLOW_TEST_CMD = 'node --test test/thing.test.mjs';
+const MAX_MUTANTS = 5;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --max 2 deliberately. These cases need ONE mutant to be in flight when the
-// signal lands; the default of 20 would pay the (deliberately slow) suite twenty
-// times per run, and the mutation gate re-runs this file once per mutant.
-const RUN_ARGS = ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD, '--max', '2'];
-
-function startCli(dir) {
-  return spawn('node', [BIN, ...RUN_ARGS], { cwd: dir, stdio: 'ignore' });
+// Every trial appends one byte, so the number of trials that RAN is observable.
+// A cancelled run must show fewer than a completed one — the assertion an empty
+// signal handler cannot satisfy.
+function testCmdCounting(counterPath) {
+  return `node -e "require('node:fs').appendFileSync(process.argv[1], 'x')" ${counterPath} && node --test test/thing.test.mjs`;
+}
+function trialsRun(counterPath) {
+  return existsSync(counterPath) ? readFileSync(counterPath, 'utf8').length : 0;
 }
 
-/** Resolve once a mutant is actually written to disk, so the signal lands mid-trial. */
+function runArgs(counterPath) {
+  return ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', testCmdCounting(counterPath),
+    '--max', String(MAX_MUTANTS)];
+}
+
+function startCli(dir, counterPath) {
+  return spawn('node', [BIN, ...runArgs(counterPath)], { cwd: dir, stdio: 'ignore' });
+}
+
 async function waitForMutantOnDisk(dir, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (git(['status', '--porcelain'], dir).trim() !== '') return true;
-    await sleep(50);
+    await sleep(40);
   }
   return false;
 }
 
-function committedContent(dir) {
-  return git(['show', 'HEAD:src/thing.mjs'], dir);
-}
+const committedContent = (dir) => git(['show', 'HEAD:src/thing.mjs'], dir);
+const INFLIGHT_BASENAME = 'adlc-hollow-test-inflight.json';
+const inflightPathFor = (dir) => resolve(dir, git(['rev-parse', '--git-dir'], dir).trim(), INFLIGHT_BASENAME);
 
-for (const signal of ['SIGTERM', 'SIGHUP']) {
-  describe(`CLI: ${signal} mid-run restores the mutated file`, () => {
+for (const [signal, expectedCode] of [['SIGTERM', 143], ['SIGHUP', 143], ['SIGINT', 130]]) {
+  describe(`CLI: ${signal} CANCELS the run, promptly`, () => {
     let dir;
-    before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-signal-')); createSlowRepo(dir); });
+    let counter;
+    before(() => {
+      dir = mkdtempSync(join(tmpdir(), 'hollow-signal-'));
+      counter = join(mkdtempSync(join(tmpdir(), 'hollow-count-')), 'trials');
+      createSlowRepo(dir, counter);
+    });
     after(() => { rmSync(dir, { recursive: true, force: true }); });
 
-    it(`leaves no mutant behind when killed by ${signal}`, async () => {
-      const child = startCli(dir);
-      const exited = new Promise((r) => child.on('exit', r));
+    it(`stops the run and leaves no mutant when killed by ${signal}`, async () => {
+      const child = startCli(dir, counter);
+      const exited = new Promise((r) => child.on('exit', (code) => r(code)));
       assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
       child.kill(signal);
-      await exited;
-      await sleep(500);
+      const code = await exited;
+      await sleep(300);
 
+      // THE point of this test. The run must not carry on through the remaining
+      // trials: before the runner became asynchronous, the handler could not be
+      // dispatched at all until the whole synchronous loop finished, so a
+      // cancelled run kept going (measured: 24.6s to exit on an 8-mutant run).
+      const ran = trialsRun(counter);
+      assert.ok(
+        ran < 1 + MAX_MUTANTS,
+        `cancellation was ignored: ${ran} trial(s) ran out of a possible ${1 + MAX_MUTANTS}`,
+      );
+
+      assert.equal(code, expectedCode, `a cancelled run must report cancellation, not a verdict`);
       assert.equal(
-        git(['status', '--porcelain'], dir).trim(),
-        '',
+        git(['status', '--porcelain'], dir).trim(), '',
         `${signal} stranded a mutant: ${git(['diff'], dir)}`,
       );
       assert.equal(readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8'), committedContent(dir));
+      assert.equal(existsSync(inflightPathFor(dir)), false, 'record survived a clean cancellation');
     });
   });
 }
 
 describe('CLI: a mutant stranded by an unhandleable kill is recovered by the next run', () => {
   let dir;
-  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-recover-')); createSlowRepo(dir); });
+  let counter;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'hollow-recover-'));
+    counter = join(mkdtempSync(join(tmpdir(), 'hollow-count-')), 'trials');
+    createSlowRepo(dir, counter);
+  });
   after(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('restores the file instead of blaming the user for a dirty tree', async () => {
-    const child = startCli(dir);
+    const child = startCli(dir, counter);
     const exited = new Promise((r) => child.on('exit', r));
     assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
-    // SIGKILL cannot be trapped: no handler can save this, only durable state can.
-    child.kill('SIGKILL');
+    child.kill('SIGKILL'); // uncatchable: only durable state can save this
     await exited;
     await sleep(300);
     assert.notEqual(git(['status', '--porcelain'], dir).trim(), '', 'SIGKILL should have stranded a mutant');
 
-    const result = runCli([...RUN_ARGS, '--json'], dir);
+    const result = runCli([...runArgs(counter), '--json'], dir);
 
-    // It must NOT have bailed out as an operational error on a dirty tree.
     assert.notEqual(result.status, 1, `refused to run instead of recovering: ${result.stderr}`);
-
     const parsed = JSON.parse(result.stdout);
     assert.ok(parsed.recovered, 'expected the run to report what it recovered');
     assert.equal(parsed.recovered.file, 'src/thing.mjs');
-
     assert.equal(readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8'), committedContent(dir));
     assert.equal(git(['status', '--porcelain'], dir).trim(), '', 'run left the tree dirty');
   });
 });
 
-// ── properties of the in-flight record itself ────────────────────────────────
-//
-// The recovery tests above prove a stranded mutant comes back. These pin the
-// three properties that make the record SAFE, each of which a surviving mutant
-// showed was unverified:
-//
-//   * it lives in the git dir, so it is never committed and never shared between
-//     linked worktrees (a repo-root path recovers just as well — and is wrong);
-//   * a completed run removes it, so it cannot accumulate or be replayed later;
-//   * a record whose owner is still running is left alone, and testing that
-//     liveness must not disturb the process being tested.
-
-const INFLIGHT_BASENAME = 'adlc-hollow-test-inflight.json';
-
-function inflightPathFor(dir) {
-  return resolve(dir, git(['rev-parse', '--git-dir'], dir).trim(), INFLIGHT_BASENAME);
-}
-
-describe('in-flight record: location and lifecycle', () => {
+describe('CLI: recovery refuses to overwrite work that is not the mutant', () => {
   let dir;
-  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-marker-')); createSlowRepo(dir); });
+  let counter;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'hollow-conflict-'));
+    counter = join(mkdtempSync(join(tmpdir(), 'hollow-count-')), 'trials');
+    createSlowRepo(dir, counter);
+  });
+  after(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('leaves a file the developer has since edited exactly as they left it', async () => {
+    const child = startCli(dir, counter);
+    const exited = new Promise((r) => child.on('exit', r));
+    assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
+    child.kill('SIGKILL');
+    await exited;
+    await sleep(300);
+
+    // The developer comes back, sees the damage, and fixes the file by hand.
+    const target = join(dir, 'src', 'thing.mjs');
+    const theirWork = `${committedContent(dir)}\n// repaired by hand after the crash\n`;
+    writeFileSync(target, theirWork);
+
+    const result = runCli(runArgs(counter), dir);
+
+    // Restoring "because it differs from the original" would delete their work —
+    // the same data loss this feature exists to prevent, pointed the other way.
+    assert.equal(readFileSync(target, 'utf8'), theirWork, 'recovery overwrote the developer\'s work');
+    // And the record must survive: it holds the only copy of the original bytes.
+    assert.equal(existsSync(inflightPathFor(dir)), true, 'discarded the only copy of the original bytes');
+    assert.equal(result.status, 1, 'expected the dirty-tree refusal rather than a silent overwrite');
+
+    writeFileSync(target, committedContent(dir));
+    rmSync(inflightPathFor(dir), { force: true });
+  });
+});
+
+describe('CLI: in-flight record location and lifecycle', () => {
+  let dir;
+  let counter;
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'hollow-marker-'));
+    counter = join(mkdtempSync(join(tmpdir(), 'hollow-count-')), 'trials');
+    createSlowRepo(dir, counter);
+  });
   after(() => { rmSync(dir, { recursive: true, force: true }); });
 
   it('writes the record inside the git dir, where git can never see it', async () => {
-    const child = startCli(dir);
+    const child = startCli(dir, counter);
     const exited = new Promise((r) => child.on('exit', r));
     assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
-    child.kill('SIGKILL'); // leaves the record behind for inspection
+    child.kill('SIGKILL');
     await exited;
     await sleep(300);
 
     assert.ok(
       existsSync(inflightPathFor(dir)),
-      'no in-flight record in the git dir — a record written anywhere else would still ' +
-      'recover, but would be committable and shared across linked worktrees',
+      'no record in the git dir — one written elsewhere would still recover, but ' +
+      'would be committable and shared across linked worktrees',
     );
-    // The decisive half: git must not be able to see it at all.
     assert.doesNotMatch(git(['status', '--porcelain'], dir), /adlc-hollow-test-inflight/);
 
-    // Put the repo back for the next case.
-    runCli(RUN_ARGS, dir);
+    runCli(runArgs(counter), dir); // recover, so the next case starts clean
   });
 
   it('removes the record when a run finishes normally', () => {
-    const result = runCli(RUN_ARGS, dir);
+    const result = runCli(runArgs(counter), dir);
     assert.ok(result.status === 0 || result.status === 2, `unexpected exit ${result.status}: ${result.stderr}`);
     assert.equal(
-      existsSync(inflightPathFor(dir)),
-      false,
-      'a finished run left its in-flight record behind — the next run would "recover" from stale state',
+      existsSync(inflightPathFor(dir)), false,
+      'a finished run left its record behind — the next run would "recover" from stale state',
     );
     assert.equal(git(['status', '--porcelain'], dir).trim(), '');
-  });
-});
-
-describe('in-flight record: a run that is still alive owns its file', () => {
-  let dir;
-  let sleeper;
-  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-live-')); createSlowRepo(dir); });
-  after(() => {
-    if (sleeper) { try { sleeper.kill('SIGKILL'); } catch { /* already gone */ } }
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('does not restore a file owned by a live pid, and does not signal that pid', async () => {
-    // Stand in for a concurrent hollow-test: alive, and killed by SIGHUP — which
-    // is what `process.kill(pid, 1)` would send if the liveness probe used any
-    // signal other than 0.
-    sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
-    for (let i = 0; i < 100 && sleeper.pid === undefined; i += 1) await sleep(20);
-    assert.ok(sleeper.pid, 'sleeper never started');
-
-    const target = join(dir, 'src', 'thing.mjs');
-    const original = readFileSync(target, 'utf8');
-    const foreignMutant = `${original}\n// mutant from the other run\n`;
-    writeFileSync(target, foreignMutant);
-    writeFileSync(
-      inflightPathFor(dir),
-      JSON.stringify({ version: 1, pid: sleeper.pid, file: target, original }),
-    );
-
-    const result = runCli(RUN_ARGS, dir);
-
-    // Stealing the file from a running trial would corrupt it and could report
-    // that run's mutant as killed, so the correct move is to leave it and refuse.
-    assert.equal(
-      readFileSync(target, 'utf8'),
-      foreignMutant,
-      'restored a file still owned by a LIVE run',
-    );
-    assert.equal(result.status, 1, 'expected the dirty-tree refusal, since recovery must not happen here');
-
-    // Probing liveness must observe, never disturb. Checked via the child's own
-    // exit state rather than kill(pid, 0): this process is the sleeper's parent,
-    // so a killed sleeper lingers as a ZOMBIE that still answers signal 0 until
-    // it is reaped — which would hide a probe that really did deliver SIGHUP.
-    // (lib/inflight.mjs pins the signal number directly; this is the end-to-end half.)
-    await sleep(400);
-    assert.equal(
-      sleeper.exitCode === null && sleeper.signalCode === null,
-      true,
-      `the liveness probe signalled the process it was only meant to check `
-      + `(exitCode=${sleeper.exitCode} signalCode=${sleeper.signalCode})`,
-    );
-
-    writeFileSync(target, original);
-    rmSync(inflightPathFor(dir), { force: true });
   });
 });

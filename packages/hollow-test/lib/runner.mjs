@@ -2,8 +2,42 @@
 // Runs a single mutant: writes mutated content, executes test command, restores file.
 // Returns { killed: boolean, timedOut: boolean, exitCode: number | null }
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
+
+// The child currently under test, so cancellation can reach it.
+//
+// This is the whole reason runTest is asynchronous. It used to be spawnSync, which
+// blocks the event loop for the entire trial — and the mutation loop is a
+// synchronous for-loop over trials, so Node could not dispatch a signal handler
+// until every mutant had run. Registering a SIGTERM handler in that shape does not
+// make cancellation work, it makes it WORSE: the handler suppresses the default
+// termination and then cannot run, so a cancelled run keeps going to completion.
+// Measured before this change: 24.6 seconds from SIGTERM to exit on an 8-mutant run.
+let activeChild = null;
+
+/**
+ * Terminate the test command and everything it spawned.
+ *
+ * Negative pid signals the whole PROCESS GROUP. The child is a shell, so killing
+ * only it would orphan the test runner beneath — which then keeps writing to the
+ * tree we are about to restore.
+ */
+export function terminateActiveTest(signal = 'SIGTERM') {
+  const child = activeChild;
+  if (child === null || child.pid === undefined) return false;
+  try {
+    process.kill(-child.pid, signal);
+    return true;
+  } catch {
+    try {
+      child.kill(signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
 
 // Strip NODE_TEST_CONTEXT from the child environment so that a test command
 // using `node --test` does not hit Node.js v22's recursive-invocation guard
@@ -25,18 +59,53 @@ function childEnv() {
  * @param {string} testCmd   - Shell command to run the test suite.
  * @param {number} timeoutMs - Maximum time in ms to wait for the test command.
  * @param {string} cwd       - Working directory for the test command.
- * @returns {{ status: number | null, timedOut: boolean, spawnFailed: boolean, reason: string | null }}
+ * @returns {Promise<{ status: number | null, timedOut: boolean, spawnFailed: boolean, reason: string | null }>}
  */
 export function runTest(testCmd, timeoutMs, cwd) {
-  const result = spawnSync(testCmd, {
-    shell: true,
-    cwd,
-    timeout: timeoutMs,
-    encoding: 'utf8',
-    stdio: 'pipe',
-    env: childEnv(),
+  return new Promise((settle) => {
+    let child;
+    try {
+      child = spawn(testCmd, {
+        shell: true,
+        cwd,
+        // Own process group, so a timeout or a cancellation can take down the
+        // shell AND the test runner under it rather than just the shell.
+        detached: true,
+        // 'ignore' rather than 'pipe': nothing reads this output, and an unread
+        // pipe deadlocks a chatty suite once the buffer fills. spawnSync captured
+        // and discarded it, so callers see exactly what they saw before.
+        stdio: 'ignore',
+        env: childEnv(),
+      });
+    } catch (err) {
+      settle(classifyTestResult({ status: null, signal: null, error: err }));
+      return;
+    }
+    activeChild = child;
+
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+    }, timeoutMs);
+
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      activeChild = null;
+      settle(classifyTestResult(result));
+    };
+
+    child.on('error', (err) => finish({ status: null, signal: null, error: err }));
+    child.on('exit', (status, signal) => {
+      // classifyTestResult already reads a SIGTERM exit as a timeout; make an
+      // expired deadline say so even when the shell reports a status instead.
+      if (timedOut) finish({ status: null, signal: 'SIGTERM' });
+      else finish({ status, signal });
+    });
   });
-  return classifyTestResult(result);
 }
 
 /**
@@ -98,9 +167,9 @@ export function classifyTestResult(result) {
  * @param {string} testCmd   - Shell command to run the test suite.
  * @param {number} timeoutMs - Maximum time in ms to wait for the test command.
  * @param {string} cwd       - Working directory for the test command.
- * @returns {{ killed: boolean, timedOut: boolean, exitCode: number | null }}
+ * @returns {Promise<{ killed: boolean, timedOut: boolean, exitCode: number | null }>}
  */
-export function runMutant(filePath, original, mutated, testCmd, timeoutMs, cwd) {
+export async function runMutant(filePath, original, mutated, testCmd, timeoutMs, cwd) {
   let trial;
   // No initialiser: it is assigned unconditionally below, so a literal here is
   // dead weight the mutation gate would flag forever.
@@ -124,7 +193,7 @@ export function runMutant(filePath, original, mutated, testCmd, timeoutMs, cwd) 
     // approximating them.
     syntax = checkSyntax(filePath, cwd);
     invalid = syntax === 'invalid';
-    if (syntax === 'valid') trial = runTest(testCmd, timeoutMs, cwd);
+    if (syntax === 'valid') trial = await runTest(testCmd, timeoutMs, cwd);
   } finally {
     // Always restore original content, even if the test run threw.
     writeFileSync(filePath, original, 'utf8');
