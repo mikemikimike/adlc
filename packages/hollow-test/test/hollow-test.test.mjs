@@ -1655,6 +1655,24 @@ describe('CLI: no-args and --help', () => {
     assert.ok(result.stdout.includes('hollow-test'));
     assert.ok(result.stdout.includes('--test-cmd'));
   });
+
+  it('documents every exit code it can return', () => {
+    // These are a CONTRACT: CI and wrappers branch on them, and 130/143 were
+    // added so a cancelled run stops reading as a verdict. A number that drifts
+    // here misinforms every caller, so the help text is pinned deliberately.
+    const result = runCli(['--help'], process.cwd());
+    for (const [code, meaning] of [
+      ['0', /All mutants killed/],
+      ['1', /Operational error/],
+      ['2', /survived/],
+      ['130', /SIGINT/],
+      ['143', /SIGTERM/],
+    ]) {
+      const line = result.stdout.split('\n').find((l) => new RegExp(`^\\s*${code}\\s`).test(l));
+      assert.ok(line, `exit code ${code} is not documented`);
+      assert.match(line, meaning);
+    }
+  });
 });
 
 // ── interrupted runs must never leave a mutant behind ─────────────────────────

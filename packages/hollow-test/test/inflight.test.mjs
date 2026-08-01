@@ -66,6 +66,15 @@ test('an unrecognised probe failure is UNKNOWN, never dead', () => {
   assert.equal(probeOwner(4242, () => { throw killError('EINVAL'); }), 'unknown');
 });
 
+test('the lowest legitimate pid is still probed', () => {
+  // The guard rejects pid <= 0. Off by one and pid 1 — init, and a perfectly
+  // real owner inside a container — would be dismissed as unknown, silently
+  // disabling recovery there.
+  let seen = null;
+  assert.equal(probeOwner(1, (pid) => { seen = pid; }), 'alive');
+  assert.equal(seen, 1);
+});
+
 test('a malformed pid is unknown rather than probed', () => {
   for (const bad of [0, -1, 1.5, '4242', null, undefined, NaN]) {
     let probed = false;
@@ -195,6 +204,9 @@ test('a record round-trips, and an unreadable one reads as absent rather than as
     writeRecord(path, { pid: 7, relFile: 'src/a.mjs', original: 'o', mutated: 'm' });
     const parsed = readRecord(path);
     assert.equal(parsed.version, RECORD_VERSION);
+    // Pinned as a LITERAL as well: RECORD_VERSION alone would move with the code,
+    // and this is an on-disk format that older and newer runs must agree on.
+    assert.equal(parsed.version, 2, 'bumping the record format needs a deliberate migration');
     assert.equal(parsed.file, 'src/a.mjs');
     assert.equal(parsed.mutated, 'm');
 
