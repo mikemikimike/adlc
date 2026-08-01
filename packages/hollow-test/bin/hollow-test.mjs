@@ -147,7 +147,12 @@ function pidAlive(pid) {
 }
 
 function recoverInflight() {
-  if (inflightPath === null || !existsSync(inflightPath)) return null;
+  // Two statements rather than one `||`: with the operands combined, swapping the
+  // operator produces a mutant no test can distinguish (falling through to the
+  // read below just throws and lands on the same `return null`), so the compound
+  // form is untestable by construction rather than merely untested.
+  if (inflightPath === null) return null;
+  if (!existsSync(inflightPath)) return null;
   let record;
   try {
     record = JSON.parse(readFileSync(inflightPath, 'utf8'));

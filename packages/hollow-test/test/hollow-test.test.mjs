@@ -11,6 +11,7 @@ import {
   readFileSync,
   mkdirSync,
   symlinkSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1784,5 +1785,114 @@ describe('CLI: a mutant stranded by an unhandleable kill is recovered by the nex
 
     assert.equal(readFileSync(join(dir, 'src', 'thing.mjs'), 'utf8'), committedContent(dir));
     assert.equal(git(['status', '--porcelain'], dir).trim(), '', 'run left the tree dirty');
+  });
+});
+
+// ── properties of the in-flight record itself ────────────────────────────────
+//
+// The recovery tests above prove a stranded mutant comes back. These pin the
+// three properties that make the record SAFE, each of which a surviving mutant
+// showed was unverified:
+//
+//   * it lives in the git dir, so it is never committed and never shared between
+//     linked worktrees (a repo-root path recovers just as well — and is wrong);
+//   * a completed run removes it, so it cannot accumulate or be replayed later;
+//   * a record whose owner is still running is left alone, and testing that
+//     liveness must not disturb the process being tested.
+
+const INFLIGHT_BASENAME = 'adlc-hollow-test-inflight.json';
+
+function inflightPathFor(dir) {
+  return resolve(dir, git(['rev-parse', '--git-dir'], dir).trim(), INFLIGHT_BASENAME);
+}
+
+describe('in-flight record: location and lifecycle', () => {
+  let dir;
+  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-marker-')); createSlowRepo(dir); });
+  after(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('writes the record inside the git dir, where git can never see it', async () => {
+    const child = startCli(dir);
+    const exited = new Promise((r) => child.on('exit', r));
+    assert.ok(await waitForMutantOnDisk(dir), 'no mutant ever reached disk — test proves nothing');
+    child.kill('SIGKILL'); // leaves the record behind for inspection
+    await exited;
+    await sleep(300);
+
+    assert.ok(
+      existsSync(inflightPathFor(dir)),
+      'no in-flight record in the git dir — a record written anywhere else would still ' +
+      'recover, but would be committable and shared across linked worktrees',
+    );
+    // The decisive half: git must not be able to see it at all.
+    assert.doesNotMatch(git(['status', '--porcelain'], dir), /adlc-hollow-test-inflight/);
+
+    // Put the repo back for the next case.
+    runCli(['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD], dir);
+  });
+
+  it('removes the record when a run finishes normally', () => {
+    const result = runCli(
+      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD],
+      dir,
+    );
+    assert.ok(result.status === 0 || result.status === 2, `unexpected exit ${result.status}: ${result.stderr}`);
+    assert.equal(
+      existsSync(inflightPathFor(dir)),
+      false,
+      'a finished run left its in-flight record behind — the next run would "recover" from stale state',
+    );
+    assert.equal(git(['status', '--porcelain'], dir).trim(), '');
+  });
+});
+
+describe('in-flight record: a run that is still alive owns its file', () => {
+  let dir;
+  let sleeper;
+  before(() => { dir = mkdtempSync(join(tmpdir(), 'hollow-live-')); createSlowRepo(dir); });
+  after(() => {
+    if (sleeper) { try { sleeper.kill('SIGKILL'); } catch { /* already gone */ } }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not restore a file owned by a live pid, and does not signal that pid', async () => {
+    // Stand in for a concurrent hollow-test: alive, and killed by SIGHUP — which
+    // is what `process.kill(pid, 1)` would send if the liveness probe used any
+    // signal other than 0.
+    sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    for (let i = 0; i < 100 && sleeper.pid === undefined; i += 1) await sleep(20);
+    assert.ok(sleeper.pid, 'sleeper never started');
+
+    const target = join(dir, 'src', 'thing.mjs');
+    const original = readFileSync(target, 'utf8');
+    const foreignMutant = `${original}\n// mutant from the other run\n`;
+    writeFileSync(target, foreignMutant);
+    writeFileSync(
+      inflightPathFor(dir),
+      JSON.stringify({ version: 1, pid: sleeper.pid, file: target, original }),
+    );
+
+    const result = runCli(
+      ['--base', 'main', '--target', 'src/thing.mjs', '--test-cmd', SLOW_TEST_CMD],
+      dir,
+    );
+
+    // Stealing the file from a running trial would corrupt it and could report
+    // that run's mutant as killed, so the correct move is to leave it and refuse.
+    assert.equal(
+      readFileSync(target, 'utf8'),
+      foreignMutant,
+      'restored a file still owned by a LIVE run',
+    );
+    assert.equal(result.status, 1, 'expected the dirty-tree refusal, since recovery must not happen here');
+
+    // Probing liveness must observe, never disturb.
+    assert.equal(sleeper.killed, false);
+    let alive = true;
+    try { process.kill(sleeper.pid, 0); } catch { alive = false; }
+    assert.equal(alive, true, 'the liveness probe signalled the process it was only meant to check');
+
+    writeFileSync(target, original);
+    rmSync(inflightPathFor(dir), { force: true });
   });
 });
