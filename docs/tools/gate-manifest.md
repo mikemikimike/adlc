@@ -33,6 +33,7 @@ gate-manifest verify [--json] [--dir path] [--allow-legacy-unsigned]
 gate-manifest show   [--ticket id] [--json] [--dir path]
 gate-manifest attest [--ticket id] [--dir path]
 gate-manifest repair-chain --reason "..." [--write] [--attest-unsigned] [--json] [--dir path]
+gate-manifest enable [--write] [--json] [--dir path]
 ```
 
 Prosecution, runner acceptance, rails evidence, and manual gate records use the
@@ -117,6 +118,54 @@ gate-manifest show --ticket T-42 --json
 | `--ticket id` | Filter to entries with this ticket id |
 | `--json` | Emit `{ entries, skipped }` |
 | `--dir path` | Override ledger directory |
+
+### enable
+
+Switch a repository with **no recorded evidence** into segmented (forest)
+mode by writing the `.adlc/manifest.d/.store.json` activation marker. Both
+storage modes are permanent and supported (spec §1.1) — run this only for
+repositories doing parallel worktree fan-out, where concurrent branches
+conflict on the single file's tail.
+
+```sh
+gate-manifest enable          # dry-run: prints the plan, writes nothing
+gate-manifest enable --write  # writes the marker atomically
+```
+
+Activation without `ADLC_MANIFEST_KEY` refuses unless `--allow-keyless` is
+passed: keyless-minted segments can never be authenticated by a key added
+later, so keyless forest mode is single-checkout only, permanently — a
+deliberate opt-in, never a stumble. Re-running `enable` on an already-enabled
+repository re-checks the gitignore contract as a health check and exits `2`
+if ignore rules have drifted (e.g. `.lineage` became trackable).
+
+Dry-run by default. Exit `0` on a written or already-enabled repo (a
+cutover-tailed root counts as enabled even if its marker was lost). Exit `2`,
+writing nothing, when:
+
+- there is no `.adlc/` workspace (run `adlc init` first — enable never
+  creates one as a side effect);
+- the root `manifest.jsonl` already records evidence — history-preserving
+  migration is the cutover ceremony (T-MANIFEST-FOREST-MIGRATE), not
+  greenfield enable;
+- `manifest.d/` has content but no valid marker (a broken state to repair by
+  hand, not silently adopt);
+- the `.gitignore` contract fails in EITHER direction — the marker or
+  evidence segments would be ignored (they must commit, or every other
+  checkout silently stays in single-file mode), or the checkout-local
+  `.lineage` token and lock files would be trackable (they must stay
+  ignored — a committed token recreates the merge conflict forest mode
+  removes and makes clones treat a segment as self-minted). The error names
+  the full ordered block: `!.adlc/manifest.d/`, `!.adlc/manifest.d/**`,
+  `.adlc/manifest.d/.lineage`, `.adlc/manifest.d/*.lock`.
+
+`--json` emits exactly one JSON document on stdout in every mode.
+
+The gitignore probe is best-effort over the common rule shapes (the
+directory, the marker file, and a representative `*.jsonl` segment name). A
+rule targeting a specific branch-derived slug (e.g. `release-*.jsonl`) can
+still evade it — enforcing committability of each real segment at the moment
+it is minted belongs to the segment writer, deliberately outside `enable`.
 
 ### attest
 

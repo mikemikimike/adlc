@@ -670,6 +670,219 @@ describe('recoverOpenSegment (lineage-durability finding)', () => {
       );
     } finally { clean(root); }
   });
+
+  // T-MANIFEST-FOREST follow-up (gap 1, ticket T-01KYTQ4BADHSDJNBFNZHB2ZG5V):
+  // a WRITE that happens before any read on a fresh clone (no local .lineage
+  // token) used to mint a needless duplicate segment rather than continuing a
+  // real, unambiguous, already-committed one for this branch. Mirrors
+  // @adlc/gate-manifest/lib/lineage.mjs's identical test.
+  // Exercises the REAL producer end-to-end (clone -> recordTicketEvidence ->
+  // readOwnChains), not just the resolver: AC1 asks that evidence recorded
+  // BEFORE the write is still visible to a consumer AFTER it, which a
+  // resolver-only assertion cannot show. Raised by adversarial review.
+  it('AC12: a fresh clone whose FIRST action is a real WRITE extends the branch\'s own committed segment, and the pre-clone evidence stays visible to a reader afterwards', () => {
+    const KEY = 'ac12-clone-write-key';
+    const { root, dir } = gitRepo('feat/clone-write-first');
+    let clonedRoot;
+    try {
+      activate(dir);
+      recordTicketEvidence(root, baseEvidence({ key: KEY, ticketId: 'ORIGINAL' }));
+      const first = resolveOpenSegment(dir, { cwd: root });
+      execFileSync('git', ['add', '.adlc/manifest.d/.store.json', `.adlc/manifest.d/${first.name}`], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('git', ['commit', '-q', '-m', 'segment evidence'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+
+      clonedRoot = mkdtempSync(join(tmpdir(), 'adlc-ticket-segments-clone-write-'));
+      execFileSync('git', ['clone', '-q', '--branch', 'feat/clone-write-first', root, clonedRoot], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const clonedDir = join(clonedRoot, '.adlc');
+      assert.equal(existsSync(lineagePath(clonedDir)), false, 'precondition: the fresh clone has no local .lineage token');
+
+      // The FIRST action in this clone is a REAL WRITE through the production
+      // producer — not merely a resolver call.
+      recordTicketEvidence(clonedRoot, baseEvidence({ key: KEY, ticketId: 'AFTER-CLONE', transactionId: 'tx-2' }));
+
+      const segs = readdirSync(join(clonedDir, 'manifest.d')).filter((n) => n.endsWith('.jsonl'));
+      assert.deepEqual(segs, [first.name], 'the write must EXTEND the committed segment — no needless duplicate minted');
+
+      // ...and a real consumer read AFTER the write still surfaces the pre-clone evidence.
+      const chains = readOwnChains(clonedDir, { cwd: clonedRoot, allowRecovery: true, key: KEY });
+      assert.equal(chains.length, 2, 'root + the single recovered segment');
+      const tickets = chains[1].map((e) => e.ticket);
+      assert.ok(tickets.includes('ORIGINAL'), 'pre-clone evidence must remain visible to a reader AFTER the write');
+      assert.ok(tickets.includes('AFTER-CLONE'), 'the newly written evidence must be visible too');
+      assert.equal(chains[1].length, 2, 'exactly the two entries — the recovered segment was extended, not replaced');
+
+      // Deliberately does NOT heal (write) the token from this UNVERIFIED
+      // recovery match (adversarial-review finding) — see the sibling
+      // gate-manifest test for the full rationale.
+      assert.equal(existsSync(lineagePath(clonedDir)), false, 'recovering via (b) must never write the local token — it would launder an unverified match into the trusted fast path');
+      // A SECOND write re-scans via (b) again and still extends the same segment.
+      recordTicketEvidence(clonedRoot, baseEvidence({ key: KEY, ticketId: 'THIRD', transactionId: 'tx-3' }));
+      assert.deepEqual(readdirSync(join(clonedDir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')), [first.name], 'the second write must also extend, not mint');
+    } finally {
+      clean(root);
+      if (clonedRoot) clean(clonedRoot);
+    }
+  });
+
+  // Keyed: recovery (and its ambiguity refusal) is key-gated — a keyless
+  // writer skips recovery and mints fresh by design, mirroring the keyless
+  // reader's refusal to trust recovered content.
+  it('AC12: refuses (ambiguous) rather than mint when recovery finds more than one candidate segment for this branch', () => {
+    const KEY = 'ambiguity-key';
+    const { root, dir } = gitRepo('feat/ambiguous-write');
+    try {
+      activate(dir);
+      recordTicketEvidence(root, baseEvidence({ key: KEY }));
+      const slug = deriveSlug('feat/ambiguous-write');
+      const secondName = `${slug}-${generateSegmentUlid(Date.now() + 1000)}.jsonl`;
+      writeFileSync(
+        segmentPath(dir, secondName),
+        `${JSON.stringify({ seq: 1, gate: 'evidence', ts: new Date().toISOString(), data: {}, files: {}, prev: null, anchor: null, branch: 'feat/ambiguous-write' })}\n`,
+      );
+      execFileSync('git', ['add', `.adlc/manifest.d/${secondName}`], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('git', ['commit', '-q', '-m', 'second ambiguous segment'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      rmSync(lineagePath(dir), { force: true }); // no token to disambiguate
+
+      // A REAL write must refuse — asserting on the resolver alone would not
+      // show that the refusal actually propagates out through the producer.
+      assert.throws(
+        () => recordTicketEvidence(root, baseEvidence({ key: KEY, transactionId: 'tx-ambiguous' })),
+        /ambiguous/,
+        'a WRITE must refuse rather than silently pick one of two candidate segments to extend',
+      );
+      assert.equal(readdirSync(join(dir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 2, 'the refused write must not have minted a third segment');
+    } finally { clean(root); }
+  });
+
+  // AC13 — a keyless writer facing a committed same-branch segment FAILS
+  // CLOSED: extending strands the checkout (the keyless reader refuses
+  // recovered content) and minting shadows the committed evidence behind
+  // the fresh token — refusal hides nothing. Keyless greenfield writes
+  // still mint normally (the origin repo's own first write proves it).
+  it('AC13: a KEYLESS fresh clone whose first action is a write REFUSES — never extends, never shadow-mints', () => {
+    const { root, dir } = gitRepo('feat/keyless-clone');
+    let clonedRoot;
+    try {
+      activate(dir);
+      recordTicketEvidence(root, baseEvidence({ ticketId: 'ORIGINAL' })); // keyless greenfield mint works
+      const s1 = readdirSync(join(dir, 'manifest.d')).find((n) => n.endsWith('.jsonl'));
+      execFileSync('git', ['add', '.adlc/manifest.d/.store.json', `.adlc/manifest.d/${s1}`], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('git', ['commit', '-q', '-m', 'keyless evidence'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+
+      clonedRoot = mkdtempSync(join(tmpdir(), 'adlc-ticket-keyless-clone-'));
+      execFileSync('git', ['clone', '-q', '--branch', 'feat/keyless-clone', root, clonedRoot], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const clonedDir = join(clonedRoot, '.adlc');
+      const s1Bytes = readFileSync(join(clonedDir, 'manifest.d', s1));
+
+      assert.throws(
+        () => recordTicketEvidence(clonedRoot, baseEvidence({ ticketId: 'KEYLESS-AFTER-CLONE', transactionId: 'tx-2' })),
+        /shadow|neither authenticate/,
+        'a keyless write must fail closed when a committed same-branch segment exists',
+      );
+      assert.equal(readdirSync(join(clonedDir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 1, 'nothing may have been minted');
+      assert.deepEqual(readFileSync(join(clonedDir, 'manifest.d', s1)), s1Bytes, 'the committed segment stays byte-identical');
+      assert.equal(existsSync(lineagePath(clonedDir)), false, 'no token may have been written');
+    } finally {
+      clean(root);
+      if (clonedRoot) clean(clonedRoot);
+    }
+  });
+
+  // v1 signatures omit branch/anchor — a bolted-on branch claim still
+  // verifies, so identity must be v2-authenticated (round-7 finding).
+  it('AC13: a KEYED writer refuses a candidate whose branch claim rides a v1 signature', () => {
+    const KEY = 'v1-forgery-key';
+    const { root, dir } = gitRepo('feat/v1-forged');
+    let clonedRoot;
+    try {
+      activate(dir);
+      const entry = { seq: 1, gate: 'evidence', ts: '2026-01-01T00:00:00.000Z', data: { note: 'v1' }, files: {}, prev: null };
+      entry.sig = createHmac('sha256', KEY).update(canonicalEntryBytes(entry)).digest('hex'); // no sigVersion → v1 canonical
+      entry.anchor = null;
+      entry.branch = 'feat/v1-forged';
+      const name = `${deriveSlug('feat/v1-forged')}-${generateSegmentUlid()}.jsonl`;
+      writeFileSync(segmentPath(dir, name), `${JSON.stringify(entry)}\n`);
+      execFileSync('git', ['add', `.adlc/manifest.d/${name}`, '.adlc/manifest.d/.store.json'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('git', ['commit', '-q', '-m', 'forged v1 branch claim'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+
+      clonedRoot = mkdtempSync(join(tmpdir(), 'adlc-ticket-v1-forged-'));
+      execFileSync('git', ['clone', '-q', '--branch', 'feat/v1-forged', root, clonedRoot], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const clonedDir = join(clonedRoot, '.adlc');
+
+      assert.throws(
+        () => recordTicketEvidence(clonedRoot, baseEvidence({ key: KEY, ticketId: 'AFTER', transactionId: 'tx-2' })),
+        /verified v2 signature|cannot be authenticated|unsigned/,
+        'a v1-signed branch claim is not an authenticated identity',
+      );
+      assert.equal(readdirSync(join(clonedDir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 1, 'nothing may have been minted past the refused candidate');
+    } finally {
+      clean(root);
+      if (clonedRoot) clean(clonedRoot);
+    }
+  });
+
+  it('AC13: a KEYED writer refuses an unauthenticatable single candidate — no extend, no duplicate mint', () => {
+    const { root, dir } = gitRepo('feat/unauth-candidate');
+    let clonedRoot;
+    try {
+      activate(dir);
+      recordTicketEvidence(root, baseEvidence({ ticketId: 'UNSIGNED' })); // keyless → unsigned entries
+      const s1 = readdirSync(join(dir, 'manifest.d')).find((n) => n.endsWith('.jsonl'));
+      execFileSync('git', ['add', '.adlc/manifest.d/.store.json', `.adlc/manifest.d/${s1}`], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('git', ['commit', '-q', '-m', 'unsigned segment'], { cwd: root, stdio: ['ignore', 'pipe', 'ignore'] });
+
+      clonedRoot = mkdtempSync(join(tmpdir(), 'adlc-ticket-unauth-clone-'));
+      execFileSync('git', ['clone', '-q', '--branch', 'feat/unauth-candidate', root, clonedRoot], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const clonedDir = join(clonedRoot, '.adlc');
+
+      assert.throws(
+        () => recordTicketEvidence(clonedRoot, baseEvidence({ key: 'a-real-key', ticketId: 'AFTER', transactionId: 'tx-2' })),
+        /cannot be authenticated|no signed entries|unsigned/,
+        'an unauthenticatable same-branch candidate must refuse, not fork the lineage',
+      );
+      assert.equal(readdirSync(join(clonedDir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 1, 'no duplicate segment may have been minted');
+      assert.equal(existsSync(lineagePath(clonedDir)), false, 'no token may have been written');
+    } finally {
+      clean(root);
+      if (clonedRoot) clean(clonedRoot);
+    }
+  });
+
+  // AC15 — the marker's persisted auth mode is enforced by THIS package's
+  // resolver too (twin of gate-manifest's): a keyed forest written keylessly
+  // by any producer would strand keyed clones permanently.
+  it('AC15: a keyed-mode marker refuses a keyless ticket-evidence write before touching anything', () => {
+    const { root, dir } = gitRepo('feat/keyed-forest');
+    try {
+      mkdirSync(join(dir, 'manifest.d'), { recursive: true });
+      writeFileSync(join(dir, 'manifest.d', '.store.json'), JSON.stringify({ format: 'adlc-manifest-segments', version: 1, auth: 'keyed' }));
+      assert.throws(
+        () => recordTicketEvidence(root, baseEvidence()),
+        /keyed mode/,
+        'a keyless write into a keyed forest must refuse',
+      );
+      assert.deepEqual(readdirSync(join(dir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')), [], 'nothing may have been minted');
+      // The keyed write works.
+      recordTicketEvidence(root, baseEvidence({ key: 'twin-persist-key' }));
+      assert.equal(readdirSync(join(dir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 1);
+    } finally { clean(root); }
+  });
+
+  // AC14 — mint-time committability, mirroring the gate-manifest twin.
+  it('AC14: minting refuses when the branch-derived segment filename is gitignored — before any evidence is recorded', () => {
+    const { root, dir } = gitRepo('release/1.0');
+    try {
+      activate(dir);
+      writeFileSync(join(root, '.gitignore'), '.adlc/manifest.d/release-*.jsonl\n');
+      assert.throws(
+        () => recordTicketEvidence(root, baseEvidence()),
+        /refusing to mint/,
+        'evidence written into an ignored file would be local-only — silent divergence',
+      );
+      assert.equal(readdirSync(join(dir, 'manifest.d')).filter((n) => n.endsWith('.jsonl')).length, 0, 'nothing may have been recorded');
+      assert.equal(existsSync(lineagePath(dir)), false, 'no token may have been written');
+    } finally { clean(root); }
+  });
 });
 
 // readOwnChains's `allowRecovery` flag (distinct-provider adversarial-review

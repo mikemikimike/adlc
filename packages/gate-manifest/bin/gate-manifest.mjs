@@ -8,6 +8,7 @@ import { verify } from '../lib/verify.mjs';
 import { loadFiltered, renderEntries } from '../lib/show.mjs';
 import { buildAttest } from '../lib/attest.mjs';
 import { repairChain } from '../lib/repair.mjs';
+import { enable } from '../lib/enable.mjs';
 import { ADLC_DIR } from '@adlc/core';
 import { getKey } from '../lib/sign.mjs';
 import { resolveCeremonyKey, writeKeyHandoffFile, computeKeyFingerprint } from '../lib/key-ceremony.mjs';
@@ -19,7 +20,8 @@ const USAGE =
   '       show   [--ticket id] [--json]\n' +
   '       attest [--ticket id]\n' +
   '       repair-chain --reason "..." [--write] [--attest-unsigned] [--json]\n' +
-  '       generate-key --output <path> [--allow-key-import] [--json]';
+  '       generate-key --output <path> [--allow-key-import] [--json]\n' +
+  '       enable [--write] [--json] [--allow-keyless]';
 
 const { values: flags, positionals } = parseArgs({
   usage: USAGE,
@@ -35,6 +37,7 @@ const { values: flags, positionals } = parseArgs({
     'allow-legacy-unsigned': { type: 'boolean', default: false },
     output: { type: 'string' },
     'allow-key-import': { type: 'boolean', default: false },
+    'allow-keyless': { type: 'boolean', default: false },
   },
 });
 
@@ -219,5 +222,44 @@ if (verb === 'generate-key') {
   pass();
 }
 
+// ── enable ──────────────────────────────────────────────────────────────────
+// Greenfield forest-mode activation (spec 'Storage modes'). Dry-run by
+// default; refusals are gate failures (exit 2) that leave the tree untouched.
+if (verb === 'enable') {
+  // Keyless activation is a ONE-WAY trap for multi-checkout workflows
+  // (adversarial-review finding): keyless-minted first entries carry no v2
+  // signature, so configuring a key LATER can never authenticate them, and
+  // token-less checkouts of the branch fail closed forever. Activation is
+  // the moment to surface that — refuse unless the operator opts into
+  // single-checkout keyless mode deliberately. Key resolution is a bin
+  // concern (key-hermeticity: libraries never read the environment).
+  if (getKey(process.env) === null && !flags['allow-keyless']) {
+    const keylessReason = 'no ADLC_MANIFEST_KEY is configured. Keyless forest mode is single-checkout only, PERMANENTLY: '
+      + 'keyless-minted segments can never be authenticated by a later key, so every other clone of a branch fails closed on '
+      + 'its first write. Configure the signing key first, or re-run with --allow-keyless to accept single-checkout mode deliberately.';
+    if (flags.json) {
+      printJson({ decision: 'refuse-keyless', reason: keylessReason });
+      process.exit(2);
+    }
+    gateFail(`enable refused: ${keylessReason}`);
+  }
+  let out;
+  try {
+    out = enable(flags.dir, { write: flags.write, auth: getKey(process.env) === null ? 'keyless' : 'keyed' });
+  } catch (err) {
+    opError(err.message);
+  }
+  const refused = out.decision.startsWith('refuse-');
+  if (flags.json) {
+    // Exactly ONE JSON document on stdout, in every mode (AC11).
+    printJson(out);
+    process.exit(refused ? 2 : 0);
+  }
+  if (refused) gateFail(`enable refused: ${out.reason}`);
+  if (out.decision === 'already-enabled') pass(out.reason);
+  if (out.written) pass(`forest mode enabled — wrote ${out.markerPath}`);
+  pass(`dry-run: would write ${out.markerPath} to enable forest mode — re-run with --write to apply`);
+}
+
 // Unknown verb
-opError(`unknown verb: ${verb}. Expected: record | verify | show | attest | repair-chain | generate-key`);
+opError(`unknown verb: ${verb}. Expected: record | verify | show | attest | repair-chain | generate-key | enable`);
