@@ -410,8 +410,18 @@ When the repo is segmented (§4.7), `appendManifestEntry`:
       legitimately owning two committed segments (the rootless-fork note
       below) turns from a read-only limitation into a total write outage on
       any token-less checkout of that branch until an operator resolves it
-      by hand (there is no `adopt`/repair command yet — a follow-up, not
-      solved here). Minting a THIRD segment instead of refusing was
+      with `adlc gate-manifest adopt`, which lists the candidate lineages
+      and binds this checkout to the chosen one by writing the local token.
+      Because a token short-circuits recovery for every later write and
+      read, adopt first applies BOTH of recovery's gates — integrity
+      (refusing while any non-conforming object or unreadable first entry
+      exists, so adoption cannot convert a fail-closed anomaly into
+      permanent silence) and authentication (v2-verified first entry with a
+      key; chain intactness alone only where the marker EXPLICITLY declares
+      `auth: "keyless"`, which the keyless reader's own contract already
+      matches — a forest declaring no mode requires a key, since a missing
+      key is far more often an oversight than a configuration). It never touches
+      committed bytes. Minting a THIRD segment instead of refusing was
       considered and rejected: that is exactly gap 1's own bug, silently
       multiplying duplicates rather than surfacing the conflict.
    c. This resolution deliberately does NOT heal (write) the `.lineage` token
@@ -655,5 +665,14 @@ anchor under the same signature-verifying ceremony rules).
   **Verify:** `node --test packages/gate-manifest/test/enable.test.mjs
   packages/tickets/test/manifest-segments.test.mjs
   --test-name-pattern='AC15'`.
+- **AC16 — lineage adoption:** with two committed same-branch segments and
+  no token, `gate-manifest adopt` lists both; adopting one makes the next
+  write extend it while the other stays byte-identical; adoption refuses a
+  wrong-branch, unknown, chain-broken, or non-v2-authenticated segment, a
+  keyed-mode forest with no key, a detached HEAD, a non-segmented repo, a
+  store holding a non-conforming object, and a store holding an unreadable
+  first entry, writing nothing in each case; a keyless-mode forest adopts on
+  chain-intactness alone. **Verify:** `node --test
+  packages/gate-manifest/test/adopt.test.mjs`.
 
 Suppressions: none. A later ticket must name and justify any.
