@@ -9,7 +9,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, parse } from 'node:path';
 import { checkRail, classifyTool, isShellTool, resolveActiveTicketId } from '../rails-checker.mjs';
 import { checkBuildGate, checkFlail, createPersistentTracker, resolveSessionId } from '../build-gate-inline.mjs';
-import { flailMessage, resolveTranscriptPath, parseTranscriptLines, analyzeFlail } from '../flail-inline.mjs';
+import { flailMessage, resolveTranscriptPath, parseTranscriptSteps, analyzeFlail } from '../flail-inline.mjs';
 
 // agy nests the call under toolCall; args is the parameter bag. Read defensively.
 const TOOLCALL_KEYS = ['toolCall', 'tool_call', 'tool'];
@@ -140,8 +140,8 @@ export function decide(payload, { env = process.env, trackerCache } = {}) {
       // Record edit for flail tracking & inspect session transcript for repeated errors / edit churn
       if (cls === 'mutating' && pathTracker?.recordEdit) {
         const transcriptPath = resolveTranscriptPath({ payload, conversationId: sessionID, env });
-        const transcriptLines = transcriptPath ? parseTranscriptLines(transcriptPath) : [];
-        const flailRes = pathTracker.recordEdit(sessionID, abs, { transcriptLines });
+        const transcriptSteps = transcriptPath ? parseTranscriptSteps(transcriptPath) : [];
+        const flailRes = pathTracker.recordEdit(sessionID, abs, { transcriptSteps });
 
         const flailEnforcing = enforcing || env?.ADLC_FLAIL_ENFORCEMENT === '1';
         const flailBypass = env?.ADLC_FLAIL_BYPASS === '1';
@@ -226,7 +226,7 @@ export function printStatus(root = process.cwd(), env = process.env, payload = {
   const sessionID = resolveSessionId({ payload, env });
   const flail = checkFlail({ sessionID, tracker, root: resolvedRoot, env });
 
-  console.log(`--- ADLC Antigravity Status ---`);
+  console.log(`--- ADLC Gemini Status ---`);
   console.log(`Root: ${resolvedRoot}`);
   console.log(`Active Ticket: ${active.id ?? (active.conflict ? 'CONFLICT' : 'NONE')}`);
   console.log(`Enforcement (ADLC_P4_ENFORCEMENT): ${env.ADLC_P4_ENFORCEMENT === '1' ? 'ACTIVE' : 'INACTIVE'}`);
@@ -241,7 +241,7 @@ export function printDoctor(root = process.cwd(), env = process.env) {
   const resolvedRoot = findAdlcRoot(absRoot) ?? absRoot;
   const active = resolveActiveTicketId(resolvedRoot, env);
 
-  console.log(`--- ADLC Antigravity Doctor ---`);
+  console.log(`--- ADLC Gemini Doctor ---`);
   console.log(`Node Version: ${process.version}`);
   console.log(`Root Directory: ${resolvedRoot}`);
   console.log(`ADLC Ticket Store Present: ${existsSync(join(resolvedRoot, '.adlc/tickets.json')) || existsSync(join(resolvedRoot, '.adlc/tickets/.store.json'))}`);

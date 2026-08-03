@@ -1,9 +1,9 @@
-# ADLC × Google Antigravity (`agy`)
+# ADLC × Google Gemini (Antigravity & JetSki)
 
-Native ADLC integration for the Antigravity CLI. Two layers:
+Native ADLC integration for the Google Gemini agent harnesses (Antigravity `agy` and JetSki `jetski`). Two layers:
 
 1. **In-session rails-guard (advisory).** A `PreToolUse` plugin hook denies edits to
-   frozen rails. It is best-effort: agy fails **open** on a non-zero hook exit, so a
+   frozen rails. It is best-effort: the host fails **open** on a non-zero hook exit, so a
    hook crash/timeout/Windows-path failure can let a rail write through.
 2. **CI diff gate (the guarantee).** `scripts/rails-guard-ci.mjs` (documented in
    [`docs/ci/rails-guard.yml`](../ci/rails-guard.yml)) is the unbypassable,
@@ -14,93 +14,67 @@ Native ADLC integration for the Antigravity CLI. Two layers:
 ## Install
 
 > **⚠️ Fail-open, CI is the real backstop.** The in-session `PreToolUse` rail hook
-> installed below is **advisory only** — `agy` fails **OPEN** on a non-zero hook
+> installed below is **advisory only** — the host fails **OPEN** on a non-zero hook
 > exit (crash, timeout, unsupported platform), so a frozen-rail write can slip
 > through. Do not treat the hook as a hard block. The unbypassable control is the
 > CI diff gate (`scripts/rails-guard-ci.mjs`, wired via
 > [`docs/ci/rails-guard.yml`](../ci/rails-guard.yml)) — **make it a required
 > check** before relying on this integration for enforcement.
 
-**One-liner via npx (Recommended).** The helper CLI fetches the package and registers it with `agy` in one step:
+**One-liner via npx (Recommended).** The helper CLI fetches the package and registers it in one step:
 
 ```sh
-(cd "$(mktemp -d)" && npx @adlc/antigravity@latest install)
+(cd "$(mktemp -d)" && npx @adlc/gemini@latest install)
 ```
 
-**Global npm Install.** Install `@adlc/antigravity` globally via npm, then let the bundled helper register it:
+**Global npm Install.** Install `@adlc/gemini` globally via npm, then let the bundled helper register it:
 
 ```sh
-npm install -g @adlc/antigravity
-adlc-agy install
+npm install -g @adlc/gemini
+adlc-gemini install
 ```
 
-**Local Project Install.** Install `@adlc/antigravity` into your project's `node_modules`, then run the binary you just installed:
+**Local Project Install.** Install `@adlc/gemini` into your project's `node_modules`, then run the binary you just installed:
 
 ```sh
-npm install @adlc/antigravity
-./node_modules/.bin/adlc-agy install
+npm install @adlc/gemini
+./node_modules/.bin/adlc-gemini install
 ```
 
 **Local Checkout (from Source).** For local development or installing directly from an `adlc` source checkout, run the checkout's own helper so it stages the plugin for you:
 
 ```sh
-node /abs/path/to/adlc/plugins/adlc-antigravity/bin/cli.mjs install
+node /abs/path/to/adlc/plugins/adlc-gemini/bin/cli.mjs install
 ```
 
-> **Why never hand the plugin directory to `agy` yourself?** `agy` resolves its
+> **Why never hand the plugin directory to the host yourself?** The host resolves its
 > install target as `plugin@marketplace` *before* deciding whether that target is
 > a filesystem path, so an `@` anywhere in the argument is read as the separator.
 > Every location npm gives a scoped package contains one, so
-> `agy plugin install $(npm root -g)/@adlc/antigravity` fails with
-> `unknown marketplace: adlc/antigravity` and installs nothing. A source checkout
+> `[agent] plugin install $(npm root -g)/@adlc/gemini` fails with
+> `unknown marketplace: adlc/gemini` and installs nothing. A source checkout
 > is not reliably safe either: an `@` in any parent directory — a clone under
 > `/home/user@example.com/...`, say — reproduces the same failure. The helper
-> stages the plugin under an `@`-free path and installs from there; `agy` copies
-> the contents into `~/.gemini/config/plugins/adlc-antigravity/`, so the staging
+> stages the plugin under an `@`-free path and installs from there; the host copies
+> the contents into `~/.gemini/config/plugins/adlc-gemini/`, so the staging
 > directory is discarded afterwards.
->
-> **And why `cd "$(mktemp -d)" && npx @adlc/antigravity@latest`?** Both halves are
-> load-bearing, and each was reproduced against a real npm install before being
-> adopted. This is a machine-level install that never needs your repository, so
-> running it from a scratch directory costs nothing.
->
-> - **`@latest`.** `npx @adlc/antigravity` resolves a bare name against the
->   **current project** first, so a repository shipping a workspace or dependency
->   named `@adlc/antigravity` gets *its* binary executed. A version spec forces
->   registry resolution — it pins nothing, it only refuses local shadowing (the
->   same reason `install.sh` calls `plugins@<version>` rather than bare `plugins`).
-> - **The neutral directory.** npm reads the current project's `.npmrc` and
->   prepends its `node_modules/.bin` to the child's PATH. A hostile repo can
->   therefore redirect the `@adlc` scope to its own registry, or plant a bin named
->   `agy` for the helper to invoke. Starting from an empty directory removes both.
->   (The helper also resolves `agy` itself while ignoring npm-injected bin
->   directories, so the two controls are independent.)
->
-> **Residual risk, stated rather than papered over.** `mktemp -d` honours `TMPDIR`,
-> and npm discovers a project by walking *upward* from the working directory. If
-> your `TMPDIR` points inside a repository, the scratch directory is still inside
-> that npm project and its `.npmrc` is still discovered — so the isolation is only
-> as good as `TMPDIR` being outside the repo you are standing in. npm offers no
-> flag that ignores an ancestor project config, so if you are installing from a
-> repository you do not trust, prefer the global-npm path above: `npm install -g`
-> resolves nothing relative to your working directory.
 
-**Universal Installer (Planned — Not yet supported).** Support for Google Antigravity inside the vendor-neutral `plugins` installer is currently in development and **not yet present**. Once implemented, you will be able to install it via:
+**Universal Installer (Planned — Not yet supported).** Support for Google Gemini inside the vendor-neutral `plugins` installer is currently in development and **not yet present**. Once implemented, you will be able to install it via:
 
 ```sh
 npx plugins add voodootikigod/adlc
 ```
 
-**Note on native marketplace:** The native `.agents` marketplace registration command (`agy plugin install adlc-antigravity@adlc`) is currently subject to a CLI limitation where the CLI rejects unregistered third-party marketplaces with `unknown marketplace: adlc`. Global npm or local installation is the recommended path.
+**Note on native marketplace:** the native `.agents` marketplace registration command (`[agent] plugin install adlc-gemini@adlc`) is currently subject to a CLI limitation where the CLI rejects unregistered third-party marketplaces with `unknown marketplace: adlc`. Global npm or local installation is the recommended path.
 
-Then `/adlc-init` (or manual bootstrap). Enforcement: `export ADLC_P4_ENFORCEMENT=1` with an active ticket.
+Then run `/adlc-init` inside your agent session (or execute the steps manually to bootstrap `.adlc/` in your repository). Enforcement: `export ADLC_P4_ENFORCEMENT=1` with active ticket.
 
-**Install timeout.** Each `agy` subprocess is bounded by `ADLC_AGY_TIMEOUT_MS` (milliseconds, default `120000`). A failure reading `timed out after 120000ms` is that bound, not `agy` crashing — re-run with a larger value if the install is legitimately slow (cold cache, network-mounted storage). The value must be positive and finite; `0` and `Infinity` would disable the bound and are refused rather than silently ignored.
+**Install timeout.** Each subprocess is bounded by `ADLC_AGY_TIMEOUT_MS` (milliseconds, default `120000`). A failure reading `timed out after 120000ms` is that bound, not the host crashing — re-run with a larger value if the install is legitimately slow. The value must be positive and finite.
 
 ## Formal ADLC Coverage
 
-| Phase | Antigravity surface |
-|-------|---------------------|
+| Phase | Gemini surface |
+|-------|----------------|
 | P0 Triage | `/adlc-init`, `/adlc-status`, `/adlc-doctor`, `adlc-ticket` skill → `.adlc/tickets.json` |
 | P1 Interrogate | `adlc spec-lint/premortem/parallax` via the `adlc` CLI |
 | P2 Decompose | `adlc coldstart/model-router/merge-forecast` |
@@ -112,10 +86,10 @@ Then `/adlc-init` (or manual bootstrap). Enforcement: `export ADLC_P4_ENFORCEMEN
 
 ## Rail enforcement — two layers
 
-Antigravity's hooks are a **best-effort, in-session** layer, not the control:
+Google Gemini's hooks are a **best-effort, in-session** layer, not the control:
 
 1. **In-session (advisory).** The `PreToolUse` hook returns
-   `{ "allow_tool": false, "deny_reason": "..." }` on a frozen-rail edit. Antigravity
+   `{ "allow_tool": false, "deny_reason": "..." }` on a frozen-rail edit. The host
    *should* block it, but the hook is subject to several fail-open conditions (see
    "Platform notes" below). The hook is configured to fail **open** so a hook
    bug/timeout/incompatibility can never brick your session. Bash/shell writes are
@@ -189,11 +163,9 @@ This split is asserted from both sides so it can't regress:
 - **Plugin (this repo):** `test/projection.test.mjs` pins both shapes — a clean
   single-ticket projection enforces its rail while allowing in-scope non-rail
   writes, and a dangling-edge projection produces the fail-closed deny-all
-  (denying even a non-rail, in-scope write). See
-  [antigravity-booster#11](https://github.com/voodootikigod/antigravity-booster/issues/11)
-  and [adlc#142](https://github.com/voodootikigod/adlc/issues/142).
-- **Booster (antigravity-booster#11):** strips edges from the projection so the
-  dangling-edge state never reaches a real build worktree.
+  (denying even a non-rail, in-scope write).
+- **Booster:** strips edges from the projection so the dangling-edge state never
+  reaches a real build worktree.
 
 ## Platform notes / limitations
 
@@ -201,7 +173,7 @@ This split is asserted from both sides so it can't regress:
   the CI gate protects Windows users regardless.
 - Shell (`run_command`) writes are not gated in-session (CI gate catches them).
 
-## Appendix: verified `agy` hook contract (agy 1.0.13)
+## Appendix: verified hook contract (agy/jetski 1.0.13+)
 
 This appendix documents the native hook contract verified by direct probing. These
 facts are the foundation for the in-session rails-guard implementation and belong in
@@ -209,12 +181,12 @@ any document describing the integration's enforcement surface.
 
 | # | Fact |
 |---|------|
-| V1 | agy has a **native plugin system**: `agy plugin install <path>` installs into `~/.gemini/config/plugins/<name>/`. Manifest is Claude-Code-shaped: root `plugin.json` (name, version) + `skills/`, `agents/`, `commands/` (auto-converted to skills), root `hooks.json`. `agy plugin import claude` even ingests Claude Code plugins. |
-| V2 | `agy plugin validate` checks component **presence only**, not deep hook schema — it passed a `hooks.json` the runtime later refused to parse. **Validation is not sufficient; runtime load must be tested.** |
-| V3 | **hooks.json schema (agy-native)** — verified working: `{ "<hook-name>": { "PreToolUse": [ { "matcher": ".*", "hooks": [ { "type":"command", "command":"<cmd>", "timeout":15 } ] } ] } }`. Top level is keyed by **hook name**, then event, then an **array** of `{matcher, hooks:[handler]}`. |
-| V4 | `matcher` is a **regex on the tool name**. `.*` matches all. `write` did **not** match tool `write_to_file` — so use `.*` or exact names. |
-| V5 | **Deny contract (INVERTED from Claude Code/Codex):** a hook denies by writing stdout `{"allow_tool": false, "deny_reason": "..."}` and **exiting 0**. `{"allow_tool": true}` allows. **Non-zero exit = hook FAILURE = FAIL-OPEN (tool proceeds).** |
-| V6 | Hooks **fire in `agy --print` (headless) mode** — a write to a rail was actually blocked. So rails-guard protects both interactive sessions and the headless fleet path. |
-| V7 | **stdin payload** (verbatim): `{"toolCall":{"name":"write_to_file","args":{"TargetFile":"/abs","CodeContent":"…","Overwrite":true}},"workspacePaths":[],"conversationId":…,"transcriptPath":…,"stepIdx":3}`. The path field varies per tool: `write_to_file`→`TargetFile`, `view_file`→`AbsolutePath`, `run_command`→`CommandLine`. Observed target paths were **absolute**. |
-| V8 | Hook **cwd is the plugin dir** (`~/.gemini/config/plugins/<name>/`), **not the repo**. In `--print` mode `workspacePaths` was observed **empty (`[]`)**. There is **no workspace-root env var** (env exposes `ANTIGRAVITY_CONVERSATION_ID`, not a workspace path). |
-| V9 | agy **expands `$HOME`** (and shell env vars) in the `command` string; there is **no** `${CLAUDE_PLUGIN_ROOT}`/`${AGY_PLUGIN_ROOT}`. Because plugins always install to `$HOME/.gemini/config/plugins/<name>/`, `node $HOME/.gemini/config/plugins/adlc-antigravity/hooks/adlc-rails-guard.mjs` is portable across users with no install-time rewrite. |
+| V1 | Google Gemini has a **native plugin system**: `[agent] plugin install <path>` installs into `~/.gemini/config/plugins/<name>/`. Manifest is Claude-Code-shaped: root `plugin.json` (name, version) + `skills/`, `agents/`, `commands/` (auto-converted to skills), root `hooks.json`. |
+| V2 | `[agent] plugin validate` checks component **presence only**, not deep hook schema. Runtime load must be tested. |
+| V3 | **hooks.json schema (Gemini-native)** — verified working: `{ "<hook-name>": { "PreToolUse": [ { "matcher": ".*", "hooks": [ { "type":"command", "command":"<cmd>", "timeout":15 } ] } ] } }`. Top level is keyed by **hook name**, then event, then an **array** of `{matcher, hooks:[handler]}`. |
+| V4 | `matcher` is a **regex on the tool name**. `.*` matches all. |
+| V5 | **Deny contract:** a hook denies by writing stdout `{"allow_tool": false, "deny_reason": "..."}` and **exiting 0**. `{"allow_tool": true}` allows. **Non-zero exit = hook FAILURE = FAIL-OPEN (tool proceeds).** |
+| V6 | Hooks **fire in `--print` (headless) mode** — a write to a rail was actually blocked. So rails-guard protects both interactive sessions and the headless fleet path. |
+| V7 | **stdin payload** (verbatim): `{"toolCall":{"name":"write_to_file","args":{"TargetFile":"/abs","CodeContent":"…","Overwrite":true}},"workspacePaths":[],"conversationId":…,"transcriptPath":…,"stepIdx":3}`. |
+| V8 | Hook **cwd is the plugin dir** (`~/.gemini/config/plugins/<name>/`), **not the repo**. In `--print` mode `workspacePaths` was observed **empty (`[]`)**. |
+| V9 | The host **expands `$HOME`** (and shell env vars) in the `command` string; there is **no** `${CLAUDE_PLUGIN_ROOT}`/`${AGY_PLUGIN_ROOT}`. Because plugins always install to `$HOME/.gemini/config/plugins/<name>/`, `node $HOME/.gemini/config/plugins/adlc-gemini/hooks/adlc-rails-guard.cjs` is portable across users with no install-time rewrite. |
