@@ -8,7 +8,7 @@ import { verify } from '../lib/verify.mjs';
 import { loadFiltered, renderEntries } from '../lib/show.mjs';
 import { buildAttest } from '../lib/attest.mjs';
 import { repairChain } from '../lib/repair.mjs';
-import { enable } from '../lib/enable.mjs';
+import { enable, boundedSegmentationState, CI_COVERAGE_WARNING, SEGMENTATION_UNDETERMINED_WARNING } from '../lib/enable.mjs';
 import { adopt } from '../lib/adopt.mjs';
 import { ADLC_DIR } from '@adlc/core';
 import { getKey } from '../lib/sign.mjs';
@@ -239,10 +239,22 @@ if (verb === 'enable') {
     const keylessReason = 'no ADLC_MANIFEST_KEY is configured. Keyless forest mode is single-checkout only, PERMANENTLY: '
       + 'keyless-minted segments can never be authenticated by a later key, so every other clone of a branch fails closed on '
       + 'its first write. Configure the signing key first, or re-run with --allow-keyless to accept single-checkout mode deliberately.';
+    // This refusal stays FIRST and must not gain a failure mode: a full plan
+    // here would turn an immediate refusal into an unbounded read of a large
+    // root manifest, and a planning error would downgrade this gate failure
+    // (exit 2) to an operational one (exit 1). isMarkerActivated is the
+    // bounded, no-follow, never-throwing probe for exactly this position —
+    // keyless adopters (activated with --allow-keyless) would otherwise hit
+    // this refusal on every run and never hear the disclosure at all.
+    const state = boundedSegmentationState(flags.dir);
+    const keylessWarnings = state === 'segmented' ? [CI_COVERAGE_WARNING]
+      : state === 'undetermined' ? [SEGMENTATION_UNDETERMINED_WARNING]
+        : [];
     if (flags.json) {
-      printJson({ decision: 'refuse-keyless', reason: keylessReason });
+      printJson({ decision: 'refuse-keyless', reason: keylessReason, ...(keylessWarnings.length ? { warnings: keylessWarnings } : {}) });
       process.exit(2);
     }
+    for (const warning of keylessWarnings) console.log(`warning [${warning.code}]: ${warning.message}`);
     gateFail(`enable refused: ${keylessReason}`);
   }
   let out;
@@ -257,6 +269,12 @@ if (verb === 'enable') {
     printJson(out);
     process.exit(refused ? 2 : 0);
   }
+  // Human mode must surface what --json already carries, and this must run
+  // BEFORE both exits below: gateFail() for a refusal and pass() for success
+  // each terminate the process. An already-segmented repo can refuse (ignore
+  // drift) while still needing the disclosure, so printing after the refusal
+  // check would drop it exactly where it matters.
+  for (const warning of out.warnings ?? []) console.log(`warning [${warning.code}]: ${warning.message}`);
   if (refused) gateFail(`enable refused: ${out.reason}`);
   if (out.decision === 'already-enabled') pass(out.reason);
   if (out.written) pass(`forest mode enabled — wrote ${out.markerPath}`);

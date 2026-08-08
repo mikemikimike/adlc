@@ -162,6 +162,42 @@ writing nothing, when:
 
 `--json` emits exactly one JSON document on stdout in every mode.
 
+#### CI does not yet guard segment files
+
+Activation warns with the code `ci-cannot-guard-segments`, and the limitation
+is real: rails-guard's committed-tree reader validates `.adlc/manifest.jsonl`
+only, so the append-only enforcement the root gets does **not** extend to
+`.adlc/manifest.d/*.jsonl`. A pull request that rewrites, truncates, reorders
+or deletes committed segment evidence is not currently detected by CI.
+
+The warning is carried by every outcome that describes a repository actually
+in forest mode — a fresh activation, an already-enabled run, an already-active
+run refused for gitignore drift, and a run refused for a missing
+`ADLC_MANIFEST_KEY`. That last one matters for repositories activated with
+`--allow-keyless`, which meet that refusal on every subsequent run.
+
+On that refusal the mode is detected without reading the whole ledger: the
+activation marker, or the root's final line, each read within a fixed window
+from a single no-follow descriptor. Both halves of the mode signal are covered
+— including a repository cut over by hand, which has a cutover-tailed root and
+no marker — while the refusal stays immune to being turned into an unbounded
+read of a hostile root.
+
+A bounded read has three possible answers, so the command has three possible
+outputs. When the window cannot decide — a final entry larger than it, a
+non-regular file, a trailing run of blank lines longer than the window — the
+refusal carries `segmentation-undetermined` rather than
+`ci-cannot-guard-segments`. The distinction is deliberate: the second asserts
+that the repository IS in forest mode, and an undecidable read has not
+established that. Configuring a signing key gets a definite answer.
+
+This is a missing guard, not a lost one — forest mode never had the coverage,
+and single-file repositories are unaffected. It closes when the forest CI gate
+ships (spec §9.1–9.3), after which the warning goes away. Until then, weigh it
+against the merge-conflict relief forest mode buys you: if your evidence
+ledger is a compliance artifact rather than a working record, stay on
+single-file mode for now.
+
 The gitignore probe is best-effort over the common rule shapes (the
 directory, the marker file, and a representative `*.jsonl` segment name). A
 rule targeting a specific branch-derived slug (e.g. `release-*.jsonl`) can

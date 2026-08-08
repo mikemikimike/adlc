@@ -12,12 +12,12 @@
 // from lineage.mjs, changes no dispatch site (those files are this ticket's
 // frozen rails).
 
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, writeFileSync, renameSync, rmdirSync, unlinkSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeFileSync, renameSync, rmdirSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { dirname, join, relative, sep } from 'node:path';
-import { ADLC_DIR, withLedgerLock } from '@adlc/core';
-import { isSegmentedRepo, markerPath } from './lineage.mjs';
+import { ADLC_DIR, ledgerPath, withLedgerLock } from '@adlc/core';
+import { isSegmentedRepo, markerPath, readBoundedJsonNoFollow } from './lineage.mjs';
 import { segmentDirPath } from './forest.mjs';
 
 // Duplicated from lineage.mjs's module-local constants (that file is a frozen
@@ -26,6 +26,35 @@ import { segmentDirPath } from './forest.mjs';
 // isSegmentedRepo whether it recognizes the marker, and rolls back if not.
 const MARKER = Object.freeze({ format: 'adlc-manifest-segments', version: 1 });
 const AUTH_MODES = Object.freeze(['keyed', 'keyless']);
+
+// Forest mode is reachable before the CI gate that guards it exists:
+// packages/rails-guard/lib/ci/manifest.mjs reads only .adlc/manifest.jsonl, so
+// committed segment files get none of the append-only enforcement the root
+// gets. That is not a regression — forest mode never had the coverage — but an
+// operator who is never shown the tradeoff cannot weigh it, so activation
+// discloses it. `code` is the contract that callers and tests key on; `message`
+// is human text and free to be reworded. Removed by the forest CI gate
+// (T-MANIFEST-FOREST slice 6), which is what closes the gap.
+export const CI_COVERAGE_WARNING = Object.freeze({
+  code: 'ci-cannot-guard-segments',
+  message: 'rails-guard does not yet validate .adlc/manifest.d/ segment files, so rewriting or deleting committed '
+    + 'segment evidence in a pull request is not currently detected by CI. The root manifest remains guarded. '
+    + 'This closes when the forest CI gate ships.',
+});
+
+// The honest answer when a BOUNDED read cannot decide whether a repository is
+// in forest mode. Distinct from CI_COVERAGE_WARNING because that code asserts
+// a fact — this repository IS segmented — which an undecidable read has not
+// established. Collapsing the two would either claim segmentation for an
+// ordinary single-file repo with an enormous trailing entry, or say nothing
+// at all about a repo that may well be segmented. Neither is true; this is.
+export const SEGMENTATION_UNDETERMINED_WARNING = Object.freeze({
+  code: 'segmentation-undetermined',
+  message: 'could not determine within a bounded read whether this repository uses segmented (forest) evidence '
+    + 'storage, because the root manifest\'s final entry could not be read within the probe window. If it IS '
+    + 'segmented, note that rails-guard does not yet validate .adlc/manifest.d/ segment files. Run this command '
+    + 'with a signing key configured for a definite answer.',
+});
 
 // The .gitignore contract forest mode needs is TWO-SIDED (adversarial-review
 // findings, verified empirically by the apply-the-advice tests): the marker
@@ -120,6 +149,140 @@ function lstatIsSymlink(p) {
 }
 
 /**
+ * A BOUNDED, no-follow answer to "is this repository already in forest mode",
+ * for callers that must not perform open-ended work — notably the CLI's
+ * keyless refusal, which returns before any planning happens.
+ *
+ * Deliberately narrower than lineage.mjs's isSegmentedRepo. That predicate is
+ * marker OR cutover-tailed-root, and the second half reads the ENTIRE root
+ * manifest through readRawLines, following symlinks: unbounded work on a path
+ * an attacker can point at a huge file or a non-terminating device.
+ *
+ * The marker read delegates to lineage.mjs's readBoundedJsonNoFollow, which
+ * is lstat + O_NOFOLLOW + a single capped read from ONE descriptor. Doing the
+ * check with lstat and then reopening via readFileSync would be a TOCTOU
+ * window: the path can be replaced between the two calls, so the size that
+ * was validated and the bytes that are read need not describe the same
+ * inode. The containing directories keep their own no-follow checks.
+ *
+ * The tradeoff is explicit: a cutover-tailed repo whose marker was lost reads
+ * as false. That is the safe direction — it under-reports a disclosure rather
+ * than reading an unbounded root — and the cutover ceremony writes the marker,
+ * so a missing one is the degraded case and not the norm. Never throws; a
+ * caller on a refusal path must not have its exit code changed by this probe.
+ */
+export function isMarkerActivated(dir = ADLC_DIR) {
+  for (const path of [dir, segmentDirPath(dir)]) {
+    if (lstatIsSymlink(path)) return false;
+  }
+  const parsed = readBoundedJsonNoFollow(markerPath(dir));
+  return parsed?.format === MARKER.format && parsed?.version === MARKER.version;
+}
+
+// How much of the root's tail a bounded cutover probe may read.
+//
+// Sized against the real distribution, not a guess: this repository's own
+// 99 KB / 176-entry ledger has a longest entry of ~6.7 KB, so an 8 KB window
+// left only a 20% margin before a final entry became undecidable. 64 KB gives
+// roughly an order of magnitude of headroom while staying a single bounded
+// read of fixed memory.
+//
+// The size matters because undecidable resolves to "warn" (see
+// isSegmentedBounded): too small a window turns ordinary ledgers with large
+// trailing entries into spurious warnings, and too large stops being a bound.
+const TAIL_PROBE_BYTES = 65536;
+
+/**
+ * Whether the root manifest's LAST line is the cutover entry, read within a
+ * fixed window from one no-follow descriptor.
+ *
+ * Tri-state: 'yes' | 'no' | 'unknown'. The bound makes some roots
+ * undecidable — a final line longer than the window, an unreadable or
+ * non-regular file — and collapsing those to 'no' is what makes a bounded
+ * probe silently disagree with the production predicate, which has no such
+ * limit and will happily route writes to segments.
+ *
+ * lineage.mjs answers this by passing the ENTIRE file through readRawLines,
+ * which is fine for a writer already committed to the ledger but not for the
+ * CLI's keyless refusal — that path must not be convertible into an unbounded
+ * read. So the file is opened once with O_NOFOLLOW, sized via fstat on THAT
+ * descriptor (never a second lstat, whose answer could describe a different
+ * inode), and only the final window is read. Never throws.
+ */
+function rootTailIsCutover(dir) {
+  const root = ledgerPath('manifest', dir);
+  let stats;
+  try {
+    stats = lstatSync(root);
+  } catch {
+    return 'no'; // absent: determinate, this repo has no root at all
+  }
+  if (!stats.isFile()) return 'unknown'; // symlink/fifo/device — undecidable without following, which we will not do
+  let fd;
+  try {
+    fd = openSync(root, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return 'unknown';
+  }
+  try {
+    const size = fstatSync(fd).size;
+    if (size === 0) return 'no';
+    const window = Math.min(size, TAIL_PROBE_BYTES);
+    const buf = Buffer.alloc(window);
+    const bytesRead = readSync(fd, buf, 0, window, size - window);
+    const text = buf.subarray(0, bytesRead).toString('utf8');
+    // A truncated window whose FIRST line is a fragment is fine — only the
+    // last line is inspected. But with no boundary anywhere in the window the
+    // final line alone exceeds it and cannot be parsed: undecidable.
+    if (size > window && !text.includes('\n')) return 'unknown';
+    const lines = text.split('\n').filter((line) => line.trim());
+    if (lines.length === 0) {
+      // Nothing but blank lines in the window. Determinate ONLY if the window
+      // was the whole file; otherwise a trailing run of newlines longer than
+      // the window hides the real last entry, which the production predicate
+      // finds because it filters blanks across the entire file.
+      return size > window ? 'unknown' : 'no';
+    }
+    return JSON.parse(lines.at(-1))?.gate === 'manifest-cutover' ? 'yes' : 'no';
+  } catch {
+    return 'unknown';
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Which disclosure a bounded, no-follow look at this repository justifies:
+ * 'segmented' | 'single-file' | 'undetermined'.
+ *
+ * TRI-STATE on purpose. An earlier binary version had to map undecidable
+ * roots to one side or the other, and both were false statements: mapping to
+ * segmented claims forest mode for an ordinary single-file repo whose final
+ * entry exceeds the window, and mapping to single-file stays silent about a
+ * repo that may well be segmented. The read is uncertain, so the answer is.
+ *
+ * Both halves of spec §4.7 are covered — a repository cut over by hand has a
+ * cutover tail and NO marker, since `gate-manifest record manifest-cutover`
+ * accepts free-form gate names, and a marker-only probe would call it
+ * single-file. Never throws: callers sit on a refusal path whose exit code
+ * must not change.
+ */
+export function boundedSegmentationState(dir = ADLC_DIR) {
+  if (isMarkerActivated(dir)) return 'segmented';
+  switch (rootTailIsCutover(dir)) {
+    case 'yes': return 'segmented';
+    case 'no': return 'single-file';
+    case 'unknown': return 'undetermined';
+    // An unrecognized probe result must NOT fall through to 'single-file':
+    // that is the one answer which asserts a fact and stays silent, so a
+    // future edit returning something unexpected would silently suppress the
+    // disclosure. Unrecognized means undetermined, like any other read this
+    // function could not decide.
+    default: return 'undetermined';
+  }
+}
+
+/**
  * Decide what `enable` would do, writing nothing. Decision order is
  * load-bearing (ticket work item 1h):
  *   1. no workspace        → refuse (never create .adlc as a side effect)
@@ -132,7 +295,10 @@ function lstatIsSymlink(p) {
  *   5. gitignored marker   → refuse (see markerWouldBeIgnored)
  *   6. greenfield          → plan the marker write
  *
- * @returns {{ decision: 'refuse-no-workspace'|'already-enabled'|'refuse-broken-manifest-dir'|'refuse-live-root'|'refuse-ignored'|'greenfield', reason?: string, markerPath?: string, marker?: object }}
+ * `warnings` is present only on the two segmented outcomes (greenfield,
+ * already-enabled) — see CI_COVERAGE_WARNING.
+ *
+ * @returns {{ decision: 'refuse-no-workspace'|'already-enabled'|'refuse-broken-manifest-dir'|'refuse-live-root'|'refuse-ignored'|'greenfield', reason?: string, markerPath?: string, marker?: object, warnings?: Array<{code: string, message: string}> }}
  */
 export function planEnable(dir = ADLC_DIR) {
   if (!existsSync(dir) && !lstatIsSymlink(dir)) {
@@ -189,12 +355,23 @@ export function planEnable(dir = ADLC_DIR) {
     // exists to enforce.
     const enabledViolation = gitignoreContractViolation(dir);
     if (enabledViolation !== null) {
+      // Warned despite being a REFUSAL: this branch is inside isSegmentedRepo,
+      // so the repository is in forest mode and exposed right now. Keying
+      // disclosure off the decision would let an operator fix the ignore drift
+      // and keep writing segments having never been told CI cannot guard them.
       return {
         decision: 'refuse-ignored',
         reason: `forest mode is already active, BUT ${enabledViolation}; restore this block (order matters): ${MARKER_NEGATION_LINES.join(' , ')}`,
+        warnings: [CI_COVERAGE_WARNING],
       };
     }
-    return { decision: 'already-enabled', reason: 'forest mode is already active for this repository' };
+    // Already segmented means segments are being written RIGHT NOW, so this
+    // path needs the disclosure every bit as much as a fresh activation.
+    return {
+      decision: 'already-enabled',
+      reason: 'forest mode is already active for this repository',
+      warnings: [CI_COVERAGE_WARNING],
+    };
   }
   if (existsSync(segDir) && readdirSync(segDir).length > 0) {
     return {
@@ -218,7 +395,11 @@ export function planEnable(dir = ADLC_DIR) {
       reason: `${violation}; add this block (order matters): ${MARKER_NEGATION_LINES.join(' , ')}`,
     };
   }
-  return { decision: 'greenfield', markerPath: markerPath(dir), marker: { ...MARKER } };
+  // Refusals on a NON-segmented repository carry no warning: nothing is
+  // writing segments there, and a warning on every outcome is noise that
+  // trains operators to skip warnings entirely. The already-segmented
+  // refusal above is the deliberate exception.
+  return { decision: 'greenfield', markerPath: markerPath(dir), marker: { ...MARKER }, warnings: [CI_COVERAGE_WARNING] };
 }
 
 /**
