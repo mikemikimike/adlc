@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildSegmentEnv, SCRUBBED_ENV_VARS } from '../run-tests.mjs';
+import { buildSegmentEnv, packageHasTests, packageSegments, SCRUBBED_ENV_VARS } from '../run-tests.mjs';
 
 const REPO_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -159,4 +159,29 @@ test('gate-bypass and mock-seam variables are scrubbed like the key', () => {
     assert.equal(Object.hasOwn(env, name), false, `${name} must not reach test segments ambiently`);
   }
   assert.equal(scrubbed.length, 3);
+});
+
+test('packageHasTests is true for test/ or cli-test, false otherwise', () => {
+  assert.equal(packageHasTests('with-test', { existsSync: (p) => p.endsWith('/with-test/test') }), true);
+  assert.equal(packageHasTests('with-cli', { existsSync: (p) => p.endsWith('/with-cli/cli-test') }), true);
+  assert.equal(packageHasTests('empty', { existsSync: () => false }), false);
+});
+
+test('packageSegments includes cli-test globs and skips packages with neither suite', () => {
+  const entries = [
+    { name: 'context-handoff', isDirectory: () => true },
+    { name: 'core', isDirectory: () => true },
+    { name: 'README.md', isDirectory: () => false },
+    { name: 'no-tests', isDirectory: () => true },
+  ];
+  const exists = (path) => {
+    if (path === 'packages/context-handoff/test') return true;
+    if (path === 'packages/context-handoff/cli-test') return true;
+    if (path === 'packages/core/test') return true;
+    return false;
+  };
+  const segs = packageSegments({ existsSync: exists, readdirSync: () => entries });
+  assert.deepEqual(segs.map(([name]) => name), ['packages/context-handoff', 'packages/core']);
+  assert.match(segs[0][1], /cli-test\/\*\.test\.mjs/);
+  assert.doesNotMatch(segs[1][1], /cli-test/);
 });
