@@ -21,10 +21,16 @@ import { deny, fail } from './errors.mjs';
 import { createGit, parseJson, resolveTrustedBase, trackedAt } from './git.mjs';
 import { ownersForPaths } from './codeowners.mjs';
 import {
-  assertAppendOnly,
+  assertRootTransition,
+  baseForestBytes,
   baseManifestBytes,
-  committedManifestAtHead,
+  committedEvidenceAtHead,
   validateMigrationEvidence,
+  validateNewSegments,
+  validateReservedFiles,
+  validateSegmentAppendOnly,
+  validateSegmentedMigrationEvidence,
+  rootTextEndsInCutover,
 } from './manifest.mjs';
 import { assertArraySuperset, assertExistingSignersUnchanged, rejectNewSigners, stable } from './json-contract.mjs';
 import { resolveImmutableTrustRoots } from './trust-roots.mjs';
@@ -39,7 +45,17 @@ const MIGRATION_ALLOWED_EXACT = new Set([
   '.adlc/manifest.jsonl',
   '.gitignore',
 ]);
-const MIGRATION_ALLOWED_PREFIXES = ['.adlc/ticket-archive/', '.adlc/tickets/'];
+// manifest.d/ is allowed because a SEGMENTED repo's migration records its
+// evidence there (the frozen root cannot carry it); those files are still
+// held to the full §9.2/§9.3 and segmented-evidence validation.
+const MIGRATION_ALLOWED_PREFIXES = ['.adlc/ticket-archive/', '.adlc/tickets/', '.adlc/manifest.d/'];
+
+/** Whether a migration-only diff may touch `path` — exported so the allowlist
+ *  itself is directly testable (its wiring is otherwise reachable only via
+ *  the railed entrypoint suite). */
+export function migrationDiffAllowsPath(path) {
+  return MIGRATION_ALLOWED_EXACT.has(path) || MIGRATION_ALLOWED_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
 
 /**
  * Run the rail-freeze gate.
@@ -75,11 +91,19 @@ export function runRailFreezeGate({ cwd, base, env, additionalTrustRoots = [], s
       messages.push(`no ticket store at ${base} — protecting ADLC trust roots only.`);
     } else {
       // Nothing is frozen yet, so the only thing left to check is that this PR is not
-      // seeding evidence. Same diff-not-filesystem rule as the main manifest block
-      // (#314): an untracked gitignored manifest is in zero commits and does not count.
-      if (committedManifestAtHead(git).text.trim()) {
+      // seeding evidence — via the ROOT or via SEGMENTS. Same diff-not-filesystem
+      // rule as the main manifest block (#314): an untracked gitignored manifest is
+      // in zero commits and does not count. The root check alone leaves
+      // segments as a seeding vector in exactly the branch a hostile
+      // bootstrap PR would arrive through, so both are checked.
+      const bootstrap = committedEvidenceAtHead(git);
+      if (bootstrap.root.text.trim()) {
         fail('first bootstrap PR cannot introduce pre-populated .adlc/manifest.jsonl evidence');
       }
+      if (bootstrap.segments.size > 0) {
+        fail('first bootstrap PR cannot introduce pre-populated .adlc/manifest.d/ segment evidence');
+      }
+      validateReservedFiles({ baseMarker: null, headMarker: bootstrap.marker });
       messages.push(`no ticket store at ${base} — nothing was frozen.`);
       return { messages, status: 0 };
     }
@@ -249,7 +273,7 @@ function verifyTicketStore({ git, cwd, trustedBase, baseSnapshot, baseTickets })
   const diff = git(['diff', '--name-only', `${trustedBase}...HEAD`], 'git diff migration shape');
   if (diff.status !== 0) fail('cannot verify migration diff shape');
   const allowed = diff.stdout.trim().split('\n').filter(Boolean).every((path) =>
-    MIGRATION_ALLOWED_EXACT.has(path) || MIGRATION_ALLOWED_PREFIXES.some((prefix) => path.startsWith(prefix)));
+    migrationDiffAllowsPath(path));
   if (!allowed) deny('legacy-to-directory transition must be a dedicated migration-only diff');
 
   return { verified: true, storeHash: headSnapshot.hash, archiveHash: headArchive.hash };
@@ -287,34 +311,119 @@ function assertBaseTicketContractsPreserved(baseTickets, headTickets, storeLabel
   }
 }
 
-/** Manifest evidence must be append-only once it exists, and un-seeded before it does. */
-function verifyManifest({ git, trustedBase, base, migration }) {
+/**
+ * Manifest evidence must be append-only once it exists, and un-seeded before
+ * it does — for the root AND (spec §9.1–9.3) every committed segment file
+ * under `.adlc/manifest.d/`. Root and forest are read from ONE pinned rev:
+ * separate pins would be the #314 round-7 TOCTOU spread across files.
+ */
+export function verifyManifest({ git, trustedBase, base, migration }) {
   const baseHasManifest = trackedAt(git, trustedBase, '.adlc/manifest.jsonl', `git ls-tree '${base}' manifest`);
+  const snapshot = committedEvidenceAtHead(git);
+  const baseSegments = baseForestBytes(git, trustedBase);
+  // ONE base-root read, kept as the RAW buffer (utf8 is non-injective; the
+  // append-only compare must see the real bytes). Read before any validator
+  // so every consumer shares the same snapshot.
+  const baseRootBytes = baseHasManifest ? baseManifestBytes(git, trustedBase) : null;
+  const baseRootText = baseRootBytes === null ? '' : baseRootBytes.toString('utf8');
+
+  // The marker is a trust file: frozen byte-identical once it exists at base;
+  // a NEW one may only arrive greenfield (no base evidence) or alongside a
+  // cutover in this same PR (a committed .lineage was already denied inside
+  // the snapshot read).
+  const headRootCutover = snapshot.root.present && rootTextEndsInCutover(snapshot.root.text);
+  const baseRootCutover = rootTextEndsInCutover(baseRootText);
+  validateReservedFiles({
+    baseMarker: baseSegments.marker,
+    headMarker: snapshot.marker,
+    baseRootHasEntries: baseRootText.trim().length > 0,
+    headRootCutover,
+    headRootGainedEntries: (snapshot.root.bytes?.length ?? 0) > (baseRootBytes?.length ?? 0),
+    newlyCutover: headRootCutover && !baseRootCutover,
+  });
+
+  // The forest's declared authentication mode, read leniently from the HEAD
+  // marker (frozen equal to base above once one exists). 'keyed' turns on
+  // presence-only signature discipline for new segments and continuations.
+  let forestAuth = null;
+  if (snapshot.marker !== null) {
+    try { forestAuth = JSON.parse(snapshot.marker.toString('utf8'))?.auth ?? null; } catch { forestAuth = null; }
+  }
+  // A cutover-tailed root implies a KEYED forest: the ceremony refuses to
+  // run without a key (§8 step 1) and always writes auth "keyed", so a
+  // keyless marker beside a cutover root is a state no producer creates —
+  // the stronger signal wins, and losing the marker does not drop the
+  // discipline either.
+  if (headRootCutover) forestAuth = 'keyed';
+
+  // §9.2 — committed segments are append-only, per file; deletion/rename denies.
+  validateSegmentAppendOnly(baseSegments.segments, snapshot.segments, { forestAuth });
+
+  // §9.3 — segments new in this PR: grammar, internal chain, anchor
+  // resolution within the HEAD forest, cycle check. anchor:null is judged
+  // against the BASE tree's root (§7.1's two-branch fork rule).
+  validateNewSegments({
+    headSegments: snapshot.segments,
+    baseSegmentNames: new Set(baseSegments.segments.keys()),
+    // Entry presence, not file existence: bootstrap creates the root EMPTY
+    // by design, and the writer mints anchor:null when there is no head
+    // line to anchor to — an empty tracked root must not deny it.
+    baseRootPresent: baseRootText.trim().length > 0,
+    headRootText: snapshot.root.present ? snapshot.root.text : null,
+    forestAuth,
+  });
+
+  // Once the BASE is segmented, evidence — including the ticket-store
+  // migration's — lives in segments: the frozen root cannot carry it, and
+  // assertRootTransition's frozen path deliberately does not look for it.
+  const baseSegmented = baseSegments.marker !== null || rootTextEndsInCutover(baseRootText);
+  if (migration.verified && baseSegmented) {
+    validateSegmentedMigrationEvidence({
+      baseSegments: baseSegments.segments,
+      headSegments: snapshot.segments,
+      storeHash: migration.storeHash,
+      archiveHash: migration.archiveHash,
+    });
+  }
 
   if (baseHasManifest) {
-    const head = committedManifestAtHead(git);
-    if (!head.present) deny('.adlc/manifest.jsonl exists at base but is absent at HEAD');
-    const baseBytes = baseManifestBytes(git, trustedBase);
-    assertAppendOnly(head.bytes, baseBytes);
-    if (migration.verified) {
-      validateMigrationEvidence(baseBytes.toString('utf8'), head.text, migration.storeHash, migration.archiveHash);
+    // §9.1 — byte-prefix pre-cutover (ordinary appends stay legal; a region
+    // containing cutover/seal entries must be a valid set), byte-identical
+    // after. Root-carried migration evidence keeps its existing conditional
+    // validation for repos that are NOT yet segmented.
+    assertRootTransition({
+      basePresent: true,
+      baseBytes: baseRootBytes,
+      headPresent: snapshot.root.present,
+      headBytes: snapshot.root.bytes ?? null,
+      migration: baseSegmented ? { verified: false } : migration,
+      baseMarkerPresent: baseSegments.marker !== null,
+    });
+    return;
+  }
+
+  if (migration.verified && baseSegmented) {
+    // The evidence was validated against segments above — but this branch is
+    // only reached when the BASE HAS NO ROOT, and returning here skipped the
+    // un-seeded rule entirely: a segmented 'migration' PR could create a
+    // root pre-loaded with arbitrary evidence. A segmented repo's migration
+    // writes nothing to the root; at most an EMPTY root may appear.
+    if (snapshot.root.text.trim()) {
+      fail('a segmented ticket-store migration cannot introduce a populated .adlc/manifest.jsonl — its evidence lives in segments');
     }
     return;
   }
 
   if (migration.verified) {
-    // Read the evidence EXACTLY ONCE and make both the presence and the validation
-    // decision on that single snapshot. A two-read pattern (validate one snapshot,
-    // presence-check a second) is a TOCTOU fail-open: an empty file skips validation,
-    // then a swapped non-empty file satisfies presence with the evidence never checked
-    // (#314 round 4). validateMigrationEvidence denies empty evidence, so one read plus
-    // one unconditional validation covers both.
-    validateMigrationEvidence('', committedManifestAtHead(git).text, migration.storeHash, migration.archiveHash);
+    // One snapshot for presence AND validation (#314 round 4) — and the SAME
+    // snapshot the forest checks above used, keeping the whole verdict pinned
+    // to one rev.
+    validateMigrationEvidence('', snapshot.root.text, migration.storeHash, migration.archiveHash);
     return;
   }
 
   // Ordinary PR: only a TRACKED manifest ADDED by this diff, carrying evidence, denies.
-  if (committedManifestAtHead(git).text.trim()) {
+  if (snapshot.root.text.trim()) {
     deny('.adlc/manifest.jsonl cannot be created with evidence in a PR; create it empty during bootstrap or use the protected-base runner ceremony');
   }
 }
