@@ -250,6 +250,87 @@ directory — if it holds segment files, a writer already recorded real
 evidence there, and deleting it destroys that evidence. Salvage segments
 first (`migrate-branch` or manual review) before any removal.
 
+### migrate-branch
+
+In-flight branch salvage after a cutover. When main migrates while a branch
+still holds root-tail evidence, the rebase's only correct resolution is
+taking main's frozen `manifest.jsonl` wholesale — discarding the branch's
+entries, including any approve that `prosecute --carry-forward` would need.
+This command re-chains those entries into a fresh segment so the evidence
+survives.
+
+```sh
+# after resolving the rebase conflict by taking main's side:
+gate-manifest migrate-branch                 # dry-run (source: ORIG_HEAD)
+gate-manifest migrate-branch --write         # apply
+gate-manifest migrate-branch --from <ref>    # explicit pre-rebase state
+```
+
+Requires `ADLC_MANIFEST_KEY`. Every source entry's signature is verified
+before salvage — a tampered signature always refuses; genuinely unsigned
+entries need `--attest-unsigned` and are disclosed in the salvage record.
+The writes go through the production segment writer, so the minted segment
+carries the branch identity, anchors to the root's cutover line, and passes
+the forest CI gate as any ordinary segment would. A terminal
+`manifest-salvage` entry records the source SHA, entry count, and each
+original line's hash — re-signing is disclosed, never silent.
+
+Refusals (exit 2, nothing written): missing key; a repository that is not
+segmented; an unresolvable source ref; a working root still matching the
+pre-rebase source (take main's side first); a source suffix that does not
+chain from the shared prefix (corruption surfaced, not truncated); a branch
+that already owns a segment (salvage runs once, before new writes).
+
+#### When and how: the full playbook
+
+**The moment you need this:** you run `git rebase main` (or merge main into
+your branch) after main has cut over, and git stops with a conflict in
+`.adlc/manifest.jsonl` — seal/cutover entries on one side, your branch's
+evidence entries on the other. Every in-flight branch hits this exactly once
+per cutover.
+
+**Step 1 — resolve by taking main's side, wholesale.** Do not union the two
+sides and do not hand-edit entries: the frozen root must be byte-identical
+to main's, and CI denies anything else. Mind the rebase inversion — during
+a rebase, `--ours` is MAIN's side, not yours:
+
+```sh
+git checkout --ours -- .adlc/manifest.jsonl     # during REBASE: ours = main
+git checkout --theirs -- .adlc/manifest.jsonl   # during MERGE:  theirs = main
+git add .adlc/manifest.jsonl && git rebase --continue
+```
+
+**Step 2 — salvage, immediately, before any new evidence is recorded:**
+
+```sh
+gate-manifest migrate-branch            # dry-run: shows what would be salvaged
+gate-manifest migrate-branch --write
+```
+
+`ORIG_HEAD` still names your pre-rebase state right after a rebase; if
+anything has moved it (a second rebase, a reset), find the pre-rebase commit
+in `git reflog` and pass it via `--from`.
+
+**Step 3 — restore your attestations.** Salvaged approve entries are
+findable in the forest again, which re-enables the cheap path when your diff
+content did not change:
+
+```sh
+adlc prosecute record-cross-model --ticket <id> --carry-forward <FROM_REVISION>
+```
+
+The old revision string is in the salvaged entry (`gate-manifest show
+--ticket <id>`). If the rebase changed your diff content, carry-forward
+refuses by design — run a fresh distinct-provider review instead.
+
+**When NOT to salvage:** if the branch's root-tail held nothing you need —
+no attestations worth carrying forward, evidence you would re-record anyway
+— just resolve the conflict (step 1) and keep working; the writer mints your
+branch's segment automatically on its next append. Salvage is for
+preserving evidence, not a mandatory ritual. And it must run BEFORE any new
+write on the branch: once fresh evidence mints your segment, salvage
+refuses rather than interleave old entries after new ones.
+
 ### adopt
 
 Choose which lineage this checkout continues, when more than one committed
