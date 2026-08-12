@@ -21,10 +21,28 @@ const APPROVED = new Set([
   'packages/fleet/bin/fleet.mjs',
 ]);
 
+/**
+ * Suite directories that are not production writers. `test/` was the only
+ * skipped name until a sibling suite that lives OUTSIDE test/ — to stay clear
+ * of a frozen rail glob — was flagged for naming `.adlc/tickets.json` in a
+ * fixture.
+ *
+ * Deliberately an explicit SET, not a `*-test` suffix rule: `packages/hollow-test`
+ * is a shipped production package, and a suffix rule would take its `bin/` and
+ * `lib/` out of scope entirely — weakening the guard far beyond the suite
+ * directories it means to skip.
+ */
+const SUITE_DIRECTORIES = new Set(['test', 'cli-test', 'adapter-test']);
+
+/** @param {string} name directory entry name */
+export function isTestDirectory(name) {
+  return SUITE_DIRECTORIES.has(name);
+}
+
 function filesBelow(path) {
   const files = [];
   for (const entry of readdirSync(path, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'test') continue;
+    if (entry.name === 'node_modules' || (entry.isDirectory() && isTestDirectory(entry.name))) continue;
     const full = join(path, entry.name);
     if (entry.isDirectory()) files.push(...filesBelow(full));
     else if (entry.name.endsWith('.mjs')) files.push(full);
@@ -49,6 +67,47 @@ export function directWriterBypasses(files) {
 test('production ticket-store filesystem writers are confined to approved adapters', () => {
   const files = ['packages', 'plugins', 'scripts'].flatMap((path) => filesBelow(join(ROOT, path)));
   assert.deepEqual(directWriterBypasses(files), []);
+});
+
+test('suite directories are skipped, production directories are not', () => {
+  for (const name of ['test', 'cli-test', 'adapter-test']) {
+    assert.equal(isTestDirectory(name), true, `${name} is a suite directory`);
+  }
+  for (const name of ['lib', 'bin', 'hooks', 'testing', 'latest']) {
+    assert.equal(isTestDirectory(name), false, `${name} is production code`);
+  }
+  // The reason this is a set and not a `*-test` suffix rule: a shipped package
+  // whose NAME ends in -test would otherwise vanish from the scan entirely.
+  assert.equal(isTestDirectory('hollow-test'), false, 'packages/hollow-test is production');
+  assert.equal(isTestDirectory('review-calibration-test'), false);
+});
+
+test('the shipped hollow-test package is still scanned', () => {
+  const scanned = filesBelow(join(ROOT, 'packages')).map((p) =>
+    relative(ROOT, p).replaceAll('\\', '/'),
+  );
+  assert.ok(
+    scanned.some((p) => p.startsWith('packages/hollow-test/lib/')),
+    'packages/hollow-test/lib must remain in the writer-boundary scan',
+  );
+  assert.ok(
+    !scanned.some((p) => p.startsWith('packages/hollow-test/test/')),
+    'its own suite directory is still skipped',
+  );
+});
+
+test('the guard still bites on a production writer', () => {
+  // Widening the skip list must not have widened it into the thing being
+  // guarded: an unapproved production module that writes the store still fails.
+  assert.equal(
+    isDirectWriterBypass('packages/rogue/lib/store.mjs', "writeFileSync('.adlc/tickets.json', x)"),
+    true,
+  );
+  assert.equal(
+    isDirectWriterBypass('packages/core/lib/scaffold-hygiene.mjs', "writeFileSync('.adlc/tickets.json', x)"),
+    false,
+    'approved adapters stay approved',
+  );
 });
 
 // ---------------------------------------------------------------------------

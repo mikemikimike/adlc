@@ -32,6 +32,7 @@ import { recordGateEvent } from './evidence.mjs';
 import { parseAddedLines } from '@adlc/rails-guard/lib/suppressions.mjs';
 import { appendToSystemPrompt, buildTicketDoctrine, buildErrorDoctrine } from './doctrine.mjs';
 import { createFitnessTracker, checkBuildGate } from './build-gate.mjs';
+import { checkHandoff, resolvePiSessionId, createStickyDenyState } from './handoff-gate.mjs';
 import { createFlailTracker } from './flail.mjs';
 import { registerCommands } from './commands.mjs';
 import { renderWidgetLines } from './widget.mjs';
@@ -58,6 +59,13 @@ export function createExtension({ env = process.env } = {}) {
     const fitness = createFitnessTracker();
     const flail = createFlailTracker();
     const unvettedSeen = new Set();
+    // Context-handoff session identity (slice 5). Minted once per extension
+    // instance and re-derived at session_start if the host offers a real id;
+    // null means the deny-set fails closed under pressure rather than skipping.
+    let handoffSessionId = resolvePiSessionId(null, null);
+    // Per-session D1 memory: a FAILED deny-marker write must stay sticky after
+    // the band cools, and only an in-process caller can carry that fact.
+    const handoffSticky = createStickyDenyState();
     // Most recent gate event, summarized for the live widget (line 3).
     let lastGateEvent = null;
     // TUI-only message renderers, isolated so this module stays loadable under
@@ -69,6 +77,21 @@ export function createExtension({ env = process.env } = {}) {
     function safeUsage(ctx) {
       try { return typeof ctx?.getContextUsage === 'function' ? ctx.getContextUsage() : null; }
       catch { return null; }
+    }
+
+    // Same reading, but an API that THREW is not the same as an API that is
+    // absent. `safeUsage` collapses both to null, which the band join reads as
+    // "no signal" and lets through — so a transient failure at 95% context
+    // would fail OPEN. The handoff gate needs the two distinguished: absent
+    // stays absent (a host without the API must not hard-lock the repo), while
+    // a failed read becomes an explicitly invalid signal that fails closed.
+    function handoffUsage(ctx) {
+      if (typeof ctx?.getContextUsage !== 'function') return null;
+      try {
+        return ctx.getContextUsage();
+      } catch {
+        return { percent: Number.NaN };
+      }
     }
 
     // =====================================================================
@@ -244,6 +267,9 @@ export function createExtension({ env = process.env } = {}) {
     // =====================================================================
 
     pi.on('session_start', async (_event, ctx) => {
+      // Prefer a host-supplied session id over the minted one; keep the mint
+      // when the host offers none, so D2 still has a stable process identity.
+      handoffSessionId = resolvePiSessionId(_event, ctx, { mint: () => handoffSessionId ?? '' });
       reload(ctx.cwd);
       fitness.reset();
       flail.reset();
@@ -308,6 +334,30 @@ export function createExtension({ env = process.env } = {}) {
     // =====================================================================
 
     pi.on('tool_call', async (event, ctx) => {
+      // Context-rot handoff (slice 5) is evaluated FIRST and is deliberately
+      // NOT ticket-scoped: an open deny record is a session-trust fact, so it
+      // must hold even when no ticket is active — every gate below this line
+      // returns early without a ticket.
+      const handoff = checkHandoff({
+        toolName: event.toolName,
+        input: event.input,
+        sessionId: handoffSessionId,
+        usage: handoffUsage(ctx),
+        ticketId: active.ticketId ?? null,
+        root: activeCwd,
+        manifestKey,
+        sticky: handoffSticky,
+      });
+      if (handoff.decision === 'deny') {
+        ctx.ui.notify(`Blocked ${event.toolName}: ${handoff.reason}`, 'error');
+        noteGate({
+          ctx,
+          type: 'handoff-deny',
+          detail: { tool: event.toolName, reasons: handoff.reasons },
+        });
+        return { block: true, reason: `Blocked ${event.toolName}: ${handoff.reason}` };
+      }
+
       if (active.ticketId && (active.error || !active.ticket)) {
         return {
           block: true,

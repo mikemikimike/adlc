@@ -70,6 +70,46 @@ it is the authoritative proof over the committed diff.
 `PostToolUse` only tracks repeated failures. Its implementation catches internal
 errors and exits successfully, so telemetry cannot break a Codex tool call.
 
+## Context-rot handoff
+
+Codex is an **enforcing** tier for the context-rot handoff. A third `PreToolUse`
+hook evaluates the deny-set from `@adlc/context-handoff` on the same matcher as
+the rail and build gates.
+
+Once a session passes the handoff band, a deny record is written for it under
+`.adlc/handoffs/denies/`. While any such record is open and unauthorized, the
+session loses structured edits **and the shell wholesale** — including attempts
+to run `adlc handoff write|resume|bypass|repair|unlock` from the agent's own
+shell. **Structured** writes to the deny store, resume-auth caches, model-ok
+stamps, and lock files are refused whether or not a deny is active. The shell is
+A shell command naming one of those paths — in any literal spelling: relative,
+dot-relative, absolute, symlinked, or a parent directory that holds them — is
+refused too, deny-set or not —
+there is **no** CI backstop for them, because `.adlc/*` is gitignored and a
+deletion never reaches a diff. That check reads literal paths only: it cannot
+see through a variable, an expansion, or an interpreter one-liner, so it raises
+the cost of the obvious attempt rather than closing the class.
+
+The session that wrote the record stays denied even after another session
+consumes it. Clearing the deny is a host action, not an agent one: resume in a
+fresh session with `adlc handoff resume`, or repair the record from a terminal.
+
+Session identity comes from the hook payload's `session_id` and falls back to
+the `transcript_path` stem. With neither available, mutations fail closed once
+the band fires or a deny store already exists — a clean repository is never
+affected.
+
+A signed resume-auth cache cannot be verified by this hook, and that is
+deliberate. Codex hooks run from the plugin's installed location and resolve
+`@adlc/context-handoff` by walking up into the **project's** `node_modules`, so
+the module they import is project-controlled code. Handing it `ADLC_MANIFEST_KEY`
+would let any repository shipping a package under that name exfiltrate the
+manifest trust anchor. The hook therefore reports
+`resume_auth_unverifiable:no_manifest_key` and keeps denying; the way out stays
+what it already was — continue in a fresh session, or repair from a terminal.
+(The in-process integrations, opencode and pi, resolve the package through their
+own declared dependency and do verify.)
+
 ## Update, inspect, and remove
 
 ```sh

@@ -65,7 +65,6 @@ import { loadContextHandoff } from './handoff-resolve.mjs';
 import {
   resolveSessionId,
   bashCommandFromInput,
-  evaluateHandoffPreToolUse,
 } from './handoff-gate.mjs';
 
 const MODE = process.argv[2];
@@ -1638,8 +1637,42 @@ function observeHandoffSignals(input) {
  * loadDenyRecords. Also protects deny-store paths and fail-closes Bash under
  * an active deny-set.
  */
+/**
+ * Credentials this hook must not expose to imported code.
+ *
+ * KEEP IN SYNC with `HOOK_SECRET_ENV_VARS` in
+ * packages/context-handoff/lib/secret-scrub.mjs, pinned by
+ * hooks/test/handoff-secret-scrub.test.mjs. Inlined rather than imported
+ * because it must run BEFORE the package is loaded — loading the package is
+ * precisely the step it protects.
+ */
+const HOOK_SECRET_ENV_VARS = ['ADLC_MANIFEST_KEY', 'ADLC_ADMIN_KEY'];
+
+/**
+ * Delete credentials from this process's environment.
+ *
+ * handoff-resolve.mjs resolves the gate implementation from the PROJECT's
+ * node_modules, so the module imported below is project-controlled code running
+ * in this process and can read `process.env` directly. Scrubbing is scoped to
+ * the `handoff` mode: the buildgate mode spawns `adlc gate-manifest record` as a
+ * CHILD process that legitimately needs the key, and those modes never import
+ * project-resolved code.
+ */
+function scrubHandoffSecrets(env = process.env) {
+  const removed = [];
+  for (const name of HOOK_SECRET_ENV_VARS) {
+    if (env[name] === undefined) continue;
+    delete env[name];
+    removed.push(name);
+  }
+  return removed;
+}
+
 async function handoff(input) {
   if (!existsSync('.adlc')) return; // not an ADLC repo → allow
+
+  // Before anything project-controlled can be imported.
+  scrubHandoffSecrets();
 
   const api = await loadContextHandoff({ projectRoot: process.cwd() });
   if (!api) {
@@ -1649,14 +1682,10 @@ async function handoff(input) {
   }
 
   const required = [
-    'evaluateBands',
-    'handoffDenyActive',
-    'ensureDenyMarker',
-    'loadDenyRecords',
-    'mutationGateInputFromLoad',
-    'evaluateMutationGate',
-    'readResumeAuth',
-    'nagSuppression',
+    'evaluateHandoffPreToolUse',
+    'resolveHandoffSessionId',
+    'isProtectedHandoffPath',
+    'isHandoffMutatingShell',
     'isSafeSessionId',
   ];
   for (const method of required) {
@@ -1693,8 +1722,7 @@ async function handoff(input) {
     }
   }
 
-  const result = evaluateHandoffPreToolUse({
-    api,
+  const result = api.evaluateHandoffPreToolUse({
     root: process.cwd(),
     sessionId,
     observed,
@@ -1702,6 +1730,20 @@ async function handoff(input) {
     editRelPaths,
     isBash,
     bashCommand,
+    host: 'claude-code',
+    // NO manifest key here, deliberately — see the same note in
+    // plugins/adlc-codex/hooks/adlc-handoff-gate.mjs. handoff-resolve.mjs
+    // resolves the package from the PROJECT's node_modules, so that module is
+    // project-controlled code and must never be handed the manifest signing
+    // key. The cost is that a signed resume-auth cannot be verified in-session.
+    manifestKey: null,
+    // A hook is a fresh process per call, so there is no in-memory D1 fact to
+    // carry. When a marker write SUCCEEDS the sentinel records the session and
+    // mutationGateInputFromLoad reconstructs stickiness from registeredSessions.
+    // When the write FAILS there is nothing durable to reconstruct from, so a
+    // later call whose band has cooled will not know — a residual gap that needs
+    // host-owned storage surviving the subprocess, not a flag here.
+    denyEverWritten: false,
   });
 
   if (!result.deny) return;

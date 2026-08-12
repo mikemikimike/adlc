@@ -91,6 +91,51 @@ integration: `scripts/rails-guard-ci.mjs` reads the frozen rail set **from the
 trusted base ref** and rejects any PR that edits a rail, however the edit was
 made. **Make it a required check.**
 
+## Context-rot handoff
+
+pi is an **enforcing** tier for the context-rot handoff, and the only harness
+with a *real* context-fill signal: `ctx.getContextUsage().percent` is a live
+reading of the window, not a transcript-size proxy. It feeds the band join
+directly as `pct`.
+
+The deny-set from `@adlc/context-handoff` is evaluated on every `tool_call`,
+before every other gate, and — unlike everything else in this extension — it is
+**not** scoped to an active ticket. An open deny record is a fact about the
+session, so it holds whether or not a ticket is selected.
+
+Once a session passes the handoff band a deny record is written for it under
+`.adlc/handoffs/denies/`. While any such record is open and unauthorized, the
+session loses structured edits, bash **wholesale**, and third-party tools —
+including attempts to run `adlc handoff write|resume|bypass|repair|unlock` from
+the agent's own shell. **Structured** writes to the deny store, resume-auth
+caches, model-ok stamps, and lock files are refused whether or not a deny is
+active. A shell command naming one of those paths — in any literal spelling:
+relative, dot-relative, absolute, symlinked, or a parent directory that holds
+them — is refused too, deny-set or not —
+there is **no** CI backstop for them, because `.adlc/*` is gitignored and a
+deletion never reaches a diff. That check reads literal paths only: it cannot
+see through a variable, an expansion, or an interpreter one-liner, so it raises
+the cost of the obvious attempt rather than closing the class. Read-only tools
+keep working.
+
+Because the handoff band (60%) sits below the build gate's own context
+threshold (80%), a percent high enough to trip the build gate now trips the
+handoff deny first. The build gate still fires on the compaction signal, which
+degrades a session without moving the percent — but note that its
+`ADLC_BUILD_GATE_BYPASS` override does not clear a deny-set: resume in a fresh
+session, or repair the record from a terminal.
+
+Session identity is pi's own `ctx.sessionManager.getSessionId()`. A context that
+exposes no session manager falls back to the `session_start` event and then to a
+per-instance mint, which names the extension rather than the session — a
+last-resort identity that still fails closed when unusable.
+
+Clearing a deny needs `ADLC_MANIFEST_KEY` in the harness's environment:
+`adlc handoff resume` signs a resume-auth cache, and the adapter can only honour
+it by verifying that signature. Without the key the gate still fails closed — it
+just cannot be re-opened in-session, and says so
+(`resume_auth_unverifiable:no_manifest_key`).
+
 ## Formal ADLC coverage
 
 | Phase | pi surface |

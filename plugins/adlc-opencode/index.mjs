@@ -18,6 +18,7 @@
 import { checkToolCall, resolveRailsInForce, railHit, extractTargets, READONLY_TOOLS, UNGATED_TOOLS, SHELL_TOOLS } from './rails-checker.mjs';
 import { checkPreflight, auditGateManifest, auditAdversarialReview } from './lib/session-hooks.mjs';
 import { createDepthTracker, checkBuildGate } from './lib/build-gate.mjs';
+import { checkHandoff, createStickyDenyState } from './lib/handoff-gate.mjs';
 import { handleFileEdited, createWatcherState } from './lib/watcher.mjs';
 import { buildSystemContext, buildToolRailNotice, buildStatusLine } from './lib/context-inject.mjs';
 import { createFlailTracker, flailMessage } from './lib/flail.mjs';
@@ -110,6 +111,9 @@ export const adlcRailsGuard = async ({ directory, worktree, project, client } = 
   const watcherState = createWatcherState();
   // Phase 3.3: per-session churn tracker for the flail advisory.
   const flail = createFlailTracker();
+  // Slice 5: per-session D1 memory so a FAILED deny-marker write stays sticky
+  // after the band cools, instead of denying exactly one tool call.
+  const handoffSticky = createStickyDenyState();
 
   const deny = async (message) => {
     if (advisoryOnly) {
@@ -118,6 +122,17 @@ export const adlcRailsGuard = async ({ directory, worktree, project, client } = 
       return;
     }
     // Enforcing (default): notify fire-and-forget, then throw to abort the tool.
+    notify(message, 'error');
+    throw new Error(message);
+  };
+
+  // The context-handoff deny does NOT honour advisoryHooks. That escape hatch
+  // downgrades the RAIL guard, whose authoritative backstop is the CI
+  // rail-freeze gate. The deny-set has no CI backstop — it is a live
+  // session-trust decision, and the spec's only exits from it are a signed
+  // resume-auth, a signed bypass, or privileged host repair. An env var must
+  // not be a fourth one.
+  const denyHandoff = async (message) => {
     notify(message, 'error');
     throw new Error(message);
   };
@@ -164,6 +179,22 @@ export const adlcRailsGuard = async ({ directory, worktree, project, client } = 
       // Pinned contract (v1.17.13): args are on output.args. The input.args
       // fallback is tolerance for older hosts, not the primary read.
       const args = output?.args ?? input?.args ?? {};
+
+      // Slice-5 context-rot handoff: evaluated FIRST. A session past the
+      // handoff band should not be told which rail it hit — it should be told
+      // to stop and hand off.
+      const handoff = checkHandoff({
+        tool,
+        args,
+        sessionID: input?.sessionID,
+        tracker,
+        root,
+        env,
+        sticky: handoffSticky,
+      });
+      if (handoff.decision === 'deny') {
+        return denyHandoff(`ADLC context-handoff: blocked ${tool} — ${handoff.reason}`);
+      }
 
       const verdict = checkToolCall({ tool, args, root, env });
       if (verdict.decision === 'deny') {
@@ -223,6 +254,22 @@ export const adlcRailsGuard = async ({ directory, worktree, project, client } = 
       try {
         const kind = String(input?.type ?? input?.action ?? '').toLowerCase();
         if (READONLY_TOOLS.includes(kind)) return;
+        // The deny-set outranks the rail set here too: a session that must hand
+        // off should not be able to buy its way past a permission prompt.
+        const handoff = checkHandoff({
+          tool: kind,
+          args: {},
+          sessionID: input?.sessionID,
+          tracker,
+          root,
+          env,
+          sticky: handoffSticky,
+        });
+        if (handoff.decision === 'deny') {
+          output.status = 'deny';
+          await notify(`ADLC context-handoff: denied permission "${kind}" — ${handoff.reason}`, 'error');
+          return;
+        }
         const force = resolveRailsInForce(root, env);
         if (!force.active) return;
         if (force.conflict) { output.status = 'deny'; return; }
