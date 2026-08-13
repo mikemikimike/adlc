@@ -7,7 +7,7 @@
 // enforcement contract (active-ticket resolution, phase gating, trust-root
 // freeze) that adlc-codex and adlc-pi already implement.
 
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 import { loadTickets, globMatch, classifyShellCommand, collectPatchPaths, resolveRailPath, ticketStoreExists, TICKET_TRUST_ROOT_RAILS } from '@adlc/core';
 import { resolveActiveTicketId as resolveActiveTicketIdCanonical } from './generated-active-ticket.mjs';
@@ -71,6 +71,32 @@ export const RAILS_SAFE_GATES = new Set([
   'preflight', 'spec-lint', 'premortem', 'parallax', 'coldstart',
   'merge-forecast', 'model-router', 'rejection-mining',
   'lesson-foundry', 'skill-rot', 'model-ratchet', 'flail-detector', 'rails-guard',
+]);
+
+// Gates that may run through adlc_gate while the rail set cannot be RESOLVED —
+// a conflicting active-ticket signal, an unloadable store, a missing ticket.
+//
+// A different question from RAILS_SAFE_GATES, which answers "may this run while
+// rails are FROZEN": there a rail set exists, so a known write target can be
+// vetted against it (that is what the --record-verdict and preflight-scratch
+// checks below do). Under conflict there is nothing to vet against, so the only
+// gate that is safe is one that writes NOTHING. `preflight` is the case that
+// separates the two sets: it is rails-safe because its scratch writes are fixed
+// and checkable (.adlc/tmp/preflight-test, .worktrees/preflight-test, the
+// branch metadata its probes churn), and it is NOT conflict-safe for the same
+// reason — those writes still happen and nothing can say whether they land on a
+// frozen rail.
+//
+// Membership is a source property, not a judgement call: each package listed
+// here contains no fs write and no child_process use outside its own tests, so
+// a bare invocation (nested argv is denied under conflict) can only read.
+// Deliberately absent, each with a write or exec path: preflight (scratch
+// probes, spawns the suite), premortem (--out report), rejection-mining and
+// lesson-foundry (emit plans/skills), skill-rot (rewrites skill headers),
+// model-ratchet (findings ledger, review subprocess), rails-guard (CI bootstrap
+// copies a runner to disk and executes it).
+export const CONFLICT_SAFE_GATES = new Set([
+  'spec-lint', 'parallax', 'coldstart', 'merge-forecast', 'model-router', 'flail-detector',
 ]);
 
 /** Canonicalize a path to a forward-slash path relative to the repo root (lexical). */
@@ -155,15 +181,42 @@ export function normalizeRails(rails) {
  * fails closed (mutating/unknown tool while rails are in force) or is benign.
  */
 export function extractTargets(args) {
-  if (!args || typeof args !== 'object') return [];
+  return extractTargetsKeyed(args).targets;
+}
+
+/**
+ * extractTargets, plus the subset whose KEY asserts the target names a concrete
+ * FILE rather than a directory.
+ *
+ * The provenance is per-key because these keys do not agree. `filePath`, `file`
+ * and a `files[]` entry all say "file" outright; a patch envelope names the
+ * files it updates. `path` says nothing — `{path: 'assets.bundle'}` is a
+ * directory as readily as a file — and a bare string in `edits[]` names an edit,
+ * not a file. Marking the whole extraction file-provenanced (what this used to
+ * do) switched ancestor detection off for every `path` argument, so a rail's own
+ * parent directory passed as `path` never hit the rail it contains.
+ *
+ * Ambiguity therefore stays out of the file set: see `namesAFile` for why that
+ * is the safe direction.
+ *
+ * @param {object} args
+ * @returns {{ targets: string[], files: Set<string> }}
+ */
+function extractTargetsKeyed(args) {
   const targets = [];
-  const push = (v) => { if (typeof v === 'string' && v.trim()) targets.push(v); };
-  push(args.filePath); push(args.path); push(args.file);
-  for (const list of [args.files, args.edits]) {
+  const files = new Set();
+  if (!args || typeof args !== 'object') return { targets, files };
+  const push = (v, fileKeyed) => {
+    if (typeof v !== 'string' || !v.trim()) return;
+    targets.push(v);
+    if (fileKeyed) files.add(v);
+  };
+  push(args.filePath, true); push(args.path, false); push(args.file, true);
+  for (const [list, entriesNameFiles] of [[args.files, true], [args.edits, false]]) {
     if (!Array.isArray(list)) continue;
     for (const entry of list) {
-      if (typeof entry === 'string') push(entry);
-      else if (entry && typeof entry === 'object') { push(entry.filePath); push(entry.path); push(entry.file); }
+      if (typeof entry === 'string') push(entry, entriesNameFiles);
+      else if (entry && typeof entry === 'object') { push(entry.filePath, true); push(entry.path, false); push(entry.file, true); }
     }
   }
   // apply_patch-style envelope bodies declare their targets in-band
@@ -174,10 +227,188 @@ export function extractTargets(args) {
     if (typeof body === 'string' && body.includes('*** ')) {
       const out = new Set();
       collectPatchPaths(body, out);
-      for (const p of out) push(p);
+      // A patch envelope names the FILES it adds/updates/deletes.
+      for (const p of out) push(p, true);
     }
   }
-  return targets;
+  return { targets, files };
+}
+
+/**
+ * Targets to test when deciding whether an UNGATED tool name is being spoofed.
+ *
+ * Deliberately broader than `extractTargets`, and deliberately used only by the
+ * ungated branch. The two branches allow on zero targets in opposite ways:
+ *
+ * - The mutating/unknown branch DENIES when nothing is extractable, so breadth
+ *   there buys no safety — and would cost it. Teaching `extractTargets` to read
+ *   `target` would turn `{target: 'src/in-scope.mjs'}` from a fail-closed deny
+ *   into an extractable non-rail ALLOW, loosening the gate for exactly the tool
+ *   class it can vouch for least.
+ * - The ungated branch ALLOWS when nothing is extractable, because `task`,
+ *   `skill`, and `todowrite` legitimately carry no path on nearly every call.
+ *   A spelling it cannot see is therefore a hole, not a fail-closed default —
+ *   `{target: <frozen rail>}` walked straight through it.
+ *
+ * So breadth belongs here and narrowness belongs in `extractTargets`.
+ *
+ * @param {object} args tool args
+ * @returns {string[]}
+ */
+export function spoofCandidateTargets(args) {
+  return spoofCandidates(args).targets;
+}
+
+/** Keys that name a DIRECTORY outright, so ancestor detection must stay on. */
+const DIR_KEY = /^target_?(?:dir|directory)$/i;
+
+/**
+ * Keys that name a FILE outright, licensing the extension heuristic.
+ *
+ * `path` is deliberately absent even though PATH_FIELD accepts it as a target
+ * spelling: naming a target is a different question from asserting it is a
+ * file. `{target: {path: 'assets.bundle'}}` names a directory, and treating the
+ * key as file-specific would switch ancestor detection off for a rail's parent.
+ */
+const FILE_KEY = /^(?:target_?file|file_?path|file)$/i;
+
+/**
+ * Spoof candidates, plus the subsets a directory-named and a file-named key
+ * produced. A candidate in neither subset is AMBIGUOUS and gets directory
+ * treatment.
+ *
+ * Provenance matters because `namesAFile` can only guess for a path that does
+ * not exist yet, and it guesses "file" for any dotted leaf. `{targetDir:
+ * 'assets.bundle'}` says directory outright; discarding that and guessing would
+ * switch off the ancestor check for the rail's own parent. The file subset is
+ * the same statement in the other direction, and it is why membership is
+ * decided per key rather than per source function.
+ *
+ * @param {object} args
+ * @returns {{ targets: string[], directories: Set<string>, files: Set<string> }}
+ */
+export function spoofCandidates(args) {
+  // Per-key, not bulk: extractTargets reads the generic `path` alongside the
+  // file-specific keys, so its output is a mix of both provenances.
+  const { targets: fromExtract, files } = extractTargetsKeyed(args);
+  const out = new Set(fromExtract);
+  const directories = new Set();
+  collectTargetKeyed(args, out, directories, files);
+  return { targets: [...out], directories, files };
+}
+
+/** Target-ish argument names. Narrower than a path heuristic, broader than one spelling. */
+const TARGET_KEY = /^target(?:_?(?:path|file|dir|directory))?$/i;
+
+/** Path fields that name the file once we are already inside a target subtree. */
+const PATH_FIELD = /^(?:path|file|file_?path)$/i;
+
+/**
+ * True when a candidate is KNOWN to name a concrete file.
+ *
+ * Ambiguity resolves to DIRECTORY, not file, because "file" is what switches
+ * ancestor detection off. Guessing "file" from a dotted leaf is what rounds of
+ * review kept finding holes in: `assets.bundle`, `.adlc`, and `.github` are all
+ * directories that read as files under that guess, and each miss disabled the
+ * check for the rail's own parent. Only two things make a target a file here:
+ * a stat that says so, or a caller that named it with a file-specific key.
+ *
+ * The extension heuristic is therefore NOT used for an ambiguous key. It costs
+ * some over-denial on an absent file named through a bare `target`, which is
+ * the safe direction for a rail guard and is recoverable by naming the key.
+ *
+ * @param {string} target repo-relative or absolute path text
+ * @param {string} [root] repo root for a relative path
+ * @param {{ fileKeyed?: boolean }} [opts] the key that produced this candidate
+ *        was file-specific (filePath/targetFile/file), so an absent path may be
+ *        inferred a file from its name
+ * @returns {boolean}
+ */
+export function namesAFile(target, root = process.cwd(), { fileKeyed = false } = {}) {
+  const raw = String(target ?? '').replace(/\\/g, '/');
+  // A trailing slash is the caller SAYING directory; never second-guess it.
+  if (/\/$/.test(raw)) return false;
+  const rel = raw.replace(/\/+$/, '');
+  if (rel === '') return false;
+  try {
+    const abs = isAbsolute(rel) ? rel : join(root, rel);
+    if (existsSync(abs)) return !statSync(abs).isDirectory();
+  } catch {
+    // Unreadable — fall through to the name heuristic rather than guessing file.
+  }
+  // Absent path: only a file-specific KEY licenses inferring a file from the
+  // name. A bare `target` stays a directory so ancestor detection stays on.
+  if (!fileKeyed) return false;
+  const leaf = rel.split('/').pop() ?? '';
+  // A LEADING dot is a hidden name, not an extension: `.adlc`, `.github`, and
+  // `.claude` are directories, and reading them as files would switch off
+  // ancestor detection for exactly the trees most likely to hold rails.
+  return /.\.[A-Za-z0-9]+$/.test(leaf);
+}
+
+/**
+ * Collect strings under a target-ish key at any reachable depth.
+ *
+ * Depth matters: `extractTargets` walks `files[]`/`edits[]` but reads only
+ * `filePath`/`path`/`file` inside their entries, so a first pass that checked
+ * the new keys on the top level alone still let `{edits:[{target: <rail>}]}`,
+ * `{files:[{target: <rail>}]}`, and `{target: [<rail>]}` through. Enumerating
+ * spellings without covering the SHAPES they arrive in is the same defect one
+ * level down.
+ *
+ * Walked iteratively with no depth ceiling. A numeric cap would BE a bypass of
+ * the same shape this helper exists to close — nest one level past it and the
+ * scan stops looking — and an explicit stack also removes the recursion depth
+ * a hostile payload could otherwise exhaust. `seen` keeps a self-referencing
+ * object from looping forever, tracked per (object, inTarget, dirKeyed) — not
+ * per object alone. What a visit collects depends on that context, so an
+ * object aliased under both a non-target and a target key must be walked once
+ * per context: identity-only tracking let whichever alias popped first (the
+ * non-target one, under LIFO order) suppress the target-context visit
+ * entirely, and the rail target was never collected. Termination holds — each
+ * object is visited at most once per context, and there are only four.
+ *
+ * @param {unknown} root
+ * @param {Set<string>} out
+ */
+function collectTargetKeyed(root, out, directories = new Set(), files = new Set()) {
+  const stack = [{ value: root, inTarget: false, dirKeyed: false }];
+  const seen = new Map(); // object → bitmask of (inTarget, dirKeyed) contexts already walked
+  while (stack.length > 0) {
+    const { value, inTarget, dirKeyed } = stack.pop();
+    // Split from the cycle check on purpose: folded into one condition, a
+    // swapped operator turns the loop-termination guard into an infinite loop
+    // on self-referencing args, which a test can only hang on rather than fail.
+    if (!value || typeof value !== 'object') continue;
+    const ctxBit = 1 << ((inTarget ? 1 : 0) | (dirKeyed ? 2 : 0));
+    const seenCtx = seen.get(value) ?? 0;
+    if ((seenCtx & ctxBit) !== 0) continue;
+    seen.set(value, seenCtx | ctxBit);
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (inTarget && typeof item === 'string' && item.trim() !== '') {
+          out.add(item);
+          if (dirKeyed) directories.add(item);
+        } else stack.push({ value: item, inTarget, dirKeyed });
+      }
+      continue;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      const targetKey = TARGET_KEY.test(key);
+      // Inside a target-valued subtree a conventional path field IS the target:
+      // `{target: {path: '…'}}` names a file just as plainly as `{target: '…'}`.
+      // Descending without carrying that context loses the whole shape.
+      const names = targetKey || (inTarget && PATH_FIELD.test(key));
+      const dirNamed = dirKeyed || DIR_KEY.test(key);
+      if (names && typeof child === 'string' && child.trim() !== '') {
+        out.add(child);
+        if (dirNamed) directories.add(child);
+        else if (FILE_KEY.test(key)) files.add(child);
+        continue;
+      }
+      stack.push({ value: child, inTarget: inTarget || targetKey, dirKeyed: dirNamed });
+    }
+  }
 }
 
 const railSegments = (s) => s.split('/').filter((x) => x !== '');
@@ -284,9 +515,63 @@ export function checkToolCall({ tool, args, root = process.cwd(), env = process.
     // extractable target that resolves to a frozen rail, treat the name as
     // spoofed/abused and deny rather than allow purely by name.
     const force = resolveRailsInForce(root, env);
-    if (force.active && !force.conflict) {
-      for (const target of extractTargets(args)) {
-        const hit = railHit(target, force.rails, root);
+    // Conflicted ticket state: the rail set is unresolved, so a target cannot be
+    // vetted. Previously the whole block was skipped and the branch fell through
+    // to allow — the ONE branch that allows by default also failing open exactly
+    // when rail state is broken.
+    //
+    // Deny only a call that actually carries a target. A no-target ungated call
+    // is the normal case (that is why these names are ungated at all), and
+    // blanket-denying would take `adlc_gate` and `adlc_prosecute` down with it —
+    // the tools an operator needs to diagnose and repair the broken store.
+    if (force.conflict) {
+      const { targets } = spoofCandidates(args);
+      if (targets.length > 0) {
+        return {
+          decision: 'deny',
+          reason: `ungated tool "${name}" carries a target that cannot be vetted — ${force.reason}`,
+        };
+      }
+      // adlc_gate forwards a NESTED argv that carries no extractable target, so
+      // the check above cannot see it. Under conflict the rail-dependent halves
+      // of the gate policy below cannot run at all, and its rail-INDEPENDENT
+      // halves are the ones that matter here: a command-executor flag runs an
+      // arbitrary program, and a writing gate writes targets nothing can vet
+      // while the rail set is unresolved. Allow only a bare NON-WRITING gate —
+      // enough to diagnose the broken store, and nothing that executes or
+      // writes while it is broken.
+      if (name === 'adlc_gate') {
+        const gate = String(args?.gate ?? '').trim().toLowerCase();
+        const nested = (Array.isArray(args?.args) ? args.args : []).filter((t) => typeof t === 'string');
+        if (nested.length > 0) {
+          return {
+            decision: 'deny',
+            reason: `adlc_gate(${gate || '?'}): arguments cannot be vetted — ${force.reason} — run it via the adlc CLI, where the CI diff gate backstops it`,
+          };
+        }
+        // CONFLICT_SAFE_GATES, not RAILS_SAFE_GATES: the rails-safe set permits
+        // gates whose writes are fixed and vettable against a KNOWN rail set,
+        // and there is no known rail set here.
+        if (!CONFLICT_SAFE_GATES.has(gate)) {
+          return {
+            decision: 'deny',
+            reason: `adlc_gate(${gate || '?'}): only a non-writing gate may run — ${force.reason}`,
+          };
+        }
+      }
+      return { decision: 'allow', reason: `tool "${name}" is not gated in-session (CI diff gate covers it)` };
+    }
+    if (force.active) {
+      const { targets, directories, files } = spoofCandidates(args);
+      for (const target of targets) {
+        // Same file-vs-directory distinction MUTATING_TOOLS already gets below:
+        // ancestor detection asks "would acting on this directory destroy a
+        // rail", which is the wrong question for a concrete file and over-blocks
+        // under an interior-wildcard rail (`src/index.mjs` reads as an ancestor
+        // of `src/**/test/*.mjs`). A file is matched against the globs directly.
+        const hit = railHit(target, force.rails, root, {
+          ancestors: directories.has(target) || !namesAFile(target, root, { fileKeyed: files.has(target) }),
+        });
         if (hit) {
           return { decision: 'deny', reason: `ungated tool "${name}" carries a frozen-rail target — frozen rail "${hit}" (active ticket ${force.ticketId})` };
         }
