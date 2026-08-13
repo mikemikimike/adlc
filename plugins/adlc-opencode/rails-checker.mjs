@@ -197,19 +197,26 @@ export function extractTargets(args) {
  * parent directory passed as `path` never hit the rail it contains.
  *
  * Ambiguity therefore stays out of the file set: see `namesAFile` for why that
- * is the safe direction.
+ * is the safe direction. It is reported alongside rather than merely omitted,
+ * because candidates are deduplicated by string and provenance must merge
+ * CONSERVATIVELY when one path arrives under two keys. Otherwise adding a
+ * second spelling weakens the check — `{target: 'x', filePath: 'x'}` would drop
+ * the ambiguous half and turn ancestor detection off — and in the branch this
+ * feeds, the arg shape is exactly what a spoofing caller controls.
  *
  * @param {object} args
- * @returns {{ targets: string[], files: Set<string> }}
+ * @returns {{ targets: string[], files: Set<string>, ambiguous: Set<string> }}
  */
 function extractTargetsKeyed(args) {
   const targets = [];
   const files = new Set();
-  if (!args || typeof args !== 'object') return { targets, files };
+  const ambiguous = new Set();
+  if (!args || typeof args !== 'object') return { targets, files, ambiguous };
   const push = (v, fileKeyed) => {
     if (typeof v !== 'string' || !v.trim()) return;
     targets.push(v);
     if (fileKeyed) files.add(v);
+    else ambiguous.add(v);
   };
   push(args.filePath, true); push(args.path, false); push(args.file, true);
   for (const [list, entriesNameFiles] of [[args.files, true], [args.edits, false]]) {
@@ -231,7 +238,7 @@ function extractTargetsKeyed(args) {
       for (const p of out) push(p, true);
     }
   }
-  return { targets, files };
+  return { targets, files, ambiguous };
 }
 
 /**
@@ -290,10 +297,15 @@ const FILE_KEY = /^(?:target_?file|file_?path|file)$/i;
 export function spoofCandidates(args) {
   // Per-key, not bulk: extractTargets reads the generic `path` alongside the
   // file-specific keys, so its output is a mix of both provenances.
-  const { targets: fromExtract, files } = extractTargetsKeyed(args);
+  const { targets: fromExtract, files, ambiguous } = extractTargetsKeyed(args);
   const out = new Set(fromExtract);
   const directories = new Set();
-  collectTargetKeyed(args, out, directories, files);
+  collectTargetKeyed(args, out, directories, files, ambiguous);
+  // Conservative merge over the deduplicated candidates: one ambiguous spelling
+  // of a path revokes the file assertion another key made about it, so a caller
+  // cannot switch ancestor detection off by ADDING an alias. `directories` needs
+  // no such pass — the consumer already lets it override.
+  for (const target of ambiguous) files.delete(target);
   return { targets: [...out], directories, files };
 }
 
@@ -310,12 +322,19 @@ const PATH_FIELD = /^(?:path|file|file_?path)$/i;
  * ancestor detection off. Guessing "file" from a dotted leaf is what rounds of
  * review kept finding holes in: `assets.bundle`, `.adlc`, and `.github` are all
  * directories that read as files under that guess, and each miss disabled the
- * check for the rail's own parent. Only two things make a target a file here:
- * a stat that says so, or a caller that named it with a file-specific key.
+ * check for the rail's own parent.
  *
- * The extension heuristic is therefore NOT used for an ambiguous key. It costs
- * some over-denial on an absent file named through a bare `target`, which is
- * the safe direction for a rail guard and is recoverable by naming the key.
+ * So a stat decides whenever the path exists. For an absent path the key and
+ * the name must BOTH say file: a file-specific key licenses the extension
+ * heuristic, and it is not authoritative on its own, because `filePath` is a
+ * key plenty of tools hand a directory. An absent `{filePath: 'src/Makefile'}`
+ * therefore keeps ancestor detection and can be over-denied under an
+ * interior-wildcard rail — deliberate, since this predicate only gates tools
+ * that do not write files (the structured mutators take the `singleFile` path),
+ * and over-denial there is a visible, explained refusal rather than a miss.
+ *
+ * The extension heuristic is NOT used at all for an ambiguous key, which costs
+ * the same over-denial on an absent file named through a bare `target`.
  *
  * @param {string} target repo-relative or absolute path text
  * @param {string} [root] repo root for a relative path
@@ -368,10 +387,15 @@ export function namesAFile(target, root = process.cwd(), { fileKeyed = false } =
  * entirely, and the rail target was never collected. Termination holds — each
  * object is visited at most once per context, and there are only four.
  *
+ * Provenance is recorded per occurrence, not per candidate: `directories` and
+ * `files` are the keys that said so outright, `ambiguous` is every other
+ * occurrence. The caller merges them (see `spoofCandidates`); recording only
+ * the assertions would let an added alias erase an ambiguous one.
+ *
  * @param {unknown} root
  * @param {Set<string>} out
  */
-function collectTargetKeyed(root, out, directories = new Set(), files = new Set()) {
+function collectTargetKeyed(root, out, directories = new Set(), files = new Set(), ambiguous = new Set()) {
   const stack = [{ value: root, inTarget: false, dirKeyed: false }];
   const seen = new Map(); // object → bitmask of (inTarget, dirKeyed) contexts already walked
   while (stack.length > 0) {
@@ -388,7 +412,9 @@ function collectTargetKeyed(root, out, directories = new Set(), files = new Set(
       for (const item of value) {
         if (inTarget && typeof item === 'string' && item.trim() !== '') {
           out.add(item);
+          // An array under a target key states no file-ness of its own.
           if (dirKeyed) directories.add(item);
+          else ambiguous.add(item);
         } else stack.push({ value: item, inTarget, dirKeyed });
       }
       continue;
@@ -404,6 +430,7 @@ function collectTargetKeyed(root, out, directories = new Set(), files = new Set(
         out.add(child);
         if (dirNamed) directories.add(child);
         else if (FILE_KEY.test(key)) files.add(child);
+        else ambiguous.add(child);
         continue;
       }
       stack.push({ value: child, inTarget: inTarget || targetKey, dirKeyed: dirNamed });
@@ -412,6 +439,22 @@ function collectTargetKeyed(root, out, directories = new Set(), files = new Set(
 }
 
 const railSegments = (s) => s.split('/').filter((x) => x !== '');
+
+/**
+ * Every spelling of a target that a decision must account for: the raw one and,
+ * when it differs, the trimmed one. A padded ` test/x.mjs ` is a different
+ * lexical path here while any tool that normalizes its input acts on the frozen
+ * one, so a check that reads a single form is a spelling bypass — and the
+ * classification and the matching must read the SAME list, or the two disagree
+ * about which path they are talking about.
+ *
+ * @param {unknown} target
+ * @returns {string[]}
+ */
+export function matchableSpellings(target) {
+  const raw = String(target ?? '');
+  return raw === raw.trim() ? [raw] : [raw, raw.trim()];
+}
 
 // True if directory `target` is a proper ANCESTOR of the concrete paths a rail
 // glob can match — i.e. deleting/moving target destroys the frozen rail even
@@ -422,26 +465,114 @@ const railSegments = (s) => s.split('/').filter((x) => x !== '');
 //   `packages/foo/src`  does NOT cover it          (literal mismatch)
 //   `test2`           does NOT cover `test/**`     (sibling, no over-block)
 //   `test/x.txt`      does NOT cover `test/*.mjs`  (same depth → globMatch's job)
-export function targetIsRailAncestor(target, rail) {
-  const T = railSegments(target);
-  const R = railSegments(rail);
-  for (let i = 0; ; i++) {
-    if (i === T.length) return R.length > T.length; // target is a proper prefix of the rail pattern
-    if (i === R.length) return false;               // target deeper than the rail, no ** seen
-    const seg = R[i];
-    if (seg === '**') {
-      // A `**` here can absorb the target's remaining segments — but ONLY if
-      // some literal/wildcard prefix already ANCHORED the match. A LEADING `**`
-      // (i === 0) anchors nothing: it would make every path an ancestor of e.g.
-      // `**/*.test.mjs`, denying all edits. Such a floating rail has no fixed
-      // root directory, so ancestor-destruction isn't well-defined — rely on
-      // globMatch (direct hits), the repo-root check, and the file.edited
-      // backstop instead. Anchored `**` (a/**) legitimately covers the subtree.
-      return i > 0;
+//
+// `opts.throughDoubleStar` (default true) allows the second form: an anchored
+// `**` absorbing the target's remaining segments. A caller that has been told
+// the target is a FILE turns it off — see railHit's `ancestors: 'literal'`.
+//
+// Narrowed, the question becomes: does the rail NAME this target as a directory?
+// It does when the target's LAST segment lines up with a real rail segment that
+// has more rail after it. How the earlier segments lined up does not matter, so
+// a `**` may still absorb them:
+//   `src/cache.bundle`     covers `src/**/cache.bundle/**`  (named, ** took none)
+//   `src/foo/cache.bundle` covers `src/**/cache.bundle/**`  (named, ** took foo)
+//   `src/index.mjs` does NOT cover `src/**/test/*.mjs`      (only the ** could
+//                                                            hold the last
+//                                                            segment — the rail
+//                                                            says nothing about
+//                                                            this name)
+export function targetIsRailAncestor(target, rail, { throughDoubleStar = true } = {}) {
+  return ancestorWalk(railSegments(target), railSegments(rail), throughDoubleStar);
+}
+
+// One rail segment against one target segment, with the SAME semantics as the
+// direct hit check — `foo-*` must not read as matching `bar`, or ancestor
+// detection denies paths the rail could never match. A single `*` stays inside
+// its segment in @adlc/core, so segment-by-segment is the right shape for it.
+//
+// Three spellings are NOT decidable one segment at a time, and each keeps the
+// older permissive reading so the ancestor check never matches LESS than the
+// glob: `?` and character classes, which core does not implement at all, and an
+// EMBEDDED `**` (`foo**bar`), which core lets span `/` — `a/foo**bar/**` really
+// does cover `a/foo/x/bar/frozen.mjs`, so `a/foo` is an ancestor of it and one
+// segment cannot see that. A segment that IS `**` never reaches here.
+const segmentMatches = (pattern, segment) => (
+  globMatch(pattern, segment) || /[?[]/.test(pattern) || pattern.includes('**')
+);
+
+// `seen` holds the (target index, rail index) pairs already explored. The
+// answer depends on nothing else, so a state reached twice cannot answer
+// differently. With the constant-work `**` transitions below, that bounds the
+// whole walk at one visit per state — target segments × rail segments — for a
+// path length the CALLER chooses, in a synchronous pre-execution hook. Both
+// halves are needed: memo without constant-work transitions still scans the
+// remaining segments at every `**` state and stays quadratic in path length.
+// Deliberately NOT solved with a segment-count cap: a numeric ceiling on a path
+// is itself a bypass, and there is nothing left to cap once the bound holds.
+//
+// Walked with an explicit worklist, not recursion. The skip branch would cost
+// one stack frame per rail segment, and a rail is a string in the ticket store:
+// a few thousand `**` segments is syntactically valid and would raise a
+// RangeError out of the hook instead of a rail decision. Nothing here needs the
+// call stack, so it does not use it.
+function ancestorWalk(T, R, throughDoubleStar) {
+  const seen = new Set();
+  // Each entry is a (target index, rail index) branch still to explore. A `**`
+  // forks; the fork is queued here instead of taking a stack frame.
+  const pending = [[0, 0]];
+  while (pending.length > 0) {
+    let [ti, ri] = pending.pop();
+    for (;;) {
+      // Keyed as text rather than packed into one number: any multiplier larger
+      // than the rail length encodes the pair just as well, so the arithmetic
+      // form has a free constant in it that no behaviour depends on.
+      const state = `${ti}:${ri}`;
+      if (seen.has(state)) break;                   // already explored; it did not pan out
+      seen.add(state);
+      if (ti === T.length) {                        // target is a proper prefix of the rail pattern
+        if (ri < R.length) return true;
+        break;
+      }
+      if (ri === R.length) break;                   // target deeper than the rail, no ** seen
+      const seg = R[ri];
+      if (seg === '**') {
+        // A `**` here can absorb target segments — but ONLY if some
+        // literal/wildcard prefix already ANCHORED the match. A LEADING `**`
+        // anchors nothing: it would make every path an ancestor of e.g.
+        // `**/*.test.mjs`, denying all edits. Such a floating rail has no fixed
+        // root directory, so ancestor-destruction isn't well-defined — rely on
+        // globMatch (direct hits), the repo-root check, and the file.edited
+        // backstop instead. Anchored `**` (a/**) legitimately covers the subtree.
+        if (ri === 0) break;
+        if (throughDoubleStar) return true;
+        // Narrowed: two constant-work moves, never a scan of the remaining
+        // segments. Either the `**` takes nothing more and the rail advances, or
+        // it eats one segment and the rail stays put — repeated, that reaches
+        // every split. The one split it must not reach is the `**` swallowing the
+        // target's LAST segment: that segment is the one whose directory-ness is
+        // in question, and a `**` matches any name at all, so it is not evidence.
+        pending.push([ti, ri + 1]);
+        if (ti >= T.length - 1) break;
+        ti += 1;
+        continue;
+      }
+      // An embedded `**` spans `/`, so the rail keeps going INSIDE this segment
+      // and can cover any number of the target's remaining segments: `a**b`
+      // matches `a/b`, and `a/foo**bar/**` matches `a/foo/x/bar/frozen.mjs`.
+      // Nothing past the `**` is decidable one segment at a time, so all that
+      // is checked is the literal text before it, which the target's segment
+      // must still begin with — enough to keep `b` from reading as an ancestor
+      // of `a**b` while never claiming less than the glob does.
+      const span = seg.indexOf('**');
+      if (span !== -1) {
+        if (T[ti].startsWith(seg.slice(0, span).replace(/[*?[][\s\S]*$/, ''))) return true;
+        break;
+      }
+      if (!segmentMatches(seg, T[ti])) break;       // mismatch → not an ancestor
+      ti += 1; ri += 1;
     }
-    if (/[*?[]/.test(seg)) continue;                // wildcard segment matches this target segment
-    if (seg !== T[i]) return false;                 // literal mismatch → not an ancestor
   }
+  return false;
 }
 
 // Does `target` hit a frozen rail? Matches the lexical path AND the
@@ -454,18 +585,34 @@ export function targetIsRailAncestor(target, rail) {
 // not be denied just because an interior-`**` rail could nest a match under a
 // same-named dir. Callers that know the op targets one concrete file
 // (edit/write/apply_patch, the file.edited watcher) pass `{ ancestors: false }`.
+//
+// `'literal'` is the middle setting, for a target something UNTRUSTED called a
+// file — an arg key, not a stat. It keeps every ancestor form except the one an
+// anchored `**` creates. The distinction is the rail set's own evidence: a rail
+// `assets.bundle/**` states that `assets.bundle` is a DIRECTORY, so a caller
+// naming it as a file contradicts the frozen rails, and the rails are the
+// trusted side. But `src/**/test/*.mjs` states nothing about `src/index.mjs` —
+// only the `**` relates them — so a file there is left alone. That is the
+// over-block requirement 3 exists to prevent, and the bypass a caller would get
+// by spelling a rail's parent directory as `filePath`.
 export function railHit(target, rails, root, { ancestors = true } = {}) {
-  const candidates = new Set([canonicalizePath(target, root), resolveRailPath(target, root)]);
+  const ancestorsOn = ancestors !== false;
+  const throughDoubleStar = ancestors !== 'literal';
+  const candidates = new Set();
+  for (const form of matchableSpellings(target)) {
+    candidates.add(canonicalizePath(form, root));
+    candidates.add(resolveRailPath(form, root));
+  }
   for (const path of candidates) {
     // A mutation targeting the repo ROOT (e.g. `rm -rf .`) destroys every rail.
     // Return a guaranteed-truthy token even if the rail set is somehow blank.
-    if (ancestors && (path === '' || path === '.')) return rails.find(Boolean) ?? '(repo root)';
+    if (ancestorsOn && (path === '' || path === '.')) return rails.find(Boolean) ?? '(repo root)';
     for (const rail of rails) {
       // (a) target is the rail or inside it (normal case).
       if (rail === path || globMatch(rail, path)) return rail;
       // (b) target is an ANCESTOR directory of the rail — deleting/moving it
       // destroys the frozen rail without ever matching the glob.
-      if (ancestors && targetIsRailAncestor(path, rail)) return rail;
+      if (ancestorsOn && targetIsRailAncestor(path, rail, { throughDoubleStar })) return rail;
     }
   }
   return null;
@@ -568,10 +715,24 @@ export function checkToolCall({ tool, args, root = process.cwd(), env = process.
         // ancestor detection asks "would acting on this directory destroy a
         // rail", which is the wrong question for a concrete file and over-blocks
         // under an interior-wildcard rail (`src/index.mjs` reads as an ancestor
-        // of `src/**/test/*.mjs`). A file is matched against the globs directly.
-        const hit = railHit(target, force.rails, root, {
-          ancestors: directories.has(target) || !namesAFile(target, root, { fileKeyed: files.has(target) }),
-        });
+        // of `src/**/test/*.mjs`).
+        //
+        // But "file" here is at best a claim by the caller, and this is the
+        // branch whose whole job is not to trust that caller — so a claimed file
+        // gets `'literal'`, not `false`. It stops the `**`-absorbed ancestor
+        // form (the over-block) while keeping the form where the rail set itself
+        // says the target is a directory, which is the spelling a spoofing call
+        // would otherwise use to shed the check.
+        //
+        // Classified on every spelling railHit will match, and conservatively:
+        // one spelling that is not a file keeps full ancestor detection. A
+        // padded ` src/cache.bundle` misses the stat that would find the real
+        // directory and reads as an absent dotted file, while railHit goes on
+        // to match the trimmed spelling — so classifying the raw form alone
+        // handed the narrowed mode a directory.
+        const claimedFile = !directories.has(target)
+          && matchableSpellings(target).every((spelling) => namesAFile(spelling, root, { fileKeyed: files.has(target) }));
+        const hit = railHit(target, force.rails, root, { ancestors: claimedFile ? 'literal' : true });
         if (hit) {
           return { decision: 'deny', reason: `ungated tool "${name}" carries a frozen-rail target — frozen rail "${hit}" (active ticket ${force.ticketId})` };
         }

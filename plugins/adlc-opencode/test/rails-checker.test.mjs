@@ -9,9 +9,10 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  checkRail, checkToolCall, extractTargets, spoofCandidateTargets, spoofCandidates, namesAFile, resolveActiveTicketId,
-  RAILS_SAFE_GATES, CONFLICT_SAFE_GATES,
+  checkRail, checkToolCall, checkShellCall, extractTargets, spoofCandidateTargets, spoofCandidates, namesAFile, resolveActiveTicketId,
+  targetIsRailAncestor, RAILS_SAFE_GATES, CONFLICT_SAFE_GATES,
 } from '../rails-checker.mjs';
+import { globMatch } from '@adlc/core';
 import { adlcRailsGuard } from '../index.mjs';
 
 function repo({ tickets, current } = {}) {
@@ -251,6 +252,11 @@ test('i: extractTargets covers the tolerated shapes', () => {
   // A host that hands the hook a non-object payload yields no targets rather
   // than reading properties off it.
   assert.deepEqual(extractTargets('test/frozen.test.mjs'), []);
+  // Same guard one level down: a null entry inside files[]/edits[] is skipped,
+  // not walked into. `typeof null === 'object'`, so the null half is the half a
+  // list can actually contain.
+  assert.deepEqual(extractTargets({ files: [null], edits: [null] }), []);
+  assert.deepEqual(extractTargets({ files: [null, { filePath: 'a' }] }), ['a']);
 });
 
 // ---- (j) tool-name normalization + ungated first-party tools ----
@@ -849,6 +855,9 @@ test('r: a concrete non-rail file is not read as a rail ancestor', () => {
       { file: 'src/index.mjs' },
       { files: ['src/index.mjs'] },
       { edits: [{ filePath: 'src/index.mjs' }] },
+      // A patch envelope names the FILES it updates — as file-specific a
+      // statement as any key, and the shape apply_patch arrives in.
+      { patch: '*** Begin Patch\n*** Update File: src/index.mjs\n*** End Patch\n' },
     ]) {
       const r = checkToolCall({ tool: 'task', args, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
       assert.equal(r.decision, 'allow', `${JSON.stringify(args)} → ${r.reason}`);
@@ -864,6 +873,33 @@ test('r: a concrete non-rail file is not read as a rail ancestor', () => {
     for (const args of [{ target: 'src/index.mjs' }, { path: 'src/index.mjs' }, { targetPath: 'src/index.mjs' }, { edits: [{ path: 'src/index.mjs' }] }]) {
       const ambiguous = checkToolCall({ tool: 'task', args, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
       assert.equal(ambiguous.decision, 'deny', `${JSON.stringify(args)} → ${ambiguous.reason}`);
+    }
+    // Provenance merges CONSERVATIVELY across the deduplicated candidate: one
+    // ambiguous spelling revokes the file assertion another key made about the
+    // same path, so a caller cannot shed the ancestor check by ADDING an alias.
+    // Both property orders, because a walk order that only works one way is the
+    // same defect waiting for a different serializer.
+    for (const args of [
+      { target: 'src/index.mjs', filePath: 'src/index.mjs' },
+      { filePath: 'src/index.mjs', target: 'src/index.mjs' },
+      { files: ['src/index.mjs'], path: 'src/index.mjs' },
+      { targetFile: 'src/index.mjs', edits: [{ path: 'src/index.mjs' }] },
+    ]) {
+      const aliased = checkToolCall({ tool: 'task', args, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
+      assert.equal(aliased.decision, 'deny', `${JSON.stringify(args)} → ${aliased.reason}`);
+    }
+    // Padding is a spelling, not a different path: a tool that trims its input
+    // would act on the frozen one. Checked on the mutating branch too, which is
+    // the branch that actually writes.
+    for (const [tool, args] of [
+      ['task', { target: ' src/app/test/a.mjs ' }],
+      ['task', { filePath: 'src/app/test/a.mjs ' }],
+      ['task', { edits: [{ target: '  src/app/test/a.mjs' }] }],
+      ['write', { filePath: ' src/app/test/a.mjs ' }],
+      ['custom_writer', { path: ' src/app/test/a.mjs ' }],
+    ]) {
+      const padded = checkToolCall({ tool, args, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
+      assert.equal(padded.decision, 'deny', `${tool} ${JSON.stringify(args)} → ${padded.reason}`);
     }
     mkdirSync(join(dir, 'src'), { recursive: true });
     writeFileSync(join(dir, 'src', 'index.mjs'), '');
@@ -976,8 +1012,12 @@ test('r: a generic path key does not assert file-ness, so a rail parent still hi
       assert.equal(r.decision, 'deny', `${JSON.stringify(args)} → ${r.reason}`);
       assert.match(r.reason, /frozen rail "assets\.bundle\/\*\*"/);
     }
-    // A key that DOES assert file-ness keeps its file semantics: the caller has
-    // said this is a file, so the ancestor question is not the one being asked.
+    // A key that asserts file-ness does NOT rescue this one, because the rail
+    // set contradicts it: `assets.bundle/**` states that `assets.bundle` is a
+    // directory, and the rails are the trusted side of that disagreement. Only
+    // the `**`-absorbed ancestor form is dropped for a claimed file — see the
+    // interior-wildcard test above, where the rails say nothing about the
+    // target and it is allowed.
     for (const args of [
       { filePath: 'assets.bundle' },
       { file: 'assets.bundle' },
@@ -985,12 +1025,210 @@ test('r: a generic path key does not assert file-ness, so a rail parent still hi
       { targetFile: 'assets.bundle' },
     ]) {
       const r = checkToolCall({ tool: 'task', args, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
-      assert.equal(r.decision, 'allow', `${JSON.stringify(args)} → ${r.reason}`);
+      assert.equal(r.decision, 'deny', `${JSON.stringify(args)} → ${r.reason}`);
     }
     // …and a stat still overrules the key, in both directions.
     mkdirSync(join(dir, 'assets.bundle'), { recursive: true });
     const stated = checkToolCall({ tool: 'task', args: { filePath: 'assets.bundle' }, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
     assert.equal(stated.decision, 'deny', `an existing directory is not a file → ${stated.reason}`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: a claimed file is still denied when the rail NAMES it past a zero-width **', () => {
+  // End-to-end form of the narrowed-ancestor boundary. `src/cache.bundle` is
+  // absent and dotted, so a file-specific key gets it classified as a claimed
+  // file — but `src/**/cache.bundle/**` names it outright once the `**` takes
+  // zero segments, and the rail set outranks the claim.
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: ['src/**/cache.bundle/**'] }] } });
+  try {
+    const env = { ...ON, ADLC_TICKET: 'T1' };
+    for (const args of [
+      { filePath: 'src/cache.bundle' },
+      { targetFile: 'src/cache.bundle' },
+      { files: ['src/cache.bundle'] },
+      // …and with the ** absorbing a segment on the way, which is no less a
+      // naming of the last one.
+      { filePath: 'src/foo/cache.bundle' },
+      { filePath: 'src/foo/bar/cache.bundle' },
+    ]) {
+      const r = checkToolCall({ tool: 'task', args, root: dir, env });
+      assert.equal(r.decision, 'deny', `${JSON.stringify(args)} → ${r.reason}`);
+    }
+    // The over-block requirement 3 removed stays removed: here only the `**`
+    // relates the rail to the target, so a claimed file still runs.
+    const unrelated = checkToolCall({ tool: 'task', args: { filePath: 'src/index.mjs' }, root: dir, env });
+    assert.equal(unrelated.decision, 'allow', unrelated.reason);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: a padded spelling is classified on the same paths it is matched on', () => {
+  // The classification and the rail matching must read the same list of
+  // spellings. A padded ` src/cache.bundle` misses the stat that finds the real
+  // directory and reads as an absent dotted FILE, while railHit goes on to
+  // match the trimmed spelling — so classifying the raw form alone handed the
+  // narrowed ancestor mode a directory and dropped the check.
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: ['src/**/test/*.mjs'] }] } });
+  try {
+    const env = { ...ON, ADLC_TICKET: 'T1' };
+    mkdirSync(join(dir, 'src', 'cache.bundle'), { recursive: true });
+    for (const spelling of [' src/cache.bundle', 'src/cache.bundle ', '  src/cache.bundle  ', 'src/cache.bundle']) {
+      const r = checkToolCall({ tool: 'task', args: { filePath: spelling }, root: dir, env });
+      assert.equal(r.decision, 'deny', `${JSON.stringify(spelling)} → ${r.reason}`);
+    }
+    // The conservative merge costs the file claim outright: a padded spelling
+    // is not a name the heuristic can read, so the target keeps full ancestor
+    // detection and an absent file named this way is over-denied. Cheap and
+    // correct-direction — the caller passed a path with padding on it, and
+    // trimming it is one edit.
+    const padded = checkToolCall({ tool: 'task', args: { filePath: ' src/index.mjs ' }, root: dir, env });
+    assert.equal(padded.decision, 'deny', padded.reason);
+    // It does NOT turn every padded path into a rail hit, which would make the
+    // guard useless rather than strict.
+    const unrelated = checkToolCall({ tool: 'task', args: { filePath: ' other/thing.mjs ' }, root: dir, env });
+    assert.equal(unrelated.decision, 'allow', unrelated.reason);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: narrowed ancestor matching stays linear on a hostile target path', () => {
+  // Each ** explores every remaining target position. Without memoizing the
+  // (target, rail) state that is combinatorial in the number of globstars over
+  // an ATTACKER-CONTROLLED path, inside a synchronous pre-execution hook: this
+  // input took minutes before, and a caller only has to name a long path.
+  // Sized past where the quadratic form gave out: 16k segments took ~8s with a
+  // per-state suffix scan and minutes with none, against ~10ms once each state
+  // is visited once. The ceiling therefore has two orders of magnitude of
+  // headroom, so this fails on an asymptotic regression rather than on a slow
+  // machine.
+  const target = `a/${Array.from({ length: 16000 }, (_, i) => `s${i}`).join('/')}`;
+  const started = process.hrtime.bigint();
+  for (const rail of ['a/**/z/**', 'a/**/**/z/**', 'a/**/**/**/z/**']) {
+    assert.equal(targetIsRailAncestor(target, rail, { throughDoubleStar: false }), false, rail);
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 2000, `narrowed ancestor walk took ${elapsedMs | 0}ms`);
+  // And the hook really does route a hostile path here: a dotted file-keyed
+  // target is what selects the narrowed mode. Asserted for its DECISION only —
+  // the rest of checkToolCall canonicalizes and symlink-resolves a 100KB path,
+  // which dominates the timing and would make a ceiling here a measurement of
+  // the filesystem rather than of this walk.
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: ['a/**/**/z/**'] }] } });
+  try {
+    const r = checkToolCall({ tool: 'task', args: { filePath: `${target}/x.mjs` }, root: dir, env: { ...ON, ADLC_TICKET: 'T1' } });
+    assert.equal(r.decision, 'allow', r.reason);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: ancestor detection never misses a rail globMatch can reach', () => {
+  // Enumerating shapes stopped converging: five review rounds each produced one
+  // more rail spelling this predicate read differently from the matcher that
+  // decides direct hits. So state the invariant behind all of them and check it
+  // against @adlc/core over GENERATED rails instead of remembered cases:
+  //
+  //   if some path the rail matches has `target` as a proper prefix,
+  //   then `target` is an ancestor of that rail.
+  //
+  // One-directional on purpose. Over-approximating is the safe direction and
+  // the predicate does it deliberately for spellings a segment walk cannot
+  // decide (`?`, character classes, an embedded `**`); MISSING one is the
+  // failure that lets a mutation destroy a frozen rail.
+  const RAIL_SEGMENTS = ['a', 'b', '*', '**', 'a*', 'a**b'];
+  const NAMES = ['a', 'b', 'ab'];
+  const combos = (alphabet, maxLen) => {
+    const out = [];
+    let level = [[]];
+    for (let n = 0; n < maxLen; n++) {
+      level = level.flatMap((prefix) => alphabet.map((s) => [...prefix, s]));
+      out.push(...level);
+    }
+    return out;
+  };
+  const rails = combos(RAIL_SEGMENTS, 3).map((s) => s.join('/'));
+  const targets = combos(NAMES, 2).map((s) => s.join('/'));
+  // The concrete paths a rail could match, deep enough to run past a `**`.
+  const universe = combos(NAMES, 4).map((s) => s.join('/'));
+  const isProperPrefix = (prefix, path) => path.startsWith(`${prefix}/`);
+  let checked = 0;
+  for (const rail of rails) {
+    // A LEADING `**` is the one documented exception: it anchors nothing, so
+    // ancestor-destruction has no fixed root to be defined against and the
+    // predicate returns false by design. Direct hits still cover it.
+    if (rail.startsWith('**')) continue;
+    for (const target of targets) {
+      const reachable = universe.some((path) => globMatch(rail, path) && isProperPrefix(target, path));
+      if (reachable) {
+        assert.ok(targetIsRailAncestor(target, rail), `missed ancestor: target ${target} of rail ${rail}`);
+        checked += 1;
+      }
+      // The narrowed mode answers a deliberately narrower question, so it may
+      // say no where the full mode says yes — but never the reverse, or a
+      // claimed file would be denied where a directory is not.
+      if (targetIsRailAncestor(target, rail, { throughDoubleStar: false })) {
+        assert.ok(targetIsRailAncestor(target, rail), `narrowed exceeded full: ${target} vs ${rail}`);
+      }
+    }
+  }
+  assert.ok(checked > 100, `property exercised only ${checked} real ancestor pairs`);
+});
+
+test('r: an embedded-globstar rail still denies its ancestor directory', () => {
+  // End-to-end witness for the spelling a segment-wise matcher cannot decide.
+  // The rail's concrete matches live under `a/foo`, so acting on that directory
+  // destroys them even though it never matches the glob itself.
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: ['a/foo**bar/**'] }] } });
+  try {
+    const env = { ...ON, ADLC_TICKET: 'T1' };
+    // A directory-affecting op: an unknown tool, and a shell removal.
+    assert.equal(checkToolCall({ tool: 'custom_writer', args: { path: 'a/foo' }, root: dir, env }).decision, 'deny');
+    assert.equal(checkShellCall({ command: 'rm -rf a/foo', root: dir, env }).decision, 'deny');
+    // And through the narrowed mode, which a claimed file selects.
+    assert.equal(checkToolCall({ tool: 'task', args: { filePath: 'a/foo' }, root: dir, env }).decision, 'deny');
+    // A sibling directory the rail cannot reach still runs.
+    assert.equal(checkToolCall({ tool: 'custom_writer', args: { path: 'b/foo' }, root: dir, env }).decision, 'allow');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: a rail thousands of globstars deep still yields a decision', () => {
+  // The other direction of the same hostile input: the RAIL is a string in the
+  // ticket store, and a few thousand `**` segments is syntactically valid. A
+  // per-segment stack frame would raise a RangeError out of the hook instead of
+  // a rail decision, which is a broken gate rather than a strict one.
+  const deep = `a/${'**/'.repeat(5000)}z`;
+  assert.equal(targetIsRailAncestor('a/b.mjs', deep, { throughDoubleStar: false }), false);
+  assert.equal(targetIsRailAncestor('a/b.mjs', deep), true);
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: [deep] }] } });
+  try {
+    const env = { ...ON, ADLC_TICKET: 'T1' };
+    // A claimed file takes the narrowed walk; an ambiguous key takes the full
+    // one, which stops at the first `**`. Both must answer rather than throw.
+    assert.equal(checkToolCall({ tool: 'task', args: { filePath: 'a/b.mjs' }, root: dir, env }).decision, 'allow');
+    assert.equal(checkToolCall({ tool: 'task', args: { target: 'a/b.mjs' }, root: dir, env }).decision, 'deny');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('r: a file-specific key does not make an absent extensionless path a file', () => {
+  // The key licenses the extension heuristic; it is not authoritative on its
+  // own, because `filePath` is a key plenty of tools hand a directory. So an
+  // absent `src/Makefile` keeps ancestor detection and is over-denied under an
+  // interior-wildcard rail. Pinned as a DECISION, not left to be rediscovered:
+  // the alternative direction (key wins outright) switches the check off for an
+  // absent `{filePath: '.adlc'}` too, and this predicate only gates tools that
+  // never write files, so over-denial here is a visible refusal rather than a
+  // miss. A stat flips it the moment the file exists.
+  const dir = repo({ tickets: { tickets: [{ id: 'T1', rails: ['src/**/test/*.mjs'] }] } });
+  try {
+    const env = { ...ON, ADLC_TICKET: 'T1' };
+    for (const leaf of ['Makefile', 'Dockerfile', 'LICENSE']) {
+      const r = checkToolCall({ tool: 'task', args: { targetFile: `src/${leaf}` }, root: dir, env });
+      assert.equal(r.decision, 'deny', `absent src/${leaf} → ${r.reason}`);
+    }
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    writeFileSync(join(dir, 'src', 'Makefile'), '');
+    const stated = checkToolCall({ tool: 'task', args: { targetFile: 'src/Makefile' }, root: dir, env });
+    assert.equal(stated.decision, 'allow', `an existing file is resolved by stat → ${stated.reason}`);
+    // The structured mutators are unaffected either way: they take the
+    // singleFile path, which never asks the ancestor question.
+    const writer = checkToolCall({ tool: 'write', args: { filePath: 'src/Dockerfile' }, root: dir, env });
+    assert.equal(writer.decision, 'allow', writer.reason);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1092,6 +1330,53 @@ test('r: no conflict-safe gate package writes files or spawns processes', () => 
       assert.ok(!WRITES.test(src), `${gate}: ${file.pathname} writes or spawns — it cannot be conflict-safe`);
     }
   }
+});
+
+test('r: targetIsRailAncestor honors an anchored ** by default and can be narrowed', () => {
+  // The two-argument form is the exported contract a sibling adapter gets, and
+  // it is the FULL ancestor question; the narrowed form is opt-in. Pinned
+  // directly because railHit always passes the option, so nothing else would
+  // notice the default changing.
+  assert.equal(targetIsRailAncestor('src', 'src/**'), true);
+  assert.equal(targetIsRailAncestor('src/index.mjs', 'src/**/test/*.mjs'), true);
+  // Narrowed: only the form an anchored ** creates goes away.
+  assert.equal(targetIsRailAncestor('src/index.mjs', 'src/**/test/*.mjs', { throughDoubleStar: false }), false);
+  // …every other ancestor form survives it, including through an interior
+  // single-star segment, which is why this is not just "ancestors off".
+  assert.equal(targetIsRailAncestor('assets.bundle', 'assets.bundle/**', { throughDoubleStar: false }), true);
+  assert.equal(targetIsRailAncestor('packages/foo/test', 'packages/*/test/**', { throughDoubleStar: false }), true);
+  // A target DEEPER than the rail is not its ancestor: `a/b/c` cannot be a
+  // parent of `a/b`. Without a `**` the rail simply runs out first.
+  assert.equal(targetIsRailAncestor('a/b/c', 'a/b'), false);
+  assert.equal(targetIsRailAncestor('a/b/c', 'a/b', { throughDoubleStar: false }), false);
+  // A LEADING ** anchors nothing, in either mode.
+  assert.equal(targetIsRailAncestor('anything', '**/*.test.mjs'), false);
+  assert.equal(targetIsRailAncestor('anything', '**/*.test.mjs', { throughDoubleStar: false }), false);
+  // Narrowed, the question is whether the rail NAMES the target's LAST segment
+  // and continues past it. How the earlier segments lined up is irrelevant, so
+  // the ** may take zero segments or several.
+  assert.equal(targetIsRailAncestor('src/cache.bundle', 'src/**/cache.bundle/**', { throughDoubleStar: false }), true);
+  assert.equal(targetIsRailAncestor('src/foo/cache.bundle', 'src/**/cache.bundle/**', { throughDoubleStar: false }), true);
+  assert.equal(targetIsRailAncestor('a/b', 'a/**/**/b/**', { throughDoubleStar: false }), true);
+  assert.equal(targetIsRailAncestor('a/b/c', 'a/**/c/**', { throughDoubleStar: false }), true);
+  // The boundary is the LAST segment: only the ** could hold `index.mjs` here,
+  // and a ** matches any name at all, so the rail says nothing about this one.
+  assert.equal(targetIsRailAncestor('src/index.mjs', 'src/**/cache.bundle/**', { throughDoubleStar: false }), false);
+  // A rail that names the target and then STOPS is a direct hit, not ancestry —
+  // globMatch's job, and not a reason to widen this one.
+  assert.equal(targetIsRailAncestor('src/cache.bundle', 'src/**/cache.bundle', { throughDoubleStar: false }), false);
+  // Segment matching uses the same semantics as the direct check: a partially
+  // literal wildcard must not read as matching everything, or ancestor
+  // detection denies paths the rail could never match.
+  assert.equal(targetIsRailAncestor('packages/foo-x/cache.bundle', 'packages/foo-*/cache.bundle/**', { throughDoubleStar: false }), true);
+  assert.equal(targetIsRailAncestor('packages/bar/cache.bundle', 'packages/foo-*/cache.bundle/**', { throughDoubleStar: false }), false);
+  assert.equal(targetIsRailAncestor('packages/bar/test', 'packages/foo-*/test/**'), false);
+  // An EMBEDDED `**` is the exception, because it spans `/` in @adlc/core:
+  // `a/foo**bar/**` really does cover `a/foo/x/bar/frozen.mjs`, so `a/foo` is
+  // an ancestor of it and no single segment can see that. Matching one segment
+  // at a time must not read this as a mismatch.
+  assert.equal(targetIsRailAncestor('a/foo', 'a/foo**bar/**'), true);
+  assert.equal(targetIsRailAncestor('a/foo', 'a/foo**bar/**', { throughDoubleStar: false }), true);
 });
 
 test('r: a mutating/unknown tool with only a target still fails closed', () => {
