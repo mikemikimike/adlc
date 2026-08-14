@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DirectoryTicketStore, GitTreeTicketStore, detectTicketStore, storeHash, validateTickets } from '@adlc/tickets';
 import { globMatch } from '@adlc/core/tickets';
+import { isManifestFile, isVersionOnlyChange, resolveManifestRevisionPair } from '../version-only.mjs';
 import { classifyTrustRootAuthorization } from '../trust-root-authorization.mjs';
 import { deny, fail } from './errors.mjs';
 import { createGit, parseJson, resolveTrustedBase, trackedAt } from './git.mjs';
@@ -148,7 +149,7 @@ export function runRailFreezeGate({ cwd, base, env, additionalTrustRoots = [], s
   }
 
   if (immutableTrustRoots.length) {
-    unique = enforceTrustRoots({ git, env, trustedBase, immutableTrustRoots, unique, rails, messages });
+    unique = enforceTrustRoots({ git, env, trustedBase, immutableTrustRoots, unique, rails, messages, cwd });
   }
 
   // ---- render the verdict -----------------------------------------------------------
@@ -428,6 +429,12 @@ export function verifyManifest({ git, trustedBase, base, migration }) {
   }
 }
 
+function isExemptManifestTrustRoot(path, base, head, cwd) {
+  if (!isManifestFile(path)) return false;
+  const contents = resolveManifestRevisionPair({ base, head, cwd, file: path });
+  return Boolean(contents && isVersionOnlyChange(contents.before, contents.after, path));
+}
+
 /**
  * Deny a trust-root change unless the #141 ceremony authorizes it.
  *
@@ -435,8 +442,12 @@ export function verifyManifest({ git, trustedBase, base, migration }) {
  * below would deny the very change the ceremony just approved. Ticket-declared rails are
  * never lifted; only the specific trust-root paths this PR was authorized to change.
  */
-function enforceTrustRoots({ git, env, trustedBase, immutableTrustRoots, unique, rails, messages }) {
-  const diff = git(['diff', '--name-status', '-M', `${trustedBase}...HEAD`, '--', ...immutableTrustRoots], 'git diff trust roots');
+function enforceTrustRoots({ git, env, trustedBase, immutableTrustRoots, unique, rails, messages, cwd }) {
+  const headRes = git(['rev-parse', 'HEAD'], 'git rev-parse HEAD');
+  if (headRes.status !== 0 || !headRes.stdout.trim()) fail('git rev-parse HEAD failed (operational error) — failing closed.');
+  const headOid = headRes.stdout.trim();
+
+  const diff = git(['diff', '--name-status', '-M', `${trustedBase}...${headOid}`, '--', ...immutableTrustRoots], 'git diff trust roots');
   if (diff.status !== 0) fail('git diff trust roots failed (operational error) — failing closed.');
   if (!diff.stdout.trim()) return unique;
 
@@ -450,7 +461,16 @@ function enforceTrustRoots({ git, env, trustedBase, immutableTrustRoots, unique,
     .flatMap((line) => line.split('\t').slice(1).map((part) => part.trim()))
     .filter(Boolean);
 
-  const decision = authorizeTrustRootChange({ git, env, changedPaths: changedTrustRoots, trustedBase });
+  // #501 / ADR 0012: a manifest trust root (such as root package.json) whose ONLY
+  // differences are version fields and lockstep repins is not an unauthorized
+  // trust-root change. Filter it out before checking ceremony authorization.
+  const nonExemptChangedRoots = changedTrustRoots.filter(
+    (path) => !isExemptManifestTrustRoot(path, trustedBase, headOid, cwd)
+  );
+
+  if (nonExemptChangedRoots.length === 0) return unique;
+
+  const decision = authorizeTrustRootChange({ git, env, changedPaths: nonExemptChangedRoots, trustedBase });
   if (!decision.authorized) {
     deny(
       'ADLC trust root changed, deleted, or renamed and the change is NOT authorized '

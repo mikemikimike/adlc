@@ -40,6 +40,10 @@
 // exactly `JSON.stringify(obj, null, 2)`, so every manifest in this repo is
 // already canonical. A manifest that is not simply fails closed.
 
+import { spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 const MANIFEST_BASENAMES = new Set(['package.json', 'plugin.json', 'marketplace.json']);
 
 const DEP_FIELDS = new Set([
@@ -318,4 +322,93 @@ export function isVersionOnlyChange(beforeText, afterText, file) {
   }
 
   return true;
+}
+
+const GIT_TIMEOUT_MS = 60_000;
+const MAX_BUFFER = 512 * 1024 * 1024;
+
+/**
+ * Resolve baseline and candidate (head) contents for a manifest path under full
+ * mode, attribute, and encoding verification (matching bin/rails-guard.mjs).
+ * Pinned to immutable git object revisions to prevent working-tree divergence attacks.
+ * Fails closed (returns null) on any deviation, error, or unreadable content.
+ *
+ * @param {object} options
+ * @param {string} options.base git ref of freeze baseline
+ * @param {string} [options.head='HEAD'] git ref of candidate revision
+ * @param {string} [options.cwd] working directory
+ * @param {string} options.file repo-relative path to manifest
+ * @returns {{before: string, after: string} | null}
+ */
+export function resolveManifestRevisionPair({ base, head = 'HEAD', cwd = process.cwd(), file }) {
+  if (typeof file !== 'string' || file === '') return null;
+  if (Buffer.from(file, 'utf8').toString('utf8') !== file) return null;
+  if (typeof base !== 'string' || !base.trim()) return null;
+  if (typeof head !== 'string' || !head.trim()) return null;
+
+  try {
+    const attrRes = spawnSync('git', ['check-attr', 'filter', 'ident', 'working-tree-encoding', '--', file], {
+      cwd,
+      encoding: 'utf8',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (attrRes.status !== 0 || !attrRes.stdout) return null;
+    for (const line of attrRes.stdout.split('\n')) {
+      if (!line.trim()) continue;
+      const value = line.slice(line.lastIndexOf(': ') + 2).trim();
+      if (value !== 'unspecified' && value !== 'unset') return null;
+    }
+
+    const lsBaseRes = spawnSync('git', ['--literal-pathspecs', 'ls-tree', base, '--', file], {
+      cwd,
+      encoding: 'utf8',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (lsBaseRes.status !== 0 || !lsBaseRes.stdout) return null;
+    const baseMode = lsBaseRes.stdout.trim().split(/\s+/)[0];
+    if (baseMode !== '100644' && baseMode !== '100755') return null;
+
+    const lsHeadRes = spawnSync('git', ['--literal-pathspecs', 'ls-tree', head, '--', file], {
+      cwd,
+      encoding: 'utf8',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (lsHeadRes.status !== 0 || !lsHeadRes.stdout) return null;
+    const headMode = lsHeadRes.stdout.trim().split(/\s+/)[0];
+    if (headMode !== '100644' && headMode !== '100755') return null;
+    if (baseMode !== headMode) return null;
+
+    const decode = (buf) => {
+      const text = buf.toString('utf8');
+      if (!Buffer.from(text, 'utf8').equals(buf)) return null;
+      return text;
+    };
+
+    const showBaseRes = spawnSync('git', ['show', `${base}:${file}`], {
+      cwd,
+      encoding: 'buffer',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (showBaseRes.status !== 0 || !showBaseRes.stdout) return null;
+    const before = decode(showBaseRes.stdout);
+    if (before === null) return null;
+
+    const showHeadRes = spawnSync('git', ['show', `${head}:${file}`], {
+      cwd,
+      encoding: 'buffer',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+    });
+    if (showHeadRes.status !== 0 || !showHeadRes.stdout) return null;
+    const after = decode(showHeadRes.stdout);
+    if (after === null) return null;
+
+    return { before, after };
+  } catch {
+    return null;
+  }
 }

@@ -573,12 +573,205 @@ test('REPO_TRUST_ROOTS: an unrelated file edit is NOT blocked as a trust-root ch
   assert.equal(code, 0);
 });
 
+// #501: root package.json is an immutable trust root with a version-only exemption
+test('trust root #501: PR modifies scripts.preflight in root package.json → exit 2', () => {
+  const basePkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+      test: 'node scripts/run-tests.mjs',
+    },
+  }, null, 2) + '\n';
+  const headPkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'echo bypassed',
+      test: 'node scripts/run-tests.mjs',
+    },
+  }, null, 2) + '\n';
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs', 'package.json'],
+    seedFileContents: { 'package.json': basePkg },
+    mutate: (d) => writeFileSync(join(d, 'package.json'), headPkg),
+  });
+  assert.equal(code, 2);
+});
+
+test('trust root #501: PR modifies scripts.test in root package.json → exit 2', () => {
+  const basePkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+      test: 'node scripts/run-tests.mjs',
+    },
+  }, null, 2) + '\n';
+  const headPkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+      test: 'echo bypassed',
+    },
+  }, null, 2) + '\n';
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs', 'package.json'],
+    seedFileContents: { 'package.json': basePkg },
+    mutate: (d) => writeFileSync(join(d, 'package.json'), headPkg),
+  });
+  assert.equal(code, 2);
+});
+
+test('trust root #501: PR removes scripts block in root package.json → exit 2', () => {
+  const basePkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+    },
+  }, null, 2) + '\n';
+  const headPkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+  }, null, 2) + '\n';
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs', 'package.json'],
+    seedFileContents: { 'package.json': basePkg },
+    mutate: (d) => writeFileSync(join(d, 'package.json'), headPkg),
+  });
+  assert.equal(code, 2);
+});
+
+test('trust root #501: PR performs canonical version-only release bump on root package.json → exit 0', () => {
+  const basePkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+      test: 'node scripts/run-tests.mjs',
+    },
+    dependencies: {
+      '@adlc/core': '^1.5.0',
+    },
+  }, null, 2) + '\n';
+  const headPkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.1',
+    scripts: {
+      preflight: 'node scripts/preflight.mjs',
+      test: 'node scripts/run-tests.mjs',
+    },
+    dependencies: {
+      '@adlc/core': '^1.5.1',
+    },
+  }, null, 2) + '\n';
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs', 'package.json'],
+    seedFileContents: { 'package.json': basePkg },
+    mutate: (d) => writeFileSync(join(d, 'package.json'), headPkg),
+  });
+  assert.equal(code, 0);
+});
+
+test('trust root #501: PR changes non-@adlc dependency in root package.json without ceremony → exit 2', () => {
+  const basePkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.0',
+    dependencies: {
+      chalk: '^5.0.0',
+    },
+  }, null, 2) + '\n';
+  const headPkg = JSON.stringify({
+    name: '@adlc/root',
+    version: '1.5.1',
+    dependencies: {
+      chalk: '^5.1.0',
+    },
+  }, null, 2) + '\n';
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs', 'package.json'],
+    seedFileContents: { 'package.json': basePkg },
+    mutate: (d) => writeFileSync(join(d, 'package.json'), headPkg),
+  });
+  assert.equal(code, 2);
+});
+
+test('trust root #501: PR commits script tampering to HEAD but working tree is clean/restored → exit 2', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'rgci-head-tamper-'));
+  try {
+    git(dir, ['init', '-q', '-b', 'main']);
+    git(dir, ['config', 'user.email', 'a@b.c']);
+    git(dir, ['config', 'user.name', 'x']);
+    mkdirSync(join(dir, '.adlc'), { recursive: true });
+    const parsedTickets = JSON.parse(RAILED);
+    for (const t of parsedTickets.tickets ?? []) t.title ??= `${t.id} fixture`;
+    writeFileSync(join(dir, '.adlc', 'tickets.json'), JSON.stringify(parsedTickets));
+    const basePkg = JSON.stringify({
+      name: '@adlc/root',
+      version: '1.5.0',
+      scripts: {
+        preflight: 'node scripts/preflight.mjs',
+        test: 'node scripts/run-tests.mjs',
+      },
+    }, null, 2) + '\n';
+    writeFileSync(join(dir, 'package.json'), basePkg);
+    mkdirSync(join(dir, 'src', 'critical'), { recursive: true });
+    writeFileSync(join(dir, 'src', 'critical', 'auth.mjs'), 'orig\n');
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'base']);
+
+    git(dir, ['checkout', '-q', '-b', 'feat']);
+    const tamperedPkg = JSON.stringify({
+      name: '@adlc/root',
+      version: '1.5.0',
+      scripts: {
+        preflight: 'echo bypassed',
+        test: 'node scripts/run-tests.mjs',
+      },
+    }, null, 2) + '\n';
+    writeFileSync(join(dir, 'package.json'), tamperedPkg);
+    git(dir, ['add', 'package.json']);
+    git(dir, ['commit', '-qm', 'tamper scripts']);
+
+    // Restore working-tree package.json to basePkg without committing
+    writeFileSync(join(dir, 'package.json'), basePkg);
+
+    let code = 0;
+    try {
+      execFileSync(process.execPath, [SCRIPT, 'main'], { cwd: dir, stdio: 'pipe', env: { ...process.env, RAILS_BASE: '', BASE_REF: '' } });
+    } catch (e) {
+      code = e.status ?? 1;
+    }
+    assert.equal(code, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('trust root #501: PR adds .npmrc with script-shell bypass → exit 2', () => {
+  const code = runScenario({
+    baseTickets: RAILED,
+    seedFiles: ['src/critical/auth.mjs'],
+    mutate: (d) => writeFileSync(join(d, '.npmrc'), 'script-shell=/usr/bin/true\n'),
+  });
+  assert.equal(code, 2);
+});
+
 for (const [path, renamedPath] of [
   ['.adlc/tickets.json', 'tickets-renamed.json'],
   ['.adlc/manifest.jsonl', 'manifest-renamed.jsonl'],
   ['.adlc/admin.pub', '.adlc/admin-renamed.pub'],
   ['CODEOWNERS', 'CODEOWNERS.renamed'],
   ['.github/workflows/adlc-rails-guard.yml', '.github/workflows/renamed.yml'],
+  ['package.json', 'package-renamed.json'],
+  ['.npmrc', '.npmrc.renamed'],
 ]) {
   test(`trust root: PR renames ${path} → exit 2`, () => {
     const seedFiles = ['src/critical/auth.mjs'];
