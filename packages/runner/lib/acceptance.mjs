@@ -1,6 +1,9 @@
 import { canonicalJson, resolveRevision, sha256 } from '@adlc/core';
 import { appendManifestEntry } from '@adlc/gate-manifest';
-import { readManifestForest } from '@adlc/gate-manifest/lib/forest.mjs';
+// Scoped to root + this checkout's own segment: `latestP5Entry`'s `.at(-1)`
+// below is a chronology claim, and only this chain can carry one. See
+// own-chain.mjs.
+import { readOwnManifestChain } from '@adlc/gate-manifest/lib/own-chain.mjs';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { LegacyTicketStore, loadTicketSnapshot } from '@adlc/tickets';
@@ -179,7 +182,13 @@ export function recordAcceptancePacket({
     }
   }
 
-  const { entries } = readManifestForest(dir);
+  const { entries, identityError } = readOwnManifestChain(dir, { cwd });
+  // Refused explicitly, not left to the empty-entries fallback: without this,
+  // "we cannot tell which evidence is ours" would surface as the ordinary
+  // "P5 evidence is missing", which reads as a fixable gap rather than a
+  // checkout that cannot be identified. Unlike assertPhase this function has no
+  // `skipped` channel, so `identityError` is the only place it can be said.
+  if (identityError) errors.push(identityError);
   const p5Revision = latestP5Revision(entries, ticket);
   const assertedP5Entry = latestP5Entry(entries, ticket, revision ?? p5Revision);
   if (ticket && !assertedP5Entry) {
