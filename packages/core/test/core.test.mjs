@@ -160,6 +160,26 @@ test('computeFloat: critical path has zero float, side branch has slack', () => 
   assert.deepEqual(criticalPath, ['A', 'B', 'D']);
 });
 
+// The semantics globMatch shipped with, expressed the way it used to be
+// implemented: one regex, built from the same token split. Kept HERE, in the
+// test, as the reference the matcher is held to — it is correct and unusably
+// slow, which is exactly the division of labour a golden implementation wants.
+// Only ever run on short inputs, where its backtracking cannot bite.
+function referenceGlobMatch(pattern, path) {
+  const regex = new RegExp(
+    `^${pattern
+      .split(/(\*\*\/|\*\*|\*)/)
+      .map((part) => {
+        if (part === '**/') return '(?:.*/)?';
+        if (part === '**') return '.*';
+        if (part === '*') return '[^/]*';
+        return part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+      })
+      .join('')}$`,
+  );
+  return regex.test(path);
+}
+
 test('globMatch: *, ** and literals', () => {
   assert.ok(globMatch('src/**', 'src/a/b/c.mjs'));
   assert.ok(globMatch('src/*.mjs', 'src/a.mjs'));
@@ -167,6 +187,136 @@ test('globMatch: *, ** and literals', () => {
   assert.ok(globMatch('**/*.test.mjs', 'packages/x/test/y.test.mjs'));
   assert.ok(globMatch('exact/path.js', 'exact/path.js'));
   assert.ok(!globMatch('exact/path.js', 'exact/other.js'));
+  // An embedded `**` spans `/`; a single `*` does not. Rail ancestry in the
+  // adapters is built on this distinction, so it is load-bearing, not incidental.
+  assert.ok(globMatch('a/foo**bar/**', 'a/foo/x/bar/frozen.mjs'));
+  assert.ok(globMatch('a**b', 'a/b'));
+  assert.ok(!globMatch('a/foo-*/x', 'a/foo-y/z/x'));
+  // `?` and character classes are NOT glob syntax here — they are literals,
+  // because the token split escapes them. Depended on by anything matching a
+  // path that actually contains them.
+  assert.ok(!globMatch('?', 'a'));
+  assert.ok(globMatch('?', '?'));
+  assert.ok(!globMatch('[ab]', 'a'));
+  assert.ok(globMatch('[ab]', '[ab]'));
+  assert.ok(globMatch('a.b', 'a.b'));
+  assert.ok(!globMatch('a.b', 'axb'));
+  // A wildcard resumes from where the pattern actually got to, not from the
+  // start of the path: `ab**b` needs a `b` AFTER the `ab`, so a two-character
+  // path cannot satisfy it however the run is placed.
+  assert.ok(!globMatch('ab**b', 'ab'));
+  assert.ok(globMatch('ab**b', 'abb'));
+  assert.ok(!globMatch('ab*b', 'ab'));
+  assert.ok(!globMatch('ab**/b', 'ab'));
+});
+
+test('globMatch: answers exactly what the reference regex answers', () => {
+  // Differential over generated pattern/path pairs rather than remembered
+  // cases: the engine changed for speed, so the whole contract is "same
+  // answers". Everything a rail or a scope check does routes through here.
+  const PATTERN_PARTS = ['a', 'b', '/', '*', '**', '**/', '.', 'a.b', '-'];
+  const PATH_PARTS = ['a', 'b', '/', '.', 'a.b', 'ab'];
+  const build = (parts, maxLen) => {
+    const out = [];
+    let level = [''];
+    for (let n = 0; n < maxLen; n++) {
+      level = level.flatMap((prefix) => parts.map((p) => prefix + p));
+      out.push(...level);
+    }
+    return out;
+  };
+  const patterns = build(PATTERN_PARTS, 3);
+  const paths = build(PATH_PARTS, 3);
+  let compared = 0;
+  let matched = 0;
+  for (const pattern of patterns) {
+    for (const path of paths) {
+      const expected = referenceGlobMatch(pattern, path);
+      assert.equal(
+        globMatch(pattern, path),
+        expected,
+        `globMatch(${JSON.stringify(pattern)}, ${JSON.stringify(path)}) disagrees with the reference`,
+      );
+      compared += 1;
+      if (expected) matched += 1;
+    }
+  }
+  // A differential that never matches anything would pass while proving little.
+  assert.ok(compared > 100000, `only ${compared} pairs compared`);
+  assert.ok(matched > 1000, `only ${matched} matching pairs among ${compared}`);
+});
+
+test('globMatch: ** crosses a line terminator, which the regex form did not', () => {
+  // The ONE place the answers deliberately differ from the reference. `**`
+  // expanded to `.*`, and JavaScript's `.` excludes LF, CR, U+2028 and U+2029
+  // unless the `s` flag is set — it never was. Git allows these in a path, so a
+  // rail simply stopped freezing any path with one in a directory name. That is
+  // a matcher artefact rather than a decision, and it is a hole in the direction
+  // a freeze must not have one, so the automaton closes it.
+  for (const terminator of ['\n', '\r', '\u2028', '\u2029']) {
+    const path = `src/a${terminator}b/frozen.mjs`;
+    assert.equal(referenceGlobMatch('src/**/frozen.mjs', path), false, 'the regex form missed it');
+    assert.equal(globMatch('src/**/frozen.mjs', path), true, 'the automaton freezes it');
+    // …at the end of a segment and as a whole segment, too.
+    assert.equal(globMatch('src/**/frozen.mjs', `src/b${terminator}/frozen.mjs`), true);
+    assert.equal(globMatch('src/**', `src/${terminator}`), true);
+    // A single `*` never had the exclusion: `[^/]*` admits every character but
+    // the separator, so these answers are unchanged in both engines.
+    for (const pattern of ['src/*.mjs', 'src/*']) {
+      const leaf = `src/a${terminator}b.mjs`;
+      assert.equal(globMatch(pattern, leaf), referenceGlobMatch(pattern, leaf), `${pattern} must not change`);
+    }
+    // And a terminator still cannot cross a SEGMENT boundary for `*`.
+    assert.equal(globMatch('src/*', `src/a${terminator}b/c`), false);
+  }
+});
+
+test('globMatch: the divergence only ever adds matches, and only through **', () => {
+  // Stronger than the witnesses above: over a generated corpus that DOES carry
+  // line terminators, the matcher may say yes where the reference said no —
+  // never the reverse — and only for a pattern containing `**`.
+  const PATTERN_PARTS = ['a', '/', '*', '**', '**/', '.'];
+  const PATH_PARTS = ['a', '/', '\n', '\r', '\u2028', 'a\nb'];
+  const build = (parts, maxLen) => {
+    const out = [];
+    let level = [''];
+    for (let n = 0; n < maxLen; n++) {
+      level = level.flatMap((prefix) => parts.map((p) => prefix + p));
+      out.push(...level);
+    }
+    return out;
+  };
+  let widened = 0;
+  for (const pattern of build(PATTERN_PARTS, 3)) {
+    for (const path of build(PATH_PARTS, 3)) {
+      const expected = referenceGlobMatch(pattern, path);
+      const actual = globMatch(pattern, path);
+      if (actual === expected) continue;
+      assert.ok(actual && !expected, `${JSON.stringify(pattern)} vs ${JSON.stringify(path)} lost a match`);
+      assert.ok(pattern.includes('**'), `${JSON.stringify(pattern)} widened without a globstar`);
+      assert.ok(/[\n\r\u2028\u2029]/.test(path), `${JSON.stringify(path)} widened without a line terminator`);
+      widened += 1;
+    }
+  }
+  assert.ok(widened > 50, `only ${widened} widened pairs — the corpus is not reaching the divergence`);
+});
+
+test('globMatch: a repeated-globstar pattern answers in bounded time', () => {
+  // The regex form backtracked catastrophically: a rail is a string in the
+  // ticket store, and every rail-enforcement path in the repo calls this before
+  // anything else, so one unusual rail could wedge a synchronous hook. These
+  // inputs took 1-6 seconds each, and the last did not finish in ten minutes.
+  const cases = [
+    [`a/${'**/'.repeat(15)}z`, `a/${Array.from({ length: 15 }, (_, i) => `s${i}`).join('/')}/x.mjs`],
+    [`a/${'**/'.repeat(12)}z`, `a/${Array.from({ length: 20 }, (_, i) => `s${i}`).join('/')}/x.mjs`],
+    [`a/${'**/'.repeat(200)}z`, `a/${Array.from({ length: 2000 }, (_, i) => `s${i}`).join('/')}/x.mjs`],
+  ];
+  const started = process.hrtime.bigint();
+  for (const [pattern, path] of cases) {
+    assert.equal(globMatch(pattern, path), false, pattern.slice(0, 20));
+  }
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 2000, `repeated-globstar matching took ${elapsedMs | 0}ms`);
 });
 
 test('inScope + scopesOverlap', () => {

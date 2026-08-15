@@ -125,26 +125,12 @@ export function computeFloat(tickets) {
   return { floats, criticalPath, makespan };
 }
 
-/**
- * Minimal glob match supporting '*' (within a segment) and '**' (across
- * segments). Enough for declared-scope checks; not a full glob engine.
- */
-export function globMatch(pattern, path) {
-  const regex = new RegExp(
-    '^' +
-      pattern
-        .split(/(\*\*\/|\*\*|\*)/)
-        .map((part) => {
-          if (part === '**/') return '(?:.*/)?';
-          if (part === '**') return '.*';
-          if (part === '*') return '[^/]*';
-          return part.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-        })
-        .join('') +
-      '$'
-  );
-  return regex.test(path);
-}
+// Re-exported for API stability: `globMatch` now lives in its own module so the
+// harnesses that cannot resolve @adlc/core can be handed a verbatim copy of it,
+// but every existing importer still reaches it here.
+import { globMatch } from './glob.mjs';
+
+export { globMatch };
 
 /** Does a file path fall inside a ticket's declared scope? */
 export function inScope(ticket, path) {
