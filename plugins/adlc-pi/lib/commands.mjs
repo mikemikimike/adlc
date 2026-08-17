@@ -14,9 +14,11 @@
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { userInfo } from 'node:os';
 import { loadTickets, sha256 } from '@adlc/core';
 import { ensureGitignore, ensureFormatterIgnores, ensureTicketStore } from '@adlc/core';
 import { record } from '@adlc/gate-manifest/lib/record.mjs';
+import { readOwnManifestChain } from '@adlc/gate-manifest/lib/own-chain.mjs';
 import { ticketHash, writeActiveTicket } from '@adlc/tickets';
 import { recordGateEvent } from './evidence.mjs';
 import { buildRollbackCandidates } from './rollback.mjs';
@@ -32,6 +34,54 @@ function parseJsonStdout(stdout) {
   } catch {
     return null;
   }
+}
+
+// The distinct interrogation-source gate names actually recorded for this
+// ticket (parallax / premortem / spec-lint). Used by /adlc-approve-spec to
+// derive a spec-approval payload's `sources` from REAL evidence instead of a
+// fabricated summary — see the codex cross-model finding cited at the call
+// site. Reads via readOwnManifestChain (the same reader
+// packages/runner/lib/assertions.mjs uses), not a hand-rolled parse of
+// .adlc/manifest.jsonl directly: a segmented ("forest") repo — this one
+// included, per docs — records current evidence under .adlc/manifest.d/, not
+// the legacy root file, and a naive root-only read would silently see none
+// of it. Fails CLOSED to an empty array on any read/identity problem: an
+// approval that cannot prove interrogation happened must be refused, not
+// silently approved.
+// spec-lint is deliberately NOT a source here: it is a deterministic
+// acceptance-criteria linter that asks a human zero questions, so its
+// presence proves nothing about interrogation having occurred (codex
+// cross-model review, feat/p1-interrogation round 7: "Pi fabricates
+// interrogation counts ... treats spec-lint as interrogation evidence").
+// p1 still separately requires a spec-lint record (PHASE_REQUIREMENTS.p1)
+// — this list only governs what THIS approval claims it consulted.
+const INTERROGATION_SOURCE_GATES = ['parallax', 'premortem'];
+
+/**
+ * @returns {{sources: string[], entryCount: number}} sources — the distinct
+ *   interrogation gates with evidence for this ticket; entryCount — the
+ *   total number of matching recorded entries (a real, if approximate,
+ *   floor on how many separate interrogation artifacts were recorded —
+ *   NOT the number of distinct gate names, which double-counts nothing but
+ *   also never reflects a gate recorded more than once across rounds).
+ */
+function ticketInterrogationEvidence(root, ticketId) {
+  let entries;
+  try {
+    ({ entries } = readOwnManifestChain(join(root, '.adlc'), { cwd: root }));
+  } catch {
+    return { sources: [], entryCount: 0 };
+  }
+  const found = new Set();
+  let entryCount = 0;
+  for (const entry of entries) {
+    const gate = entry?.type ?? entry?.gate;
+    if (entry?.ticket === ticketId && INTERROGATION_SOURCE_GATES.includes(gate)) {
+      found.add(gate);
+      entryCount += 1;
+    }
+  }
+  return { sources: [...found], entryCount };
 }
 
 /**
@@ -277,6 +327,33 @@ export function registerCommands(pi, { env = process.env, reload, getActive, get
         return;
       }
 
+      // The p1 assertion (packages/runner/lib/assertions.mjs) requires the
+      // spec-approval record to be bound to exactly one ticket — check before
+      // opening a dialog, same as the missing-spec-path guard above.
+      const active = typeof getActive === 'function' ? getActive() : null;
+      const ticketId = active && active.ticketId ? active.ticketId : undefined;
+      if (!ticketId) {
+        ctx.ui.notify('ADLC: /adlc-approve-spec needs an active ticket (the p1 gate requires a ticket-bound approval) — nothing recorded.', 'error');
+        return;
+      }
+
+      // The p1 assertion requires sources to be a NON-EMPTY list of
+      // interrogation sources actually consulted — a confirm dialog alone
+      // proves nothing was checked (codex cross-model review,
+      // feat/p1-interrogation full-branch pass: "Pi emits a passing approval
+      // that proves no interrogation occurred"). Pi has no native
+      // interrogation loop wired to THIS dialog (unlike Claude Code's
+      // AskUserQuestion-driven /adlc-spec), but the prompt-template
+      // `/adlc-spec` flow (plugins/adlc-pi/prompts/adlc-spec.md) DOES run
+      // parallax/premortem through the real CLI and record real, ticket-bound
+      // evidence — so read the manifest for that evidence instead of
+      // fabricating a summary. Refuse if none exists: run /adlc-spec first.
+      const { sources: priorSources, entryCount: priorEntryCount } = ticketInterrogationEvidence(root, ticketId);
+      if (priorSources.length === 0) {
+        ctx.ui.notify('ADLC: no parallax/premortem evidence recorded for this ticket yet — run /adlc-spec first, then /adlc-approve-spec. Nothing recorded.', 'error');
+        return;
+      }
+
       // G1 is a human decision — the model cannot self-approve, and there is no
       // dialog to prompt with in non-TUI modes. Record nothing and say so.
       if (!ctx.hasUI) {
@@ -295,14 +372,39 @@ export function registerCommands(pi, { env = process.env, reload, getActive, get
       }
 
       const hash = sha256(bytes);
-      const active = typeof getActive === 'function' ? getActive() : null;
-      const ticketId = active && active.ticketId ? active.ticketId : undefined;
       try {
-        // Chain-valid manifest entry naming the spec + its sha256 (spec AC4).
+        // Chain-valid manifest entry naming the spec + its sha256 (spec AC4),
+        // plus the interrogation-summary fields the p1 assertion requires
+        // (packages/runner/lib/assertions.mjs specApprovalIntegrityErrors).
+        // rounds/questions used to be a hand-fixed 1/1 (or, before that, the
+        // count of distinct gate names) — neither reflects reality: a real
+        // /adlc-spec run can re-record premortem/parallax across several
+        // rounds of the interrogation loop, and a fixed constant would
+        // always undercount that (codex cross-model review,
+        // feat/p1-interrogation round 7: "Pi fabricates interrogation
+        // counts"). priorEntryCount is the actual number of recorded
+        // parallax/premortem entries for this ticket — a genuine floor on
+        // how many interrogation artifacts exist, not a number invented from
+        // unrelated source cardinality. The true per-round question count
+        // (the AskUserQuestion-equivalent exchange) happens client-side
+        // during /adlc-spec and is not recoverable from the manifest, so
+        // this still never claims more precision than the evidence proves.
         record({
           gate: 'spec-approval',
           ticket: ticketId,
-          rawData: JSON.stringify({ spec: specArg, sha256: hash, verdict: 'approved' }),
+          rawData: JSON.stringify({
+            spec: specArg,
+            sha256: hash,
+            verdict: 'approved',
+            approver: userInfo().username,
+            spec_hash: hash,
+            rounds: priorEntryCount,
+            questions: priorEntryCount,
+            sources: priorSources,
+            unresolved: 0,
+            approved_assumptions: [],
+          }),
+          rawFiles: specPath,
           dir: join(root, '.adlc'),
           key: manifestKey,
         });
@@ -311,7 +413,7 @@ export function registerCommands(pi, { env = process.env, reload, getActive, get
         return;
       }
       ctx.ui.notify(
-        `ADLC: recorded spec approval for "${specArg}" (sha256 ${hash.slice(0, 12)}…)${ticketId ? ' on ticket ' + ticketId : ''}.`,
+        `ADLC: recorded spec approval for "${specArg}" (sha256 ${hash.slice(0, 12)}…) on ticket ${ticketId}.`,
         'info'
       );
     },

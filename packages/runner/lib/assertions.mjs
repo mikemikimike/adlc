@@ -9,7 +9,8 @@ import { join, relative, resolve } from 'node:path';
 import { LegacyTicketStore, loadTicketSnapshot } from '@adlc/tickets';
 
 const PHASE_REQUIREMENTS = {
-  p1: ['spec-lint', 'premortem'],
+  p0: ['coldstart'],
+  p1: ['spec-lint', 'premortem', 'spec-approval'],
   p2: ['coldstart', 'merge-forecast'],
   p3: ['rails-red', 'hollow-test', 'rails-frozen'],
   p4: ['rails-green', 'rails-check', 'flail-check'],
@@ -26,8 +27,8 @@ function matchesTicket(entry, ticket) {
   return ticket === undefined || entry.ticket === ticket;
 }
 
-function requiresTicket(phase) {
-  return phase === 'p3' || phase === 'p4' || phase === 'p5' || phase === 'p6';
+export function requiresTicket(phase) {
+  return phase === 'p0' || phase === 'p1' || phase === 'p3' || phase === 'p4' || phase === 'p5' || phase === 'p6';
 }
 
 function requiresRevision(phase) {
@@ -329,6 +330,185 @@ function p6IntegrityErrors(entry, currentBinding) {
   return errors;
 }
 
+// P0's coldstart requirement is presence-only by default (any coldstart
+// record anywhere satisfies it) unless this validator narrows it: bound to
+// THIS ticket (not an --all sweep, which records no entry.ticket at all —
+// see coldstart's bin/adlc-coldstart.mjs), a zero-gap verdict, and a
+// ticketHash matching the CURRENT ticket definition (a ticket edited after
+// coldstart ran must re-run it). Validates the LATEST matching coldstart
+// entry, so a fixed re-run heals a failing one.
+// coldstart records evidence in one of two shapes depending on how it ran:
+//   live, provider-backed (packages/coldstart/lib/cache.mjs buildCacheData):
+//     entry.data.cache = { ticketHash, model, gaps }
+//   --prompt-only, operator-recorded (packages/coldstart/lib/verdict.mjs):
+//     entry.data.verdict = '{"gaps":[...],"ticketHash":"…"}' (a JSON STRING,
+//     matching the exact text the P0 authoring flow instructs writing before
+//     --record-verdict)
+// Both must be understood, or a real successful audit reads as a P0 failure.
+function coldstartEvidenceShape(data) {
+  if (data?.cache && typeof data.cache === 'object' && !Array.isArray(data.cache)) {
+    return { gaps: data.cache.gaps, ticketHash: data.cache.ticketHash };
+  }
+  if (typeof data?.verdict === 'string') {
+    let parsed;
+    try {
+      parsed = JSON.parse(data.verdict);
+    } catch {
+      return { parseError: true };
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { parseError: true };
+    return { gaps: parsed.gaps, ticketHash: parsed.ticketHash };
+  }
+  return null;
+}
+
+function coldstartIntegrityErrors(entries, ticket, cwd, dir) {
+  const entry = entries
+    .filter((candidate) => entryType(candidate) === 'coldstart' && candidate.ticket === ticket)
+    .at(-1);
+  if (!entry) return [];
+  const shape = coldstartEvidenceShape(entry.data);
+  if (shape === null) {
+    return ['P0 evidence is incomplete: coldstart record has neither a live cache result (data.cache) nor a prompt-only verdict (data.verdict)'];
+  }
+  if (shape.parseError) {
+    return ['P0 evidence is incomplete: coldstart verdict is not valid JSON (expected {"gaps":[...],"ticketHash":"…"})'];
+  }
+  const errors = [];
+  if (!Array.isArray(shape.gaps)) {
+    errors.push('P0 evidence is incomplete: coldstart record missing a gaps array');
+  } else if (shape.gaps.length > 0) {
+    errors.push(`P0 evidence is contradictory: coldstart recorded ${shape.gaps.length} unresolved gap(s)`);
+  }
+  const binding = ticketDefinitionBinding(cwd, ticket, dir);
+  if (!binding) {
+    errors.push('P0 evidence is stale: ticket definition is absent');
+  } else if (shape.ticketHash !== binding.ticketHash) {
+    errors.push('P0 evidence is stale: ticket definition changed after coldstart ran');
+  }
+  return errors;
+}
+
+// Gate 1 is a human decision with machine-checked evidence: the approval must
+// carry the interrogation summary the protocol produced, an explicit approved
+// verdict (not rejected, not missing), a non-empty human approver, a ticket
+// binding, and exactly one bound spec file whose recorded hash matches both
+// the payload's claimed spec_hash (the approver's stated hash is genuine, not
+// fabricated) and the file's CURRENT content (the spec has not been edited
+// since approval) — plus recording after the latest spec-lint/premortem
+// evidence, so the approval covers the audited spec, not a pre-audit draft.
+// Validates the LATEST spec-approval so a corrected re-approval heals a
+// rejected one. Emitters: the adlc-approve-spec command in every harness
+// plugin (updated atomically with this validator).
+function specApprovalIntegrityErrors(entries, ticket, cwd) {
+  const entry = entries
+    .filter((candidate) => entryType(candidate) === 'spec-approval' && matchesTicket(candidate, ticket))
+    .at(-1);
+  if (!entry) return [];
+  const errors = [];
+  const data = entry.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return ['P1 evidence is incomplete: spec-approval missing interrogation payload (data)'];
+  }
+  if (data.verdict !== 'approved') {
+    errors.push('P1 evidence is contradictory: spec-approval verdict is not "approved" (a rejected, pending, or missing verdict cannot pass Gate 1)');
+  }
+  if (typeof data.approver !== 'string' || data.approver.trim().length === 0) {
+    errors.push('P1 evidence is incomplete: spec-approval missing a non-empty approver');
+  }
+  // No separate "is entry.ticket bound" check here: p1 now requires --ticket
+  // (requiresTicket), and `entry` above was selected via matchesTicket(candidate,
+  // ticket) — an entry with no matching ticket binding is never selected at
+  // all, so it surfaces as "missing: spec-approval" instead, not a data error.
+  if (!Number.isInteger(data.rounds) || data.rounds < 1) {
+    errors.push('P1 evidence is incomplete: spec-approval missing a positive integer rounds (zero proves no interrogation activity)');
+  }
+  if (!Number.isInteger(data.questions) || data.questions < 1) {
+    errors.push('P1 evidence is incomplete: spec-approval missing a positive integer questions (zero proves no interrogation activity)');
+  }
+  if (!Array.isArray(data.sources) || data.sources.length === 0) {
+    errors.push('P1 evidence is incomplete: spec-approval sources must name at least one interrogation source actually consulted (an empty list proves nothing was checked)');
+  } else if (!data.sources.every((source) => typeof source === 'string' && source.trim().length > 0)) {
+    errors.push('P1 evidence is incomplete: spec-approval sources must be non-empty strings naming the interrogation source actually consulted');
+  }
+  if (data.unresolved !== 0) {
+    errors.push('P1 evidence is contradictory: spec-approval requires unresolved === 0 (record unresolved divergences as approved_assumptions instead)');
+  }
+  if (data.approved_assumptions !== undefined && !Array.isArray(data.approved_assumptions)) {
+    errors.push('P1 evidence is incomplete: spec-approval approved_assumptions must be an array');
+  }
+
+  const filePaths = Object.keys(entry.files ?? {});
+  let path, recordedHash;
+  if (filePaths.length !== 1) {
+    errors.push('P1 evidence is incomplete: spec-approval must bind exactly one spec file via --files');
+  } else {
+    [path] = filePaths;
+    recordedHash = entry.files[path];
+    if (typeof data.spec_hash !== 'string' || data.spec_hash.length === 0) {
+      errors.push('P1 evidence is incomplete: spec-approval missing spec_hash');
+    } else if (recordedHash !== data.spec_hash) {
+      errors.push('P1 evidence is contradictory: spec-approval spec_hash does not match the recorded file hash');
+    }
+    try {
+      const currentHash = sha256(readFileSync(resolve(cwd, path)));
+      if (currentHash !== recordedHash) {
+        errors.push(`P1 evidence is stale: spec file changed after approval was recorded: ${path}`);
+      }
+    } catch (err) {
+      errors.push(`P1 evidence is stale: spec file cannot be read: ${path}: ${err.message}`);
+    }
+  }
+
+  // Scoped to THIS ticket, not "latest anywhere in the manifest" — otherwise
+  // ticket T2's approval could borrow ticket T1's spec-lint/premortem audits
+  // (P1 D4). p1 is ticket-required (see requiresTicket) specifically so this
+  // scoping is always meaningful, never a silent no-op over the whole ledger.
+  //
+  // Ticket-scoping alone still lets the SAME ticket launder a stale or
+  // different spec: T1 lints spec-A.md, then approves an edited spec-A.md or
+  // an entirely different spec-B.md without re-running spec-lint/premortem
+  // (codex cross-model review round 2). So beyond ordering, each audit's OWN
+  // --files binding must name the exact same (path, hash) the approval
+  // bound — and a hand-crafted `gate-manifest record spec-lint` with no
+  // --files at all (or spec-lint's own verified:false) must not count either.
+  const entryIndex = entries.indexOf(entry);
+  const latestSpecLint = entries.reduce((acc, e, i) => (entryType(e) === 'spec-lint' && matchesTicket(e, ticket) ? { entry: e, index: i } : acc), null);
+  const latestPremortem = entries.reduce((acc, e, i) => (entryType(e) === 'premortem' && matchesTicket(e, ticket) ? { entry: e, index: i } : acc), null);
+
+  // Path comparison is by RESOLVED absolute location, not raw string —
+  // codex cross-model review, round 4: Pi resolves its approval argument to
+  // an absolute path before recording, while the documented spec-lint/
+  // premortem commands pass through whatever spelling (often relative) the
+  // caller typed. The same file audited via two different, both-legitimate
+  // spellings must still match.
+  function auditMatchesApprovedSpec(audit) {
+    if (!path) return true; // approval's own file binding already flagged above; don't double-report
+    const auditPaths = Object.keys(audit.entry.files ?? {});
+    if (auditPaths.length !== 1) return false;
+    const [auditPath] = auditPaths;
+    return resolve(cwd, auditPath) === resolve(cwd, path) && audit.entry.files[auditPath] === recordedHash;
+  }
+
+  if (!latestSpecLint || entryIndex < latestSpecLint.index) {
+    errors.push('P1 evidence is stale: spec-approval was recorded before the latest spec-lint evidence for this ticket');
+  } else {
+    if (!auditMatchesApprovedSpec(latestSpecLint)) {
+      errors.push('P1 evidence is contradictory: the latest spec-lint evidence for this ticket does not audit the approved spec file');
+    }
+    if (latestSpecLint.entry.data?.verified !== true) {
+      errors.push('P1 evidence is incomplete: the latest spec-lint evidence for this ticket is not a verified (passing) result');
+    }
+  }
+  if (!latestPremortem || entryIndex < latestPremortem.index) {
+    errors.push('P1 evidence is stale: spec-approval was recorded before the latest premortem evidence for this ticket');
+  } else if (!auditMatchesApprovedSpec(latestPremortem)) {
+    errors.push('P1 evidence is contradictory: the latest premortem evidence for this ticket does not analyze the approved spec file');
+  }
+
+  return errors;
+}
+
 function latestRailCheckEntry(entries, ticket, revision) {
   return entries
     .filter((entry) => entryType(entry) === 'rails-check' && matchesTicket(entry, ticket))
@@ -370,6 +550,10 @@ function p4IntegrityErrors(entries, ticket, revision, cwd) {
 
 export function requirementsForPhase(phase) {
   return PHASE_REQUIREMENTS[phase] ?? null;
+}
+
+export function allPhases() {
+  return Object.keys(PHASE_REQUIREMENTS);
 }
 
 export function assertPhase(phase, { dir = ADLC_DIR, ticket, revision, cwd = process.cwd() } = {}) {
@@ -480,6 +664,36 @@ export function assertPhase(phase, { dir = ADLC_DIR, ticket, revision, cwd = pro
   const p4Errors = phase === 'p4'
     ? p4IntegrityErrors(entries, ticket, resolvedRevision, cwd)
     : [];
+  // operational: false — an unresolved gap, a rejected verdict, or stale
+  // evidence is a normal, expected GATE rejection with concrete reasons
+  // (exit 2), not an infrastructure failure that couldn't be evaluated at
+  // all (exit 1). Codex cross-model review, round 4: the CLI's opError-on-
+  // operational path exits 1 for these, which misreports a fixable content
+  // problem as an outage to any automation branching on exit code.
+  const p1Errors = phase === 'p1'
+    ? specApprovalIntegrityErrors(entries, ticket, cwd)
+    : [];
+  if (p1Errors.length > 0) {
+    return {
+      ok: false,
+      operational: false,
+      phase,
+      ticket,
+      errors: p1Errors,
+    };
+  }
+  const p0Errors = phase === 'p0' && ticket
+    ? coldstartIntegrityErrors(entries, ticket, cwd, dir)
+    : [];
+  if (p0Errors.length > 0) {
+    return {
+      ok: false,
+      operational: false,
+      phase,
+      ticket,
+      errors: p0Errors,
+    };
+  }
   if (p6Errors.length > 0) {
     return {
       ok: false,

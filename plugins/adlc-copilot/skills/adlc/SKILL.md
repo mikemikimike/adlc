@@ -53,16 +53,44 @@ on PATH. See ADR-0008 (adversarial-review coverage map) in the ADLC repo.
 Turn a request into a self-contained ticket through the unified ticket service. New repositories
 use one canonical shard per ticket under `.adlc/tickets/`; legacy
 `.adlc/tickets.json` remains supported until an approved migration. Everything
-downstream reads the logical store.
+downstream reads the logical store. The mechanism is **human interrogation
+before the store write** (`docs/interrogation-protocol.md` in the ADLC repo):
+frontier rounds of numbered questions, each codebase-checked before it is
+asked; applicable `.adlc/lessons/interrogation-template.md` checkboxes are
+mandatory candidates. After the write, coldstart gaps drive the loop until
+none remain, and the verdict is recorded (`--record-verdict`) so the p0 gate
+has evidence.
 
 ### P1 — Interrogate (spec is testable and stress-tested)
+The phase's mechanism is the interrogation loop (`docs/interrogation-protocol.md`
+in the ADLC repo): parallax divergences, premortem questions, and applicable
+`.adlc/lessons/interrogation-template.md` checkboxes form the frontier; each
+question is codebase-checked before it reaches the human; answers fold into the
+spec and parallax re-runs, capped at 3 rounds with an approved-assumptions
+escape hatch. Gate 1 is recorded through the `adlc` dispatcher:
+```
+adlc \
+  gate-manifest record spec-approval --ticket ID --files SPEC.MD --data '{
+  "approver":…,"verdict":"approved","spec_hash":…,"rounds":…,"questions":…,
+  "sources":[…],"unresolved":0,"approved_assumptions":[]}'
+```
+(the trailing `\` is a shell line-continuation — paste both lines as one
+command) — `adlc-runner run p1` requires and validates that record: it
+rejects a missing `--ticket`/`--files` binding, a non-`"approved"` verdict, a
+`spec_hash` that does not match the file's actual hash, and an approval
+recorded before the ticket's own spec-lint/premortem evidence. The tools:
 - `adlc spec-lint <spec.md>` — every acceptance criterion needs a concrete
   verification method; a "wish" with no method gate-fails (exit 2). Add `--llm`
-  (or `--prompt-only`) to also catch vacuous methods.
-- `adlc premortem <spec.md> [--prompt-only]` — stress-test the approved spec for
-  failure modes before implementation.
+  (or `--prompt-only`) to also catch vacuous methods. Once it passes cleanly,
+  record it as P1 evidence: `adlc spec-lint <spec.md> --record --ticket <id>`
+  (`--record` requires `--ticket`).
+- `adlc premortem <spec.md> --prompt-only --record-verdict <file|-> --ticket <id>`
+  — stress-test the approved spec for failure modes before implementation.
+  `--ticket` is required alongside `--record-verdict`.
 - `adlc parallax --request "…"` (or `--file req.md`) — fan out readers to expose
   ambiguity, edge conflicts, or route conflicts. The accuracy dial (D3).
+  `--questions-json` emits the divergences as structured
+  `{questions: [{point, options}]}` for the interrogation loop.
 - Design review is recommended practice today via `adversarial-review --prompt-only`
   (feed the ticket/spec to a model yourself) or `adversarial-review --base <ref>`
   (review the diff that introduces it); `exit 0 = SHIP`. First-class artifact input

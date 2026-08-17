@@ -46,8 +46,14 @@ checks. Gather or infer:
 - **duration**, **category**, **budget** — as needed; `duration` defaults to
   `1` if unknown.
 
-If anything required for a self-contained ticket is ambiguous, ask rather
-than guess — a vague ticket fails `coldstart`.
+Before the dry-run, interrogate the human per the shared protocol
+(`docs/interrogation-protocol.md` in the ADLC repo): frontier rounds of
+numbered questions with a recommended answer first, **codebase-checked before
+asking** (only what the repo cannot answer reaches the human; applicable
+`.adlc/lessons/interrogation-template.md` checkboxes are mandatory
+candidates), answers folded into the body as revised prose, stopping when the
+frontier is empty (5-round cap with approved assumptions otherwise). A ticket
+built on silent assumptions fails `coldstart`.
 
 ### Apply the change through the store service (atomic, locked, evidenced)
 
@@ -84,15 +90,49 @@ without one:
 2. Answer that prompt yourself, applying its own rubric: list every genuine
    gap that would block a fresh agent (information not derivable from the
    repo).
-3. No gaps → the ticket is executable, done. Gaps found → summarize and offer
-   to revise the ticket body/scope, then re-check.
+3. Act on the verdict — the post-write half of the interrogation loop
+   (`docs/interrogation-protocol.md`): gaps found → codebase-check each gap,
+   ask the human the rest, fold answers into the body via
+   `adlc ticket update <id> --input <file> --expect <ticketHash> --write`,
+   re-check until the gap list is empty (5-round cap; `--expect` takes the
+   **current** hash — capture the `ticketHash` each update prints, a stale
+   one fails the CAS). No gaps → executable. The p0 assertion re-checks the
+   ticket's CURRENT hash (a ticket edited after coldstart ran must re-run
+   it), so record the hash it audited: get it with `adlc ticket show <id>
+   --json` (the `ticketHash` field), write
+   `{"gaps":[],"ticketHash":"<that hash>"}`, then
+   `adlc coldstart <id> --prompt-only --record-verdict <file|->`.
+
+`adlc-runner run p0` requires `--ticket <id>` — p0 is ticket-scoped, not a
+global presence check.
 
 ## P1-P2 commands
 
+P1's parallax divergences are frontier questions — resolve them via the shared
+interrogation protocol (`docs/interrogation-protocol.md` in the ADLC repo):
+codebase-check each one, ask the human the rest in numbered rounds with a
+recommended answer first, fold answers into the spec, and re-run parallax —
+capped at 3 rounds, after which surviving divergences are recorded as approved
+assumptions in the spec. `adlc parallax --questions-json` returns the
+divergences as structured `{questions: [{point, options}]}` for this loop.
+
+`premortem` needs a written spec to stress-test, so it runs only after the
+first interrogation round has produced one — never before, and never as a
+step whose questions get silently resolved by the model. Its output feeds a
+SECOND round of the same loop (codebase-check, ask the human, fold answers,
+re-run parallax) before spec-lint; the 3-round cap covers both rounds
+combined, not each source separately. Both `premortem --record-verdict` and
+`spec-lint --record` require `--ticket <id>` — the p1 gate scopes evidence
+per-ticket (P1 D4: an unbound record could otherwise satisfy another
+ticket's approval).
+
 ```sh
 adlc parallax --request "<request>"
-adlc spec-lint spec.md --json
-adlc premortem spec.md --json
+# … interrogation round 1, write the draft spec …
+adlc premortem spec.md --prompt-only --record-verdict <file> --ticket <id>
+# … interrogation round 2 on premortem's questions …
+adlc spec-lint spec.md --prompt-only  # answer the vacuousness audit
+adlc spec-lint spec.md --record --ticket <id>  # once it passes cleanly
 adlc coldstart --all --tickets .adlc/tickets.json --json
 adlc merge-forecast --tickets .adlc/tickets.json --json
 adlc model-router --tickets .adlc/tickets.json --json

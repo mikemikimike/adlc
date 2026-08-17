@@ -23,14 +23,14 @@ export function normalizeCommandName(command) {
 //
 // The evidence names are the AUTHORITATIVE phase-completion gates from the
 // runner's model (`@adlc/runner` requirementsForPhase — pinned by a drift test):
-//   P1 = spec-lint | premortem     P2 = coldstart | merge-forecast
+//   P1 = spec-lint | premortem | spec-approval     P2 = coldstart | merge-forecast
 // So /adlc-decompose (P2) expects P1 evidence, /adlc-prosecute (P5) expects P2
-// evidence. There is NO distinct `spec_approval`/`p1` gate in the recorded model
-// (an earlier revision keyed on those, which are never written — this pins to
-// what the runner actually records). Manifest entries carry the gate under
-// `type` with `gate` as a fallback, so the check reads `type ?? gate`.
+// evidence. `spec-approval` is the recorded Gate 1 human approval (see
+// /adlc-approve-spec); the runner's p1 assertion requires and validates it.
+// Manifest entries carry the gate under `type` with `gate` as a fallback, so
+// the check reads `type ?? gate`.
 export const PHASE_PREREQ = {
-  'adlc-decompose': { gates: ['spec-lint', 'premortem'], hint: 'no P1 spec gate (spec-lint/premortem) recorded for this ticket — complete P1 (/adlc-spec, /adlc-approve-spec) first' },
+  'adlc-decompose': { gates: ['spec-lint', 'premortem', 'spec-approval'], hint: 'no P1 spec gate (spec-lint/premortem/spec-approval) recorded for this ticket — complete P1 (/adlc-spec, /adlc-approve-spec) first' },
   'adlc-prosecute': { gates: ['coldstart', 'merge-forecast'], hint: 'this ticket has no P2 evidence (coldstart) — run /adlc-decompose first' },
 };
 
@@ -54,8 +54,11 @@ function manifestEntries(root) {
 /**
  * Advisory lifecycle-order check. Returns { warn: string|null }.
  * Only warns when: the command has a declared prerequisite, enforcement is on
- * with an unambiguous active ticket, AND the manifest has NO entry for any of
- * the prerequisite gates on that ticket. Fail-OPEN everywhere else — advisory.
+ * with an unambiguous active ticket, AND the manifest is missing ANY ONE of
+ * the prerequisite gates on that ticket (all must be present — P1's
+ * requirement is spec-lint AND premortem AND spec-approval; a single early
+ * spec-lint row must not silence the warning for the other two). Fail-OPEN
+ * everywhere else — advisory.
  */
 export function checkCommandOrder(command, root, env = process.env) {
   const name = normalizeCommandName(command);
@@ -64,7 +67,8 @@ export function checkCommandOrder(command, root, env = process.env) {
   const active = resolveActiveTicketId(root, env);
   if (active.conflict || !active.id) return { warn: null };
   const entries = manifestEntries(root);
-  const satisfied = entries.some((e) => e?.ticket === active.id && prereq.gates.includes(entryEvidence(e)));
+  const present = new Set(entries.filter((e) => e?.ticket === active.id).map(entryEvidence));
+  const satisfied = prereq.gates.every((gate) => present.has(gate));
   if (satisfied) return { warn: null };
   return { warn: `ADLC lifecycle: /${name} — ${prereq.hint}. (advisory; not blocked)` };
 }

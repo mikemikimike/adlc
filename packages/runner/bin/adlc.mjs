@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs, printJson, opError } from '@adlc/core';
-import { assertPhase, requirementsForPhase } from '../lib/assertions.mjs';
+import { assertPhase, requirementsForPhase, allPhases, requiresTicket } from '../lib/assertions.mjs';
 import { recordAcceptancePacket } from '../lib/acceptance.mjs';
 import { getKey } from '@adlc/gate-manifest/lib/sign.mjs';
 
@@ -18,13 +18,15 @@ const { values, positionals } = parseArgs({
 });
 
 function help() {
+  const phases = allPhases();
+  const ticketRequired = phases.filter((p) => requiresTicket(p));
   console.log(`adlc run <phase> [--dir .adlc] [--ticket id] [--revision rev] [--json]
 adlc accept --ticket id --packet .adlc/packet.json [--before .adlc/before.json] [--after .adlc/after.json] [--dir .adlc] [--revision rev] [--json]
 
 Artifact-asserting ADLC phase runner.
 
-Phases: p1 p2 p3 p4 p5 p6 p7
-Ticket required: p3 p4 p5 p6
+Phases: ${phases.join(' ')}
+Ticket required: ${ticketRequired.join(' ')}
 Revision required: p5 p6 use the current git worktree fingerprint unless --revision is supplied.
 Explicit --revision selects recorded manifest/artifact evidence without live worktree comparison.
 
@@ -77,6 +79,11 @@ if (values.json) {
   printJson(result);
 } else if (result.ok) {
   console.log(`adlc ${phase}: required evidence present`);
+} else if (Array.isArray(result.errors)) {
+  // A content-level gate failure (stale/incomplete/contradictory evidence,
+  // e.g. p0/p1's integrity checks) — a normal exit-2 rejection with reasons,
+  // not the "evidence missing entirely" shape below.
+  console.error(`adlc ${phase}: evidence rejected:\n  ${result.errors.join('\n  ')}`);
 } else {
   console.error(`adlc ${phase}: missing evidence: ${result.missing.join(', ') || 'none'}`);
   if (result.skipped.length > 0) console.error(`malformed manifest lines: ${result.skipped.length}`);

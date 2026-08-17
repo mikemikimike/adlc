@@ -14,7 +14,7 @@ Runs once per spec. Cheap. No bespoke judgement needed.
 ## Usage
 
 ```
-premortem <spec.md> [--tier cheap|mid|frontier] [--out report.md] [--json] [--prompt-only] [--record-verdict <file|->]
+premortem <spec.md> [--tier cheap|mid|frontier] [--out report.md] [--json] [--prompt-only] [--record-verdict <file|-> --ticket <id>]
 ```
 
 ### Arguments
@@ -26,7 +26,8 @@ premortem <spec.md> [--tier cheap|mid|frontier] [--out report.md] [--json] [--pr
 | `--out <path>` | Write markdown report to this file instead of stdout | stdout |
 | `--json` | Emit machine-readable JSON `{ causes: [...] }` | false |
 | `--prompt-only` | Print the exact system + user prompt, then exit 0 — **no API key needed** | false |
-| `--record-verdict <file\|->` | With `--prompt-only`: read the operator's answer from `<file>` (or stdin when `-`) and record it into `.adlc/manifest.jsonl` via `gate-manifest` | — |
+| `--record-verdict <file\|->` | With `--prompt-only`: read the operator's answer from `<file>` (or stdin when `-`) and record it into `.adlc/manifest.jsonl` via `gate-manifest`. Requires `--ticket` — an unbound record could satisfy another ticket's P1 gate | — |
+| `--ticket <id>` | Ticket to bind the recorded verdict to (required with `--record-verdict`) | — |
 | `--help` | Print usage and exit 0 | false |
 
 ### Examples
@@ -111,16 +112,19 @@ logic rather than reimplementing it.
 
 ```sh
 # Operator writes their conclusion to a file, then records it
-premortem specs/checkout-v2.md --prompt-only --record-verdict verdict.txt
+premortem specs/checkout-v2.md --prompt-only --record-verdict verdict.txt --ticket T1
 
 # Or pipe the answer straight from stdin
 echo "confirmed: process.chdir throws under vitest threads pool" \
-  | premortem specs/checkout-v2.md --prompt-only --record-verdict -
+  | premortem specs/checkout-v2.md --prompt-only --record-verdict - --ticket T1
 ```
 
-`--record-verdict` requires `--prompt-only` (exit 1 otherwise). The recorded
-entry's `gate` is `premortem`, `data.verdict` holds the operator's text
-verbatim, and `data.specPath` records which spec the prompt covered.
+`--record-verdict` requires `--prompt-only` (exit 1 otherwise) and `--ticket`
+(exit 1 otherwise — the p1 gate scopes spec-lint/premortem evidence per
+ticket, so an unbound record could otherwise satisfy a different ticket's
+approval). The recorded entry's `gate` is `premortem`, `data.verdict` holds
+the operator's text verbatim, and `data.specPath` records which spec the
+prompt covered.
 
 ---
 
