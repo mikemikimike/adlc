@@ -23,6 +23,8 @@ import {
 import { evaluateBands, nagSuppression, handoffDenyActive } from './bands.mjs';
 import { evaluateMutationGate } from './mutation-gate.mjs';
 import { readResumeAuth } from './resume-auth.mjs';
+import { readBypassGrant, removeBypassGrant } from './bypass-grant.mjs';
+import { HANDOFF_DEPTH } from './thresholds.mjs';
 
 /** Mutating `adlc handoff` subcommands agents must not run under deny-set. */
 export const HANDOFF_MUTATING_SUBCOMMANDS = new Set([
@@ -83,7 +85,8 @@ export function isProtectedHandoffPath(rel) {
   return (
     leaf.endsWith('.resume-auth.json') ||
     leaf.endsWith('.model-ok') ||
-    leaf.endsWith('.lock')
+    leaf.endsWith('.lock') ||
+    leaf.endsWith('.bypass-grant.json')
   );
 }
 
@@ -295,12 +298,41 @@ export function denyStoreHot(loaded) {
  *        a correctly signed resume could never clear a deny through an adapter.
  *        Adapters pass their own `ADLC_MANIFEST_KEY`; absent, the gate still
  *        fails closed, it just cannot be re-opened in-session.
+ * @param {{ session_id: string, unbound_reason: string|null, written_at: string, verified: boolean }|null} [opts.verifiedBypassGrant]
+ *        host-verified bypass grant, three-state by design:
+ *        - `undefined` (omitted): this caller makes no claim — the adapter
+ *          reads and verifies the grant file itself with `manifestKey`, as
+ *          in-process adapters (OpenCode, Pi) do today.
+ *        - `null`: the HOST attempted verification with its own trusted code
+ *          and key and found no valid grant. Authoritative — the adapter does
+ *          NOT re-read the file.
+ *        - object: the HOST verified this grant. The adapter still requires
+ *          `verified === true` and `session_id === sessionId` before it
+ *          authorizes anything, and consumes (deletes) the grant one-shot
+ *          exactly as if it had verified it itself.
+ *        This exists for hook hosts (Claude Code, Codex) that resolve this
+ *        package from the PROJECT's node_modules: they must never hand
+ *        `manifestKey` to project-controlled code, so they verify the grant
+ *        in their own trusted hook (pre-secret-scrub) and pass only the
+ *        verdict across the trust boundary — never the key.
  * @param {boolean} [opts.denyEverWritten] caller-threaded D1 fact: this session
  *        has already had a deny marker written OR attempted. `processStickyDeny`
  *        is a per-call local, so without this a marker write that FAILED denies
  *        one call and then fails open once the band cools. Only a caller with
  *        memory across calls can carry it; the spec makes it caller-threaded for
  *        exactly that reason.
+ * @param {boolean} [opts.scanTruncated] Phase 0 hotfix (context-rot-threshold-
+ *        calibration spec §1.2.2): true when the caller's transcript scan hit
+ *        its byte/wall-clock budget before reaching start-of-file, so
+ *        `observed.depth` is a LOWER bound, not an exact count. A lower bound
+ *        is only safe to act on as an implicit allow once it already reaches
+ *        HANDOFF_DEPTH (more unseen calls only make a deny more correct,
+ *        never less) — below that, this restricts the call even when the
+ *        raw depth number alone would read as WARN or clean. Callers that
+ *        completed a full scan (or have no scan at all) omit this or pass
+ *        false — the default preserves prior behavior exactly. The Recovery
+ *        Exception and Inspection Bash Exception are evaluated by the CALLER
+ *        before this function is ever invoked and are unaffected by it.
  * @returns {{ deny: boolean, reasons: string[], ensuredMarker: boolean, denyEverWritten: boolean }}
  */
 export function evaluateHandoffPreToolUse({
@@ -313,12 +345,29 @@ export function evaluateHandoffPreToolUse({
   bashCommand = '',
   host = 'unknown',
   manifestKey = null,
+  verifiedBypassGrant = undefined,
   denyEverWritten = false,
+  scanTruncated = false,
 }) {
   const reasons = [];
   let ensuredMarker = false;
   let mutationDenied = false;
   let sawDeny = denyEverWritten === true;
+
+  // Incomplete-scan lower-bound restriction (Phase 0 hotfix, spec §1.2.2).
+  // Independent of, and additional to, every other D0-D3/band cause below —
+  // OR'd in the same way. Only fires on a genuinely finite, in-domain depth:
+  // a NaN/Infinity depth already fails closed via evaluateBands itself.
+  if (
+    scanTruncated === true &&
+    typeof observed.depth === 'number' &&
+    Number.isFinite(observed.depth) &&
+    observed.depth >= 0 &&
+    observed.depth < HANDOFF_DEPTH
+  ) {
+    reasons.push('incomplete_scan_lower_bound');
+    mutationDenied = true;
+  }
 
   for (const rel of editRelPaths) {
     const verdict = classifyProtectedTarget(root, rel);
@@ -382,11 +431,56 @@ export function evaluateHandoffPreToolUse({
       sessionId,
       typeof manifestKey === 'string' && manifestKey.length > 0 ? { key: manifestKey } : {},
     );
+    // Without a key `readBypassGrant` reports verified:false for every
+    // document, same reasoning as resumeAuth above — a signed grant only
+    // ever authorizes when the adapter supplies the key it was signed with.
+    // A caller that passes `verifiedBypassGrant` (host hooks — see the JSDoc)
+    // pre-empts the read entirely: the host verdict is authoritative, and the
+    // session-binding check below still applies to whatever it handed over.
+    const bypassGrant =
+      verifiedBypassGrant !== undefined
+        ? verifiedBypassGrant !== null &&
+          typeof verifiedBypassGrant === 'object' &&
+          verifiedBypassGrant.session_id === sessionId &&
+          (verifiedBypassGrant.unbound_reason === null ||
+            typeof verifiedBypassGrant.unbound_reason === 'string')
+          ? verifiedBypassGrant
+          : null
+        : readBypassGrant(
+            root,
+            sessionId,
+            typeof manifestKey === 'string' && manifestKey.length > 0 ? { key: manifestKey } : {},
+          );
+    const bypassVerified = bypassGrant != null && bypassGrant.verified === true;
+    // Round-13 review (T-01M03J291182MXD1KEKM2PRKTS): claim-first atomicity.
+    // Phase 0 has no lock (spec §1.3), so `unlinkSync` IS the one-shot
+    // primitive — POSIX guarantees exactly one caller's unlink on a given
+    // path succeeds; every other concurrent caller (or a caller that arrives
+    // after) gets ENOENT. Attempting the claim HERE, before the grant is used
+    // for anything, closes the read-verify-then-defer-delete race a prior
+    // round found: two PreToolUse evaluations racing on the SAME grant file
+    // could previously both read it as active before either deleted it.
+    //
+    // Gated on `reasons.length === 0`: every reason already computed above
+    // this point (incomplete-scan lower bound, protected-path) denies
+    // regardless of bypass, so claiming here would spend the one-shot grant
+    // on a mutation that was going to be denied anyway — the exact "consumed
+    // despite the final decision" gap the same round found. A reason pushed
+    // LATER (the bash-shell protected-path check below) is a narrower,
+    // disclosed residual: an active grant for a Bash call that ALSO touches a
+    // protected path is already a suspicious combination, not the ordinary
+    // recovery flow this mechanism exists for.
+    const bypassActive = bypassVerified && reasons.length === 0 && removeBypassGrant(root, sessionId) === true;
+    const bypassForSession = bypassActive
+      ? bypassGrant.unbound_reason
+        ? { sessionId, unboundReason: bypassGrant.unbound_reason }
+        : { sessionId }
+      : false;
     const gateInput = mutationGateInputFromLoad(loadedAfter, {
       currentSessionId: sessionId,
       processStickyDeny,
       resumeAuth,
-      bypassForSession: false,
+      bypassForSession,
       manifestVerifyFailed: false,
     });
     const gate = evaluateMutationGate(gateInput);

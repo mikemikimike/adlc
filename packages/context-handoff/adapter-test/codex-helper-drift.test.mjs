@@ -1,29 +1,28 @@
-// cc-helper-drift.test.mjs — pin the Claude Code hook's two retained pure
-// helpers to this package's canonical implementations (slice 5).
+// codex-helper-drift.test.mjs — pin the Codex hook's trusted local Recovery
+// Exception / Inspection Bash Exception copy to this package's canonical
+// implementation (Phase 0 hotfix, context-rot-threshold-calibration spec
+// §1.3, AC0).
 //
-// plugins/adlc-claude-code/hooks/handoff-gate.mjs keeps its own
-// `resolveSessionId` / `isProtectedHandoffPath` because that module is loaded
-// synchronously by the hook while the package can only be resolved
-// asynchronously (no workspace node_modules in a plugin install dir; Node 18
-// cannot `require()` an ESM package). The hook's real decisions go through the
-// package, but the frozen slice-4 contract test drives these two directly — so
-// they must not be allowed to drift from the copies they mirror. Same pattern
-// as packages/core/test/shell.test.mjs pinning the Codex hook's inline shell
-// classifier.
+// plugins/adlc-codex/hooks/adlc-handoff-gate.mjs keeps its own
+// `isBareInspectionPwd` / `matchRecoveryCommand` — see that file's own
+// "KEEP IN SYNC" comment for why: these gate the operator's escape hatch out
+// of a Hard-Degraded session and must not depend on the project-resolved
+// `@adlc/context-handoff` package successfully loading. Same pattern as
+// packages/context-handoff/adapter-test/cc-helper-drift.test.mjs.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHmac } from 'node:crypto';
 
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import {
-  isSafeSessionId,
-  resolveHandoffSessionId,
-  isProtectedHandoffPath as canonicalIsProtectedHandoffPath,
   isBareInspectionPwd as canonicalIsBareInspectionPwd,
   matchRecoveryCommand as canonicalMatchRecoveryCommand,
+  isSafeSessionId,
+  resolveHandoffSessionId,
   formatRecoveryCommand as canonicalFormatRecoveryCommand,
   formatNoSessionIdMessage as canonicalFormatNoSessionIdMessage,
   formatUnsafeInstallPathMessage as canonicalFormatUnsafeInstallPathMessage,
@@ -33,110 +32,39 @@ import {
   BYPASS_GRANT_SCHEMA,
 } from '@adlc/context-handoff';
 import { canonicalJson } from '@adlc/core';
-import { createHmac } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const CC_HANDOFF_GATE = join(
-  REPO_ROOT,
-  'plugins',
-  'adlc-claude-code',
-  'hooks',
-  'handoff-gate.mjs',
-);
+const CODEX_HANDOFF_GATE = join(REPO_ROOT, 'plugins', 'adlc-codex', 'hooks', 'adlc-handoff-gate.mjs');
 
 const {
-  resolveSessionId: ccResolveSessionId,
-  isProtectedHandoffPath: ccIsProtectedHandoffPath,
-  readVerifiedBypassGrant: ccReadVerifiedBypassGrant,
-  isBareInspectionPwd: ccIsBareInspectionPwd,
-  matchRecoveryCommand: ccMatchRecoveryCommand,
-  isSafeSessionId: ccIsSafeSessionId,
-  formatRecoveryCommand: ccFormatRecoveryCommand,
-  formatNoSessionIdMessage: ccFormatNoSessionIdMessage,
-  formatUnsafeInstallPathMessage: ccFormatUnsafeInstallPathMessage,
-} = await import(CC_HANDOFF_GATE);
+  isBareInspectionPwd: codexIsBareInspectionPwd,
+  matchRecoveryCommand: codexMatchRecoveryCommand,
+  isSafeSessionId: codexIsSafeSessionId,
+  resolveHandoffSessionIdLocal: codexResolveHandoffSessionId,
+  formatRecoveryCommand: codexFormatRecoveryCommand,
+  formatNoSessionIdMessage: codexFormatNoSessionIdMessage,
+  formatUnsafeInstallPathMessage: codexFormatUnsafeInstallPathMessage,
+  readVerifiedBypassGrant: codexReadVerifiedBypassGrant,
+} = await import(CODEX_HANDOFF_GATE);
 
-/** Payload shapes the two session resolvers must agree on. */
-const SESSION_CASES = [
-  null,
-  undefined,
-  {},
-  { session_id: 'sess-a' },
-  { sessionId: 'sess-b' },
-  { session_id: 'sess-a', sessionId: 'sess-b' },
-  { session_id: '', sessionId: 'sess-b' },
-  { session_id: '', transcript_path: '' },
-  { transcript_path: '/tmp/uuid-1.jsonl' },
-  { transcript_path: '/tmp/uuid-1' },
-  { transcript_path: '....jsonl' },
-  { transcript_path: 12 },
-  { session_id: 'sess-a', transcript_path: '/tmp/uuid-1.jsonl' },
-  { session_id: '../escape' },
-  { session_id: 'has/slash' },
-];
-
-/** Repo-relative paths the two path guards must agree on. */
-const PATH_CASES = [
-  '',
-  'src/app.mjs',
-  '.adlc/tickets.json',
-  '.adlc/.deny-store',
-  '.adlc/handoffs/.deny-store',
-  '.adlc/handoffs/denies',
-  '.adlc/handoffs/denies/sess-a.json',
-  './.adlc/handoffs/denies/sess-a.json',
-  '.adlc/handoffs/x/../denies/sess-a.json',
-  '.adlc/handoffs/sess-a.resume-auth.json',
-  '.adlc/handoffs/sess-a.model-ok',
-  '.adlc/handoffs/sess-a.lock',
-  '.adlc/handoffs/sess-a.bypass-grant.json',
-  './.adlc/handoffs/x/../sess-a.bypass-grant.json',
-  '.adlc/handoffs/final.md',
-  '.adlc/handoffs-other/denies/x.json',
-  '.adlc\\handoffs\\denies\\sess-a.json',
-];
-
-test('the CC session resolver agrees with resolveHandoffSessionId', () => {
-  for (const input of SESSION_CASES) {
-    const cc = ccResolveSessionId(input, { isSafeSessionId });
-    const payload = input && typeof input === 'object' ? input : {};
-    const canonical = resolveHandoffSessionId({
-      candidates: [payload.session_id, payload.sessionId],
-      transcriptPath: payload.transcript_path,
-    });
-    assert.equal(cc, canonical, `drift on ${JSON.stringify(input)}`);
-  }
-});
-
-test('the CC path guard agrees with isProtectedHandoffPath', () => {
-  for (const p of PATH_CASES) {
-    assert.equal(
-      ccIsProtectedHandoffPath(p),
-      canonicalIsProtectedHandoffPath(p),
-      `drift on ${JSON.stringify(p)}`,
-    );
-  }
-});
-
-test('the CC bare-pwd exception agrees with isBareInspectionPwd', () => {
+test('the Codex bare-pwd exception agrees with isBareInspectionPwd', () => {
   for (const cmd of ['pwd', 'pwd -L', ' pwd', 'pwd ', 'pwd; ls', '', null, undefined]) {
     assert.equal(
-      ccIsBareInspectionPwd(cmd),
+      codexIsBareInspectionPwd(cmd),
       canonicalIsBareInspectionPwd(cmd),
       `drift on ${JSON.stringify(cmd)}`,
     );
   }
 });
 
-test('the CC recovery matcher agrees with matchRecoveryCommand', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cc-helper-drift-'));
+test('the Codex recovery matcher agrees with matchRecoveryCommand', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-helper-drift-'));
   // A separate, SPACE-containing dir — this is the fixture that caught a
   // real drift bug (round 1 of this ticket's own review): the local copies
   // had `inner.includes(' ')` where the canonical has `inner.includes('\0')`,
   // silently rejecting every legitimate quoted spaced path. Never drop this
   // case from the drift table.
-  const spacedDir = mkdtempSync(join(tmpdir(), 'cc-helper-drift space '));
+  const spacedDir = mkdtempSync(join(tmpdir(), 'codex-helper-drift space '));
   try {
     const interpreterPath = join(dir, 'node');
     const scriptPath = join(dir, 'handoff.mjs');
@@ -153,18 +81,18 @@ test('the CC recovery matcher agrees with matchRecoveryCommand', () => {
       [`${interpreterPath} ${scriptPath} bypass --session ${sessionId} --write`, opts],
       [`${interpreterPath} ${scriptPath} unlock --session ${sessionId} --started-at 2026-08-15T12:34:56.789Z --write`, opts],
       [`${interpreterPath} ${scriptPath} resume --session ${sessionId} --deny-session other-session --write`, opts],
-      [`${interpreterPath} ${scriptPath} bypass --session other-session --write`, opts], // wrong session
-      [`${interpreterPath} ${scriptPath} bypass --session ${sessionId} --write; rm -rf /`, opts], // decoy
-      [`node ${scriptPath} bypass --session ${sessionId} --write`, opts], // bare interpreter
-      [`${interpreterPath} ${scriptPath} frobnicate --session ${sessionId} --write`, opts], // unknown subcommand
-      [`'${spacedInterpreterPath}' '${spacedScriptPath}' bypass --session ${sessionId} --write`, spacedOpts], // quoted spaced path
+      [`${interpreterPath} ${scriptPath} bypass --session other-session --write`, opts],
+      [`${interpreterPath} ${scriptPath} bypass --session ${sessionId} --write; rm -rf /`, opts],
+      [`node ${scriptPath} bypass --session ${sessionId} --write`, opts],
+      [`${interpreterPath} ${scriptPath} frobnicate --session ${sessionId} --write`, opts],
+      [`'${spacedInterpreterPath}' '${spacedScriptPath}' bypass --session ${sessionId} --write`, spacedOpts],
       ['pwd', opts],
       ['', opts],
     ];
     for (const [cmd, o] of cases) {
-      const cc = ccMatchRecoveryCommand(cmd, o);
+      const codex = codexMatchRecoveryCommand(cmd, o);
       const canonical = canonicalMatchRecoveryCommand(cmd, o);
-      assert.deepEqual(cc, canonical, `drift on ${JSON.stringify(cmd)}`);
+      assert.deepEqual(codex, canonical, `drift on ${JSON.stringify(cmd)}`);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -172,9 +100,9 @@ test('the CC recovery matcher agrees with matchRecoveryCommand', () => {
   }
 });
 
-test('the CC recovery diagnostic formatters agree with the canonical formatters (Round-5 Finding 4)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'cc-helper-drift-format-'));
-  const apostropheDir = mkdtempSync(join(tmpdir(), "cc-helper-drift-format-o'clock-"));
+test('the Codex recovery diagnostic formatters agree with the canonical formatters (Round-5 Finding 4)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-helper-drift-format-'));
+  const apostropheDir = mkdtempSync(join(tmpdir(), "codex-helper-drift-format-o'clock-"));
   try {
     const interpreterPath = join(dir, 'node');
     const scriptPath = join(dir, 'handoff.mjs');
@@ -187,41 +115,55 @@ test('the CC recovery diagnostic formatters agree with the canonical formatters 
       { interpreterPath, scriptPath: apostropheScriptPath, sessionId: 'sess-a' }, // unquotable path
     ];
     for (const o of cases) {
-      assert.equal(ccFormatRecoveryCommand(o), canonicalFormatRecoveryCommand(o), `drift on ${JSON.stringify(o)}`);
+      assert.equal(codexFormatRecoveryCommand(o), canonicalFormatRecoveryCommand(o), `drift on ${JSON.stringify(o)}`);
     }
-    assert.equal(ccFormatNoSessionIdMessage(), canonicalFormatNoSessionIdMessage());
+    assert.equal(codexFormatNoSessionIdMessage(), canonicalFormatNoSessionIdMessage());
     const unsafeOpts = { interpreterPath, scriptPath: apostropheScriptPath, sessionId: 'sess-a' };
-    assert.equal(ccFormatUnsafeInstallPathMessage(unsafeOpts), canonicalFormatUnsafeInstallPathMessage(unsafeOpts));
+    assert.equal(codexFormatUnsafeInstallPathMessage(unsafeOpts), canonicalFormatUnsafeInstallPathMessage(unsafeOpts));
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(apostropheDir, { recursive: true, force: true });
   }
 });
 
-test('the CC isSafeSessionId agrees with the canonical isSafeSessionId', () => {
+test('the Codex isSafeSessionId agrees with the canonical isSafeSessionId', () => {
   for (const id of ['sess-a', '', null, undefined, '../escape', 'has/slash', '  padded  ', 'a'.repeat(200)]) {
-    assert.equal(ccIsSafeSessionId(id), isSafeSessionId(id), `drift on ${JSON.stringify(id)}`);
+    assert.equal(codexIsSafeSessionId(id), isSafeSessionId(id), `drift on ${JSON.stringify(id)}`);
+  }
+});
+
+test('the Codex session resolver agrees with resolveHandoffSessionId', () => {
+  const cases = [
+    { candidates: ['sess-a', 'sess-b'] },
+    { candidates: [undefined, '', 'sess-b'] },
+    { candidates: [null], transcriptPath: '/tmp/uuid-1.jsonl' },
+    {},
+    { transcriptPath: '' },
+  ];
+  for (const c of cases) {
+    assert.equal(
+      codexResolveHandoffSessionId(c),
+      resolveHandoffSessionId(c),
+      `drift on ${JSON.stringify(c)}`,
+    );
   }
 });
 
 test('the case tables actually exercise both verdicts', () => {
-  // A drift test whose inputs all land on one verdict would pass against a
-  // helper that returned a constant. Prove both tables straddle the boundary.
-  const sessions = SESSION_CASES.map((i) => ccResolveSessionId(i, { isSafeSessionId }));
-  assert.ok(sessions.some((s) => s !== null), 'no case resolves a session id');
-  assert.ok(sessions.some((s) => s === null), 'no case rejects a session id');
-
-  const paths = PATH_CASES.map((p) => ccIsProtectedHandoffPath(p));
-  assert.ok(paths.some(Boolean), 'no case is protected');
-  assert.ok(paths.some((v) => !v), 'no case is unprotected');
+  const pwdCases = ['pwd', 'pwd -L', ' pwd', 'pwd ', 'pwd; ls', ''];
+  const results = pwdCases.map((c) => codexIsBareInspectionPwd(c));
+  assert.ok(results.some(Boolean), 'no case is the bare exception');
+  assert.ok(results.some((v) => !v), 'no case is rejected');
 });
 
 // ---------------------------------------------------------------------------
-// readVerifiedBypassGrant — the hook's trusted grant-verification twin
-// ("KEEP IN SYNC (3)" in handoff-gate.mjs). The hook verifies the grant
-// itself, pre-secret-scrub, so ADLC_MANIFEST_KEY never reaches the
-// project-resolved package; this pin keeps that twin honest against the
+// readVerifiedBypassGrant — the Codex hook's trusted grant-verification twin
+// (see its own comment in adlc-handoff-gate.mjs). The hook verifies the grant
+// itself from the pre-scrub env snapshot, so ADLC_MANIFEST_KEY never reaches
+// the project-resolved package; this pin keeps that twin honest against the
 // canonical readBypassGrant across every verdict-relevant fixture shape.
+// Same case matrix as cc-helper-drift.test.mjs's — the two hook twins are
+// themselves verbatim copies of each other.
 
 const GRANT_KEY = 'k'.repeat(64);
 const WRONG_KEY = 'w'.repeat(64);
@@ -346,14 +288,14 @@ const GRANT_CASES = [
   ],
 ];
 
-test('the CC readVerifiedBypassGrant agrees with the canonical readBypassGrant', () => {
+test('the Codex readVerifiedBypassGrant agrees with the canonical readBypassGrant', () => {
   for (const [name, mutate, readOpts] of GRANT_CASES) {
-    const root = mkdtempSync(join(tmpdir(), 'cc-grant-drift-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-grant-drift-'));
     try {
       mkdirSync(join(root, '.adlc'), { recursive: true });
       mutate(root);
       const canonical = canonicalReadBypassGrant(root, 'sess-a', readOpts);
-      const twin = ccReadVerifiedBypassGrant(root, 'sess-a', readOpts);
+      const twin = codexReadVerifiedBypassGrant(root, 'sess-a', readOpts);
       assert.deepEqual(twin, canonical, `drift on ${name}`);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -361,14 +303,14 @@ test('the CC readVerifiedBypassGrant agrees with the canonical readBypassGrant',
   }
 });
 
-test('the CC grant twin returns null (never throws) on an unsafe session id', () => {
+test('the Codex grant twin returns null (never throws) on an unsafe session id', () => {
   // Deliberate, documented divergence: the canonical asserts on an unsafe id
   // (bypassGrantPath -> assertSafeSessionId); the hook twin must never crash
   // on hostile input, so it reads as absent instead.
-  const root = mkdtempSync(join(tmpdir(), 'cc-grant-unsafe-'));
+  const root = mkdtempSync(join(tmpdir(), 'codex-grant-unsafe-'));
   try {
     for (const bad of ['../escape', 'has/slash', '', null, undefined]) {
-      assert.equal(ccReadVerifiedBypassGrant(root, bad, { key: GRANT_KEY }), null, `must be null for ${JSON.stringify(bad)}`);
+      assert.equal(codexReadVerifiedBypassGrant(root, bad, { key: GRANT_KEY }), null, `must be null for ${JSON.stringify(bad)}`);
     }
     assert.throws(() => canonicalReadBypassGrant(root, '../escape', { key: GRANT_KEY }), /session/i);
   } finally {
@@ -379,11 +321,11 @@ test('the CC grant twin returns null (never throws) on an unsafe session id', ()
 test('the grant drift cases straddle the verdict boundary', () => {
   // Same guard as the tables above: a twin returning a constant must fail.
   const verdicts = GRANT_CASES.map(([, mutate, readOpts]) => {
-    const root = mkdtempSync(join(tmpdir(), 'cc-grant-verdicts-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-grant-verdicts-'));
     try {
       mkdirSync(join(root, '.adlc'), { recursive: true });
       mutate(root);
-      return ccReadVerifiedBypassGrant(root, 'sess-a', readOpts);
+      return codexReadVerifiedBypassGrant(root, 'sess-a', readOpts);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
