@@ -34,24 +34,16 @@ const USAGE = `fleet — parallel ADLC ticket orchestration
 Usage:
   fleet run [--concurrency N] [--dry-run] [--tickets T1,T2] [--base B] [--json]
             [--adapter NAME] [--model MODEL] [--model-auth-key ENV_VAR]
-            [--i-am-in-a-disposable-container]
+            [--i-am-in-a-disposable-container] [--model-plane-writable PATH]
   fleet status [--json]
   fleet unlock
 
 Exit codes: 0 ok · 1 operational error · 2 a ticket failed/blocked.`;
 
-function runCli() {
-const raw = process.argv.slice(2);
-const sub = raw[0];
-
-if (!sub || sub === '--help' || sub === '-h') {
-  console.log(USAGE);
-  process.exit(0);
-}
-
-const dir = join(process.cwd(), '.adlc');
-
-function parseFlags(args) {
+// Exported so a test can observe that a REPEATABLE flag actually accumulates.
+// `multiple: false` does not error on a repeated flag — it silently keeps the last
+// value — so the only way to see the difference is the parsed result itself.
+export function parseFlags(args) {
   const { values } = parseArgs({
     args,
     options: {
@@ -66,11 +58,23 @@ function parseFlags(args) {
       'model-auth-key': { type: 'string' },
       'adapter-command': { type: 'string' },
       'adapter-args': { type: 'string' },
+      'model-plane-writable': { type: 'string', multiple: true },
     },
     allowPositionals: true,
   });
   return values;
 }
+
+function runCli() {
+const raw = process.argv.slice(2);
+const sub = raw[0];
+
+if (!sub || sub === '--help' || sub === '-h') {
+  console.log(USAGE);
+  process.exit(0);
+}
+
+const dir = join(process.cwd(), '.adlc');
 
 if (sub === 'status') {
   const flags = parseFlags(raw.slice(1));
@@ -107,6 +111,9 @@ if (sub === 'run') {
     // Operator-local worker binary override (A2) — CLI only, never repo config.
     adapterCommand: flags['adapter-command'] ?? undefined,
     adapterArgs: flags['adapter-args'] ? flags['adapter-args'].split(',') : undefined,
+    // Operator-local escape hatch for the model-plane write boundary (#395): a
+    // harness whose state directory the adapter catalog has not caught up with.
+    modelPlaneWritable: flags['model-plane-writable'] ?? undefined,
   });
   for (const w of config.warnings) console.error(`warning: ${w}`);
 
