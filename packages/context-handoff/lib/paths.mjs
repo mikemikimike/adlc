@@ -54,3 +54,9 @@ export function lockPath(root, sessionId) {
   assertSafeSessionId(sessionId);
   return join(root, LEDGER_DIRNAME, 'handoffs', `${sessionId}.lock`);
 }
+
+/** Capture body; host-written only (adapters protect the directory). */
+export function contentPath(root, sessionId) {
+  assertSafeSessionId(sessionId);
+  return join(root, LEDGER_DIRNAME, 'handoffs', 'content', `${sessionId}.md`);
+}

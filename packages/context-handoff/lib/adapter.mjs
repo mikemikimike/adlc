@@ -25,6 +25,8 @@ import { evaluateMutationGate } from './mutation-gate.mjs';
 import { readResumeAuth } from './resume-auth.mjs';
 import { readBypassGrant, removeBypassGrant } from './bypass-grant.mjs';
 import { HANDOFF_DEPTH } from './thresholds.mjs';
+import { readVerifiedCapture } from './capture.mjs';
+import { CONTENT_KIND_CAPTURE } from './final.mjs';
 
 /** Mutating `adlc handoff` subcommands agents must not run under deny-set. */
 export const HANDOFF_MUTATING_SUBCOMMANDS = new Set([
@@ -33,6 +35,9 @@ export const HANDOFF_MUTATING_SUBCOMMANDS = new Set([
   'bypass',
   'repair',
   'unlock',
+  // `continue` consumes a deny for a successor it mints — an agent that can run
+  // it authorizes its own replacement out of its own session.
+  'continue',
 ]);
 
 /**
@@ -80,6 +85,9 @@ export function isProtectedHandoffPath(rel) {
     .join('/');
   if (norm === '.adlc/.deny-store' || norm === '.adlc/handoffs/.deny-store') return true;
   if (norm === '.adlc/handoffs/denies' || norm.startsWith('.adlc/handoffs/denies/')) return true;
+  // Capture bodies: a session that can rewrite its own capture rewrites the
+  // content its successor's authorization is bound to.
+  if (norm === '.adlc/handoffs/content' || norm.startsWith('.adlc/handoffs/content/')) return true;
   if (!norm.startsWith('.adlc/handoffs/')) return false;
   const leaf = basename(norm);
   return (
@@ -204,8 +212,16 @@ export function shellPathCandidates(command) {
   return [...out];
 }
 
-/** Repo-relative artifacts a shell target must not be able to reach. */
-const PROTECTED_SHELL_ROOTS = ['.adlc/handoffs/denies', '.adlc/.deny-store'];
+/**
+ * Repo-relative artifacts a shell target must not be able to reach.
+ *
+ * The whole `handoffs/` tree, not only `denies/`: a successor whose deny is
+ * CONSUMED holds no D1-D3 and is otherwise free to run shell, so without this
+ * it can `rm -rf .adlc/handoffs` and take the captures, finals, resume-auths
+ * and locks with it — the evidence its own authorization rests on. These paths
+ * are gitignored, so no diff would ever show the deletion.
+ */
+const PROTECTED_SHELL_ROOTS = ['.adlc/handoffs', '.adlc/.deny-store'];
 
 /**
  * True when deleting `rel` would take a protected artifact with it — `rel` is
@@ -222,7 +238,13 @@ const PROTECTED_SHELL_ROOTS = ['.adlc/handoffs/denies', '.adlc/.deny-store'];
  */
 function coversProtectedRoot(rel) {
   if (rel === '') return false;
-  return PROTECTED_SHELL_ROOTS.some((p) => p === rel || p.startsWith(`${rel}/`));
+  return PROTECTED_SHELL_ROOTS.some(
+    // An ancestor of a protected root reaches it by deletion…
+    (p) => p === rel || p.startsWith(`${rel}/`)
+      // …and so does anything INSIDE one. `.adlc/handoffs/finals` is not itself
+      // a named artifact, but removing it takes every final with it.
+      || rel.startsWith(`${p}/`),
+  );
 }
 
 /**
@@ -255,6 +277,41 @@ export function classifyProtectedTarget(root, rel) {
     return { protected: true, via: 'covers' };
   }
   return { protected: false, via: null };
+}
+
+/**
+ * Deny reasons for records whose capture no longer backs the hash they bind.
+ *
+ * A `content_kind: 'capture'` record says something stronger than "here is a
+ * hash": it says the hash was derived from a stored capture body, so a reader
+ * can re-derive it. That is what makes tampering detectable at all — signatures
+ * attest that a hash was authorized, never that the file still matches it — and
+ * it is why deleting the capture must fail closed rather than read as "no
+ * content to check". Legacy records carry no `content_kind` and are untouched:
+ * their hash was never re-derivable, so there is nothing here to verify.
+ *
+ * Keyless by construction (plain sha256), so a hook holding no manifest key
+ * enforces it exactly as the CLI does.
+ *
+ * @param {string} root repo root
+ * @param {object[]} records valid deny records from `loadDenyRecords`
+ * @returns {string[]} deny reasons, empty when every capture-bound record verifies
+ */
+export function captureBindingFailures(root, records) {
+  const reasons = [];
+  if (!Array.isArray(records)) return reasons;
+  for (const record of records) {
+    if (!record || record.content_kind !== CONTENT_KIND_CAPTURE) continue;
+    if (!isSafeSessionId(record.session_id)) {
+      reasons.push('capture_tamper:unsafe_session_id');
+      continue;
+    }
+    const verified = readVerifiedCapture(root, record.session_id, record.content_hash);
+    if (!verified.ok) {
+      reasons.push(`capture_tamper:${record.session_id}:${verified.error}`);
+    }
+  }
+  return reasons;
 }
 
 /**
@@ -487,6 +544,17 @@ export function evaluateHandoffPreToolUse({
     if (gate.deny) {
       mutationDenied = true;
       for (const r of gate.reasons) reasons.push(r);
+    }
+
+    // Content binding, checked against the filesystem rather than a signature.
+    // Applies to consumed records too: a successor authorized on a capture is
+    // working from content the store still claims to hold, so an edited or
+    // deleted capture invalidates that authorization no matter which side of
+    // the consume it happens on.
+    const captureFailures = captureBindingFailures(root, loadedAfter?.records);
+    if (captureFailures.length > 0) {
+      mutationDenied = true;
+      for (const r of captureFailures) reasons.push(r);
     }
 
     // Diagnostic only, and only once the call is already denied: an operator who

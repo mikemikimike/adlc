@@ -3,26 +3,41 @@
  * handoff — operator/host CLI for context-rot handoff (slice 2).
  * Dispatched as `adlc handoff <subcommand>`.
  *
- * Subcommands: write | resume | bypass | repair | unlock
+ * Subcommands: write | resume | bypass | repair | unlock | continue
  * Mutating `--write` requires ADLC_MANIFEST_KEY (never silent success).
  */
 
-import { existsSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { parseArgs } from '@adlc/core';
-import { ensureDenyMarker, readDenyMarker, normalizeBindField } from '../lib/deny-marker.mjs';
+import { resolveActiveTicketId } from '@adlc/tickets';
+import { readDenyMarker, normalizeBindField } from '../lib/deny-marker.mjs';
 import { consumeDenyRecord } from '../lib/deny-lifecycle.mjs';
 import { normalizeBypassGrant, authorized } from '../lib/mutation-gate.mjs';
-import { writeFinal, readFinal, buildFinal } from '../lib/final.mjs';
+import { writeFinal, readFinal, buildFinal, CONTENT_KIND_CAPTURE } from '../lib/final.mjs';
+import { HANDOFF_MAX_AGE_HOURS } from '../lib/thresholds.mjs';
 import { writeResumeAuth, removeResumeAuth } from '../lib/resume-auth.mjs';
 import { writeBypassGrant, removeBypassGrant } from '../lib/bypass-grant.mjs';
 import { writeDenyRecord, repairDenyBinds, markerUnchanged } from '../lib/deny-persist.mjs';
 import { unlockSession } from '../lib/lock.mjs';
-import { writeJsonAtomic } from '../lib/atomic-json.mjs';
-import { finalPath } from '../lib/paths.mjs';
+import { restoreFinal, rollbackCheckpoint, writeCheckpoint } from '../lib/checkpoint.mjs';
+import { conflictReport, currentBytes, restoreIfOurs } from '../lib/rollback.mjs';
+import { authorizeSuccessor } from '../lib/consume.mjs';
+import { capCaptureBody, hashCaptureBody, writeVerifiedCapture } from '../lib/capture.mjs';
+import { buildBootstrapPrompt, composeBrief } from '../lib/brief.mjs';
+import {
+  finalAssistantMessageFrom,
+  parseTranscript,
+  transcriptTimestamp,
+} from '../lib/transcript-extract.mjs';
+import { evidenceTail, gitState, readTranscriptTail, ticketTitle } from '../lib/continue-inputs.mjs';
+import { recordHandoffEvidence } from '../lib/evidence.mjs';
+import { contentPath, resumeAuthPath } from '../lib/paths.mjs';
 import {
   commonOrExit,
   exitFrom,
   finish,
+  gateFail,
   lockOrExit,
   opError,
   recordOrExit,
@@ -41,6 +56,7 @@ Subcommands:
   bypass    One-shot TTY+key bypass grant (bound or unbound)
   repair    Privileged host bind: update open deny ticket_id+content_hash
   unlock    Reclaim a session lock (dead PID + same host + full field match)
+  continue  Capture the denied session, bind it, and consume for one successor
 
 Common options:
   --dir <path>     ledger directory (default: .adlc). Its final path segment
@@ -60,47 +76,6 @@ ADLC phase: P4 continuity (F3)
 function helpAndExit() {
   console.log(USAGE);
   process.exit(0);
-}
-
-/**
- * Put a final back the way we found it. Evidence is what makes a mutation
- * legible, so a final whose evidence never landed is state nobody can audit.
- * @param {{ ok: boolean, final?: object }} prior — readFinal() from before the write
- */
-function restoreFinal(root, sessionId, prior) {
-  const path = finalPath(root, sessionId);
-  try {
-    if (prior.ok) writeJsonAtomic(path, prior.final);
-    else if (existsSync(path)) unlinkSync(path);
-  } catch {
-    // best-effort: the operator already sees the evidence failure
-  }
-}
-
-/**
- * Point an open deny at the binds of the final we just wrote. `ensureDenyMarker`
- * is idempotent by contract and never rebinds, so a refresh without this leaves
- * the marker on the previous hash and every later resume is refused.
- * @returns {{ ok: true, record: object } | { ok: false, error: string }}
- */
-function rebindOpenDeny(root, sessionId, record, planned) {
-  if (planned.ticket_id != null) {
-    return repairDenyBinds(root, sessionId, {
-      ticketId: planned.ticket_id,
-      contentHash: planned.content_hash,
-      host: planned.host,
-    });
-  }
-  // Still-unbound refresh: repairDenyBinds demands both binds, and an unbound
-  // deny is the stricter state (only an unbound bypass clears it), so persist
-  // the marker directly rather than refusing a legitimate no-ticket refresh.
-  return writeDenyRecord(root, {
-    ...record,
-    ticket_id: null,
-    content_hash: planned.content_hash,
-    host: planned.host,
-    status: 'open',
-  });
 }
 
 function runWrite(argv) {
@@ -174,44 +149,8 @@ Dropping --ticket from a ticket-bound deny, or refreshing a consumed one, exits 
     );
   }
 
-  const priorFinal = readFinal(root, sessionId);
-  const written = writeFinal(root, {
-    sessionId,
-    ticketId: planned.ticket_id,
-    contentHash: planned.content_hash,
-    host: planned.host,
-  });
-  if (!written.ok) opError(`failed to write final: ${written.error}`);
-
-  const deny = ensureDenyMarker(root, {
-    sessionId,
-    ticketId: planned.ticket_id,
-    contentHash: planned.content_hash,
-    host: planned.host,
-  });
-  if (!deny.ok) {
-    restoreFinal(root, sessionId, priorFinal);
-    opError(`failed to ensure deny marker: ${deny.reason}`);
-  }
-
-  // Rebind whatever ensure left in place, so final and marker agree.
-  const marker = readDenyMarker(root, sessionId);
-  if (!marker.ok) {
-    restoreFinal(root, sessionId, priorFinal);
-    opError(`deny marker unreadable after ensure: ${marker.reason}`);
-  }
-  const stale =
-    marker.record.ticket_id !== planned.ticket_id ||
-    marker.record.content_hash !== planned.content_hash;
-  let priorRecord = null;
-  if (stale) {
-    const rebound = rebindOpenDeny(root, sessionId, marker.record, planned);
-    if (!rebound.ok) {
-      restoreFinal(root, sessionId, priorFinal);
-      opError(`failed to rebind deny marker: ${rebound.error}`);
-    }
-    priorRecord = marker.record;
-  }
+  const checkpoint = writeCheckpoint(root, sessionId, planned);
+  if (!checkpoint.ok) opError(checkpoint.error);
 
   const recorded = recordOrExit(
     {
@@ -220,20 +159,15 @@ Dropping --ticket from a ticket-bound deny, or refreshing a consumed one, exits 
       data: {
         session_id: sessionId,
         content_hash: planned.content_hash,
-        deny_reason: deny.reason,
-        rebound: stale,
+        deny_reason: checkpoint.denyReason,
+        rebound: checkpoint.rebound,
       },
       adlcDir,
       key,
     },
     // Un-evidenced state is un-auditable state: undo this run's final and, if we
-    // moved an existing marker's binds, put those back too. A marker created
-    // fresh this run stays — the sentinel already names the session, so deleting
-    // it trades an open deny for an unclearable D3.
-    () => {
-      restoreFinal(root, sessionId, priorFinal);
-      if (priorRecord) writeDenyRecord(root, priorRecord);
-    },
+    // moved an existing marker's binds, put those back too.
+    () => rollbackCheckpoint(root, sessionId, checkpoint),
   );
 
   finish({
@@ -242,11 +176,11 @@ Dropping --ticket from a ticket-bound deny, or refreshing a consumed one, exits 
       tool: 'handoff',
       command: 'write',
       dryRun: false,
-      final: written.final,
-      deny: { ok: true, reason: deny.reason, rebound: stale },
+      final: checkpoint.final,
+      deny: { ok: true, reason: checkpoint.denyReason, rebound: checkpoint.rebound },
       evidence: { gate: 'context-handoff-write', seq: recorded?.seq },
     },
-    human: `handoff write: wrote final+deny for session=${sessionId} content_hash=${written.final.content_hash}`,
+    human: `handoff write: wrote final+deny for session=${sessionId} content_hash=${checkpoint.final.content_hash}`,
   });
 }
 
@@ -401,6 +335,328 @@ exits 2 rather than minting a second verified resume-auth for one deny.
       evidence: { gate: 'context-handoff-resume', seq: recorded?.seq, outcome: 'authorized' },
     },
     human: `handoff resume: consumed deny=${denySessionId} for consumer=${consumerId}`,
+  });
+}
+
+/** Degrade: exit 2 with nothing consumed (spec §Continue). */
+function degrade(message) {
+  gateFail(`handoff continue: ${message}`);
+}
+
+/** The exact command an operator runs to bind an unbound deny (§Host repair). */
+function repairHint(denySessionId) {
+  return `adlc handoff repair --session ${denySessionId} --ticket <id> --content-hash <hash> --write`;
+}
+
+/**
+ * Which ticket governs the continuation.
+ *
+ * An unbound deny degrades rather than being bound here: binding is host
+ * repair's job, and a `continue` that could invent the ticket would let the
+ * pointer decide what a denied session was working on. When the marker IS
+ * bound, CLI → pointer → env may only agree with it — a disagreement means
+ * nobody can say which ticket governs, so it fails closed.
+ *
+ * @returns {{ ok: true, ticketId: string } | { ok: false, error: string }}
+ */
+function resolveContinueTicket({ flag, root, env, record, denySessionId }) {
+  const bound = normalizeBindField(record.ticket_id);
+  if (!bound) {
+    return {
+      ok: false,
+      error:
+        `deny for session=${denySessionId} is unbound (ticket_id is null) — bind it first: ${repairHint(denySessionId)}`,
+    };
+  }
+  const explicit = normalizeBindField(flag);
+  let selected = explicit;
+  if (!selected) {
+    const active = resolveActiveTicketId({ root, env });
+    if (!active.ok) {
+      return { ok: false, error: `active ticket cannot be resolved (${active.code}): ${active.message}` };
+    }
+    selected = active.value ? normalizeBindField(active.value.id) : null;
+  }
+  if (selected && selected !== bound) {
+    return {
+      ok: false,
+      error:
+        `deny for session=${denySessionId} is bound to ticket ${bound} but the active ticket is ${selected} — ` +
+        `pass --ticket ${bound} to continue that work, or re-select the ticket`,
+    };
+  }
+  return { ok: true, ticketId: bound };
+}
+
+/**
+ * Model narrative from a harness transcript, or a degrade.
+ *
+ * Absent `--capture-from` there is simply no narrative — the deterministic
+ * brief stands on its own. Given one, a source that cannot be read or holds no
+ * parseable JSONL is corrupt and degrades; a readable transcript that merely
+ * ends on a tool call is not corrupt, and continues without a narrative.
+ *
+ * A narrative older than the staleness window is dropped rather than embedded:
+ * the spec's `written_at` rule exists because a days-old plan read as current
+ * is worse than no plan. The omission is stated in the brief instead of being
+ * an error — the deterministic half is still worth handing over.
+ *
+ * @returns {{ narrative: string|null, note: string|null }}
+ */
+function narrativeOrDegrade(source, now = Date.now()) {
+  if (source === undefined) return { narrative: null, note: null };
+  if (typeof source !== 'string' || source.trim().length === 0) {
+    degrade('--capture-from needs a transcript path');
+  }
+  const tail = readTranscriptTail(source);
+  if (!tail.ok) degrade(`--capture-from source unreadable (${tail.error}): ${source}`);
+  const parsed = parseTranscript(tail.text);
+  if (parsed.entries.length === 0) {
+    degrade(`--capture-from source holds no parseable transcript lines: ${source}`);
+  }
+  const narrative = finalAssistantMessageFrom(parsed.entries);
+  if (narrative === null) return { narrative: null, note: null };
+
+  // The transcript's own newest timestamp answers "how old is this
+  // CONVERSATION"; the file's mtime only answers "when was this file last
+  // touched", so it is the fallback, not the measure.
+  const stamped = transcriptTimestamp(parsed.entries);
+  const ageHours = (now - (stamped ?? tail.mtimeMs)) / (60 * 60 * 1000);
+  if (ageHours > HANDOFF_MAX_AGE_HOURS) {
+    return {
+      narrative: null,
+      note: `model narrative omitted: source stale (${Math.floor(ageHours)}h > ${HANDOFF_MAX_AGE_HOURS}h)`,
+    };
+  }
+  return { narrative, note: null };
+}
+
+function runContinue(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      'deny-session': { type: 'string' },
+      session: { type: 'string' },
+      'capture-from': { type: 'string' },
+      ticket: { type: 'string' },
+      host: { type: 'string' },
+      dir: { type: 'string' },
+      write: { type: 'boolean', default: false },
+      json: { type: 'boolean', default: false },
+      help: { type: 'boolean', default: false },
+    },
+  });
+  if (values.help) {
+    console.log(`handoff continue --deny-session <old> [--session <new>] [--capture-from <transcript>] [--ticket <id>] [--host <h>] [--dir .adlc] [--write] [--json]
+
+Capture the denied session, bind the final to that capture, and consume the deny
+for ONE successor session — the host-orchestrated recovery from a handoff deny.
+The denier is never un-denied: D2 stays sticky and the work moves to a new session.
+
+The successor id comes from --session or is minted here; it is never taken from
+agent input. --write requires ADLC_MANIFEST_KEY and runs under the denier's lock.
+
+Exit 2 (nothing consumed): unbound deny, consumed deny, missing/corrupt
+--capture-from source, a successor that already holds a resume-auth, or an
+active ticket that disagrees with the deny's bind.
+`);
+    process.exit(0);
+  }
+
+  const denySessionId = requireSafeSession(values['deny-session'], '--deny-session');
+  // Minted here when absent: a successor id supplied by the denied agent would
+  // let it name a session whose resume-auth it can already read.
+  const successorId =
+    values.session === undefined ? randomUUID() : requireSafeSession(values.session, '--session');
+  if (successorId === denySessionId) {
+    degrade('the successor id must differ from the denied session (its deny is sticky)');
+  }
+  const { root, adlcDir, write, json } = commonOrExit(values);
+  const host = values.host ?? 'local';
+
+  // Refuse a successor that is already authorized, before anything is written.
+  // Overwriting would destroy an authorization this run never issued, and this
+  // run's own rollback would then delete it outright. `authorizeSuccessor`
+  // re-checks under the lock; this one keeps a dry run honest about what the
+  // real run would do.
+  if (existsSync(resumeAuthPath(root, successorId))) {
+    degrade(`successor session ${successorId} already holds a resume-auth — successor ids must be fresh`);
+  }
+
+  const marker = readDenyMarker(root, denySessionId);
+  if (!marker.ok || !marker.record) {
+    degrade(`deny marker for session=${denySessionId} unavailable (${marker.reason || 'missing'})`);
+  }
+  if (marker.record.status !== 'open') {
+    degrade(
+      `deny marker for session=${denySessionId} is ${marker.record.status} — a consumed handoff has already moved to its successor`,
+    );
+  }
+
+  const ticket = resolveContinueTicket({
+    flag: values.ticket,
+    root,
+    env: process.env,
+    record: marker.record,
+    denySessionId,
+  });
+  if (!ticket.ok) degrade(ticket.error);
+  const ticketId = ticket.ticketId;
+
+  const narrative = narrativeOrDegrade(values['capture-from']);
+  const git = gitState(root);
+  const body = capCaptureBody(
+    composeBrief({
+      ticketId,
+      ticketTitle: ticketTitle(adlcDir, ticketId),
+      evidenceTail: evidenceTail(adlcDir),
+      gitBranch: git.branch,
+      gitStatus: git.status,
+      // Flail signals reach the brief from a supervisor that observed the
+      // session; this CLI has no build log of its own to analyze.
+      flailSignals: null,
+      modelNarrative: narrative.narrative,
+      narrativeNote: narrative.note,
+    }),
+  ).body;
+  const contentHash = hashCaptureBody(body);
+  // The ids land in the prompt's trusted half, so they are checked, not trusted.
+  const bootstrap = buildBootstrapPrompt({ denySessionId, ticketId, body });
+  if (!bootstrap.ok) degrade(bootstrap.error);
+  const bootstrapPrompt = bootstrap.prompt;
+
+  if (!write) {
+    finish({
+      json,
+      payload: {
+        tool: 'handoff',
+        command: 'continue',
+        dryRun: true,
+        successor_session_id: successorId,
+        ticket_id: ticketId,
+        content_path: contentPath(root, denySessionId),
+        content_hash: contentHash,
+        bootstrap_prompt: bootstrapPrompt,
+      },
+      human: `handoff continue: dry-run deny=${denySessionId} successor=${successorId} ticket=${ticketId} content_hash=${contentHash} (pass --write to persist)`,
+    });
+  }
+
+  const key = requireKeyOrExit();
+
+  // One deny authorizes exactly one successor, and this command rewrites the
+  // denier's capture, final and marker — all of it runs under the denier's lock.
+  lockOrExit(root, denySessionId);
+  const claimed = markerUnchanged(root, denySessionId, marker.record);
+  if (!claimed.ok) exitFrom(claimed);
+
+  const capturePath = contentPath(root, denySessionId);
+  const priorCaptureBytes = currentBytes(capturePath);
+  // Writes and then proves the bytes on disk hash to what everything downstream
+  // will authorize against. Ownership is carried from the write itself — a
+  // disk sample here could adopt a concurrent replacement as ours and let the
+  // rollback below destroy it.
+  const wroteCapture = writeVerifiedCapture(root, denySessionId, body);
+  const wroteCaptureBytes = wroteCapture.ok ? wroteCapture.bytes : null;
+  const rollbackCapture = () =>
+    restoreIfOurs({
+      path: capturePath,
+      wroteBytes: wroteCaptureBytes,
+      priorBytes: priorCaptureBytes,
+      label: 'capture',
+    });
+  if (!wroteCapture.ok) {
+    rollbackCapture();
+    opError(`failed to write capture: ${wroteCapture.error}`);
+  }
+
+  // content_kind: 'capture' is what makes the bind re-derivable — it tells every
+  // later reader that a capture body must exist and hash to content_hash, so an
+  // edited or deleted capture fails closed instead of going unnoticed.
+  const planned = buildFinal({
+    sessionId: denySessionId,
+    ticketId,
+    contentHash,
+    contentKind: CONTENT_KIND_CAPTURE,
+    host,
+  });
+  const checkpoint = writeCheckpoint(root, denySessionId, planned, { expected: marker.record });
+  if (!checkpoint.ok) {
+    rollbackCapture();
+    exitFrom(checkpoint);
+  }
+  // Every undo is a compare-and-swap on the bytes this run wrote. The failure
+  // that triggers a rollback is often a concurrent writer, so restoring a
+  // pre-command snapshot unconditionally would delete the record that just beat
+  // us. The resume-auth is authorizeSuccessor's to own; this only removes what
+  // THIS run minted, so a refused collision cannot delete another run's grant.
+  // The resume-auth is `authorizeSuccessor`'s to undo — it holds the bytes it
+  // created, so its removal is byte-checked the same way these are, and a
+  // caller that also unlinked would be doing it blind.
+  const undoFiles = () => [
+    ...rollbackCheckpoint(root, denySessionId, checkpoint),
+    rollbackCapture(),
+  ];
+  /** Exit reporting both the failure and anything the undo could not reclaim. */
+  const undoAndExit = (result) => {
+    const conflicts = conflictReport([...undoFiles(), result?.authRollback].filter(Boolean));
+    exitFrom({
+      ...result,
+      message: conflicts ? `${result.error || result.message} — ${conflicts}` : result.error || result.message,
+    });
+  };
+
+  const bound = readDenyMarker(root, denySessionId);
+  if (!bound.ok) {
+    undoAndExit({ error: `deny marker unreadable after bind: ${bound.reason}`, exitCode: 1 });
+  }
+
+  const authorized = authorizeSuccessor({
+    root,
+    denySessionId,
+    successorId,
+    ticketId,
+    contentHash,
+    key,
+    expected: bound.record,
+    recordEvidence: () =>
+      recordHandoffEvidence({
+        gate: 'context-handoff-continue',
+        ticket: ticketId,
+        data: {
+          deny_session_id: denySessionId,
+          successor_session_id: successorId,
+          content_hash: contentHash,
+          // Durable before the marker flips, so it attests the authorization,
+          // not the consume — same reading as context-handoff-resume.
+          outcome: 'authorized',
+        },
+        dir: adlcDir,
+        key,
+      }),
+  });
+  if (!authorized.ok) {
+    // An un-evidenced or refused continuation must leave the deny open, no
+    // capture behind, and nothing half-authorized — except where another writer
+    // has since taken ownership of an artifact, which the undo reports instead
+    // of overwriting.
+    undoAndExit(authorized);
+  }
+
+  finish({
+    json,
+    payload: {
+      tool: 'handoff',
+      command: 'continue',
+      dryRun: false,
+      successor_session_id: successorId,
+      ticket_id: ticketId,
+      content_path: wroteCapture.path,
+      content_hash: contentHash,
+      bootstrap_prompt: bootstrapPrompt,
+      evidence: { gate: 'context-handoff-continue', seq: authorized.evidence?.seq },
+    },
+    human: `handoff continue: deny=${denySessionId} consumed for successor=${successorId} ticket=${ticketId} content=${wroteCapture.path}`,
   });
 }
 
@@ -738,11 +994,14 @@ switch (command) {
   case 'unlock':
     runUnlock(rest);
     break;
+  case 'continue':
+    runContinue(rest);
+    break;
   case '--help':
   case '-h':
   case 'help':
     helpAndExit();
     break;
   default:
-    opError(`unknown subcommand "${command}" (expected write|resume|bypass|repair|unlock)`);
+    opError(`unknown subcommand "${command}" (expected write|resume|bypass|repair|unlock|continue)`);
 }
