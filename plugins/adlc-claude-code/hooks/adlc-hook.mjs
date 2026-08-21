@@ -9,6 +9,7 @@
 //   rails      (PreToolUse)     → block edits to frozen rail paths        [ENFORCING]
 //   buildgate  (PreToolUse)     → fitness-to-build gate (issue #48)        [ENFORCING]
 //   handoff    (PreToolUse)     → context-rot deny/handoff (D1–D3)         [ENFORCING]
+//   handoffstart (SessionStart) → continuation context / operator one-liner [advisory]
 //
 // CONTRACT: preflight/flail/manifest must NEVER block and stay SILENT unless
 // there is something to flag. `rails`, `buildgate`, and `handoff` are the
@@ -74,6 +75,7 @@ import {
   formatRecoveryCommand,
   formatNoSessionIdMessage,
   readVerifiedBypassGrant,
+  CAPTURE_INSTRUCTION,
 } from './handoff-gate.mjs';
 
 const MODE = process.argv[2];
@@ -320,6 +322,7 @@ async function main() {
   if (MODE === 'rails') return rails(input);
   if (MODE === 'buildgate') return buildgate(input);
   if (MODE === 'handoff') return await handoff(input);
+  if (MODE === 'handoffstart') return await handoffStart(input);
   // unknown mode → no-op
 }
 
@@ -2322,8 +2325,164 @@ async function handoff(input) {
 
   return denyHandoff(
     `mutation denied (${result.reasons.join(', ')}). Resume via host \`adlc handoff resume\` / repair, ` +
-      `or continue in a fresh session. Agent Shell cannot clear deny-set.\n\n${recoveryDiagnostic(sessionId)}`
+      `or continue in a fresh session. Agent Shell cannot clear deny-set.\n\n` +
+      `${CAPTURE_INSTRUCTION}\n\n${recoveryDiagnostic(sessionId)}`
   );
+}
+
+/**
+ * Set by `adlc handoff supervise` on every harness child it spawns (twin of the
+ * package's `SUPERVISOR_ENV_MARKER`, lib/supervise.mjs; pinned by
+ * adapter-test/cc-helper-drift.test.mjs).
+ *
+ * Read for SUPPRESSION only. Under the wrapper the successor already receives
+ * the capture as its bootstrap prompt, so injecting it again here would hand
+ * the model the same handoff twice. A forged value costs an operator one
+ * advisory injection and can never clear, weaken, or grant anything — which is
+ * why an unverified environment variable is enough for this decision and would
+ * not be for any other in this file.
+ */
+const SUPERVISOR_ENV_MARKER = 'ADLC_HANDOFF_SUPERVISED';
+
+/**
+ * The open deny an operator most likely needs to act on.
+ *
+ * `since` is an ISO timestamp written by `ensureDenyMarker`. A record whose
+ * timestamp is missing or unparseable still counts as a candidate — it is an
+ * open deny either way — it just sorts oldest, because an unknown time is not
+ * evidence of being recent.
+ *
+ * @param {unknown[]} records
+ * @returns {object|null}
+ */
+export function newestOpenDeny(records) {
+  if (!Array.isArray(records)) return null;
+  let best = null;
+  let bestAt = -Infinity;
+  for (const record of records) {
+    if (!record || typeof record !== 'object' || record.status !== 'open') continue;
+    const at = Date.parse(record.since);
+    const rank = Number.isFinite(at) ? at : -Infinity;
+    if (best === null || rank > bestAt) {
+      best = record;
+      bestAt = rank;
+    }
+  }
+  return best;
+}
+
+/**
+ * SessionStart continuation notice — the keyless, near-automatic half of the
+ * handoff continuation (spec §Continue, §Supervised-only auto-consume).
+ *
+ * ADVISORY, and keyless by construction. Two branches:
+ *
+ *   (a) This session already holds a resume-auth — a host (`handoff continue`,
+ *       usually driven by `handoff supervise`) consumed a deny FOR it. The
+ *       capture it was authorized against is injected as context, re-verified
+ *       against the bytes on disk first. Note the condition is the resume-auth
+ *       alone, NOT an open deny: a completed continuation leaves the denier's
+ *       record `consumed`, so gating this on an open deny would skip exactly
+ *       the successor it exists for.
+ *
+ *   (b) There is no auth for this session but the store holds open denies —
+ *       this session cannot mutate anything until an operator continues one.
+ *       It gets the exact command, and nothing else happens.
+ *
+ * What this NEVER does is consume. Hooks are key-scrubbed (see
+ * `scrubHandoffSecrets`), consume requires the manifest key to sign a
+ * resume-auth, and the spec's supervised-only rule exists precisely so a fresh
+ * session cannot authorize itself out of somebody else's deny. Reading a
+ * capture is not a mutation and needs no key: `readVerifiedCapture` re-derives
+ * a plain sha256, so an edited capture fails here exactly as it does in the
+ * mutation gate.
+ */
+async function handoffStart(input) {
+  if (!existsSync('.adlc')) return; // not an ADLC repo → silent
+  const sessionId = resolveSessionId(input, { isSafeSessionId });
+
+  // This path never reads ADLC_MANIFEST_KEY — but it does import a
+  // project-resolved package below, and an operator's shell holds the key at
+  // session start, so the scrub still has to happen first.
+  scrubHandoffSecrets();
+
+  const api = await loadContextHandoff({ projectRoot: process.cwd() });
+  // Advisory: an unresolvable or stale package means no notice, never a block.
+  if (!api || typeof api.loadDenyRecords !== 'function') return;
+
+  const root = process.cwd();
+  const eventName =
+    typeof input?.hook_event_name === 'string' && input.hook_event_name
+      ? input.hook_event_name
+      : 'SessionStart';
+
+  // (a) — a resume-auth document names THIS session.
+  //
+  // TRUST BOUNDARY (ruled 2026-08-20). This branch is ADVISORY CONTEXT
+  // SURFACING, not an authorization decision, and it must never present itself
+  // as one. The hook scrubs ADLC_MANIFEST_KEY before it imports anything (see
+  // `scrubHandoffSecrets`), so it structurally CANNOT verify the resume-auth's
+  // HMAC — that seam is deliberately closed, and re-opening it to make this
+  // check "real" would hand the manifest trust anchor to project-resolved code.
+  //
+  // What still holds without a key: `readVerifiedCapture` re-derives the
+  // capture's sha256 from disk, so altered or missing content is refused here
+  // exactly as it is in the mutation gate, and `buildBootstrapPrompt` fences the
+  // body so a previous session's words cannot read as instructions. What does
+  // NOT hold: that this session is an authorized continuation. Enforcement of
+  // that lives where a key exists — the supervised wrapper, the mutation gate's
+  // own capture-hash re-derivation on every mutation, and CI. The message below
+  // says so rather than asserting a continuation this code cannot establish.
+  const auth =
+    sessionId && typeof api.readResumeAuth === 'function' ? api.readResumeAuth(root, sessionId) : null;
+  if (auth && typeof api.readVerifiedCapture === 'function') {
+    if (process.env[SUPERVISOR_ENV_MARKER] === '1') return; // wrapper already injected it
+    if (typeof api.isSafeSessionId !== 'function' || !api.isSafeSessionId(auth.deny_session_id)) return;
+    let capture;
+    try {
+      capture = api.readVerifiedCapture(root, auth.deny_session_id, auth.content_hash);
+    } catch {
+      return; // a capture that cannot be read is a capture that is not injected
+    }
+    if (!capture?.ok || typeof api.buildBootstrapPrompt !== 'function') return;
+    // The package's own composition — preamble, fences, and the closing
+    // reminder that everything between them is data. Rebuilding it here would
+    // be a second copy of the one text whose job is to keep a previous
+    // session's words from reading as instructions.
+    const built = api.buildBootstrapPrompt({
+      denySessionId: auth.deny_session_id,
+      ticketId: auth.ticket_id,
+      body: capture.body,
+      // The MODEL-facing half of the same honesty the systemMessage carries.
+      // The assertive composition tells the reader "this is the continuation,
+      // continue the work" — true when a host with the key composed it, and a
+      // claim this hook cannot make. Passing the hedge is what keeps the two
+      // audiences (operator and model) being told the same thing.
+      verified: false,
+    });
+    if (!built?.ok) return;
+    emit({
+      hookSpecificOutput: { hookEventName: eventName, additionalContext: built.prompt },
+      systemMessage:
+        `ADLC context-handoff: surfacing an UNVERIFIED handoff capture from session ${auth.deny_session_id} ` +
+        `(ticket ${auth.ticket_id}) as context. This hook is keyless by design and cannot verify the ` +
+        'resume-auth signature, so nothing here establishes that this session may continue that work — ' +
+        'that is decided by `adlc handoff supervise` or a host holding the manifest key.',
+    });
+    return;
+  }
+
+  // (b) — no auth for this session; name the deny that is blocking mutations.
+  const loaded = api.loadDenyRecords(root);
+  const newest = newestOpenDeny(loaded?.records);
+  if (!newest) return;
+  const command =
+    typeof api.formatContinueCommand === 'function' ? api.formatContinueCommand(newest.session_id) : null;
+  const msg =
+    'ADLC context-handoff: an open handoff deny is blocking mutations in this repo. This session cannot ' +
+    'clear it — a host must continue the denied session, which consumes the deny for ONE successor. Run:\n  ' +
+    (command ?? 'ADLC_MANIFEST_KEY=… adlc handoff continue --deny-session <id> --write   (read <id> from .adlc/handoffs/denies/)');
+  emit({ hookSpecificOutput: { hookEventName: eventName, additionalContext: msg }, systemMessage: msg });
 }
 
 /**

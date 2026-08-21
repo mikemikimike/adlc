@@ -31,6 +31,8 @@ import {
   writeBypassGrant,
   bypassGrantPath,
   BYPASS_GRANT_SCHEMA,
+  CAPTURE_INSTRUCTION as canonicalCaptureInstruction,
+  buildBootstrapPrompt,
 } from '@adlc/context-handoff';
 import { canonicalJson } from '@adlc/core';
 import { createHmac } from 'node:crypto';
@@ -45,9 +47,12 @@ const CC_HANDOFF_GATE = join(
   'handoff-gate.mjs',
 );
 
+const CC_HOOK = join(REPO_ROOT, 'plugins', 'adlc-claude-code', 'hooks', 'adlc-hook.mjs');
+
 const {
   resolveSessionId: ccResolveSessionId,
   isProtectedHandoffPath: ccIsProtectedHandoffPath,
+  CAPTURE_INSTRUCTION: ccCaptureInstruction,
   readVerifiedBypassGrant: ccReadVerifiedBypassGrant,
   isBareInspectionPwd: ccIsBareInspectionPwd,
   matchRecoveryCommand: ccMatchRecoveryCommand,
@@ -87,6 +92,16 @@ const PATH_CASES = [
   '.adlc/handoffs/denies/sess-a.json',
   './.adlc/handoffs/denies/sess-a.json',
   '.adlc/handoffs/x/../denies/sess-a.json',
+  // Capture bodies. The fixed list above predates `.adlc/handoffs/content/**`,
+  // so the CC copy went on returning false for every one of these while the
+  // canonical returned true and this test still passed — the exact drift it
+  // exists to catch, invisible because no case named the directory.
+  '.adlc/handoffs/content',
+  '.adlc/handoffs/content/sess-a.md',
+  './.adlc/handoffs/content/sess-a.md',
+  '.adlc/handoffs/x/../content/sess-a.md',
+  '.adlc\\handoffs\\content\\sess-a.md',
+  '.adlc/handoffs/content-other/sess-a.md',
   '.adlc/handoffs/sess-a.resume-auth.json',
   '.adlc/handoffs/sess-a.model-ok',
   '.adlc/handoffs/sess-a.lock',
@@ -118,6 +133,64 @@ test('the CC path guard agrees with isProtectedHandoffPath', () => {
     );
   }
 });
+
+test('the path drift cases straddle the verdict boundary', () => {
+  // Same guard as the grant table below: two twins that both returned a
+  // constant would agree on every case above and prove nothing.
+  const verdicts = PATH_CASES.map((p) => canonicalIsProtectedHandoffPath(p));
+  assert.ok(verdicts.includes(true), 'no case is protected');
+  assert.ok(verdicts.includes(false), 'no case is unprotected');
+  assert.equal(canonicalIsProtectedHandoffPath('.adlc/handoffs/content/sess-a.md'), true);
+  assert.equal(canonicalIsProtectedHandoffPath('.adlc/handoffs/content-other/sess-a.md'), false);
+});
+
+test('the keyless hedge the CC hook depends on is part of the prompt contract', () => {
+  // The hook capability-checks that `buildBootstrapPrompt` EXISTS, but its
+  // honesty guarantee rests on the resolved package HONORING `verified`. A copy
+  // that silently ignored the option would emit the assertive "continue the
+  // work" text from a keyless hook — the exact false claim the trust-boundary
+  // ruling removed — and every capability check would still pass.
+  const inputs = { denySessionId: 'sess-a', ticketId: 'T-1', body: 'BODY' };
+  const hedged = buildBootstrapPrompt({ ...inputs, verified: false });
+  const assertive = buildBootstrapPrompt(inputs);
+
+  assert.equal(hedged.ok, true);
+  assert.equal(assertive.ok, true);
+  assert.match(hedged.prompt, /NOT VERIFIED/);
+  assert.match(hedged.prompt, /not cryptographically verified by this keyless hook/);
+  assert.match(hedged.prompt, /^Possible continuation of session sess-a/);
+
+  // The supervised form keeps the claim it has earned.
+  assert.doesNotMatch(assertive.prompt, /NOT VERIFIED/);
+  assert.match(assertive.prompt, /^Continuation of session sess-a/);
+
+  // The single assertion that catches an option-ignoring package.
+  assert.notEqual(
+    hedged.prompt,
+    assertive.prompt,
+    'a package that ignores `verified` returns identical text and the keyless hook then lies',
+  );
+  // Both forms keep the fence — one composition, so it cannot drift.
+  for (const built of [hedged, assertive]) {
+    assert.ok(built.prompt.includes('<<<UNTRUSTED-CAPTURE-DATA'));
+    assert.ok(built.prompt.includes('END-UNTRUSTED>>>'));
+  }
+
+  // And the hook must actually ask for the hedged form.
+  assert.match(
+    readFileSync(CC_HOOK, 'utf8'),
+    /verified: false/,
+    'the SessionStart hook must pass the hedge flag',
+  );
+});
+
+test('the CC deny message carries the canonical capture instruction', () => {
+  // The hook keeps its own copy so a project-resolved package cannot delete the
+  // one sentence that makes a denied session's final message worth capturing.
+  assert.equal(ccCaptureInstruction, canonicalCaptureInstruction);
+  assert.match(ccCaptureInstruction, /handoff summary/);
+});
+
 
 test('the CC bare-pwd exception agrees with isBareInspectionPwd', () => {
   for (const cmd of ['pwd', 'pwd -L', ' pwd', 'pwd ', 'pwd; ls', '', null, undefined]) {

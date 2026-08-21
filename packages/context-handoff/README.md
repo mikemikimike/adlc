@@ -12,6 +12,7 @@ adlc handoff bypass --session <id> [--unbound-reason <text>] [--write]
 adlc handoff repair --session <id> --ticket <id> --content-hash <h> [--write]
 adlc handoff unlock --session <id> --pid <n> --started-at <iso> --host <h> --nonce <n> [--write]
 adlc handoff continue --deny-session <denier> [--session <new>] [--capture-from <transcript>] [--write]
+adlc handoff supervise [--dir .adlc] -- <command> [args...]
 ```
 
 Mutating `--write` requires `ADLC_MANIFEST_KEY` (never silent success).
@@ -80,6 +81,13 @@ fail closed with no body. Supervisors and session-start injectors must go
 through it rather than reading the file — a signature proves the hash was
 authorized, never that the file still matches it.
 
+A **keyless** injector (a harness hook, which scrubs the manifest key before it
+imports anything) gets the content bind from this function and nothing more: it
+cannot verify the resume-auth's HMAC, so it must surface a capture as advisory
+context and say so, never as proof that the reading session is an authorized
+continuation. Authorization is decided where a key exists — the supervisor, and
+the mutation gate that re-derives the same hash on every mutation.
+
 ```js
 import { readVerifiedCapture } from '@adlc/context-handoff/lib/capture.mjs';
 
@@ -114,6 +122,67 @@ session's own words — so each section is wrapped in `<<<UNTRUSTED-CAPTURE-DATA
 / `END-UNTRUSTED>>>` markers, with those delimiters stripped from the content so
 the fence cannot be closed from inside. `bootstrap_prompt` repeats, before and
 after the body, that fenced content is recorded data rather than instructions.
+
+## Supervision
+
+`supervise` is the zero-touch path: it wraps a harness command, and when that
+session hits a handoff deny it performs the whole recovery the operator would
+otherwise perform by hand.
+
+```sh
+ADLC_MANIFEST_KEY=$KEY adlc handoff supervise -- claude --model opus
+```
+
+It mints the first session id, polls that session's deny marker (~2 s; `fs.watch`
+is not trusted), waits for the transcript to stop growing (5 s of stability, or
+the child exiting) so the handoff summary is captured whole, runs
+`handoff continue --write`, terminates the superseded child (SIGTERM, then
+SIGKILL after 10 s), and respawns the harness with the successor id and the
+bootstrap prompt. Successor ids come from `continue`, never from the wrapper.
+
+**The key stays with the supervisor.** `ADLC_MANIFEST_KEY` is required up front
+and reaches only the continue step; `superviseChildEnv` strips it — along with
+`ADLC_ADMIN_KEY` — from every harness child.
+
+**Contract item 24.** Every spawn also drops `CLAUDECODE`,
+`CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID` and
+`CLAUDE_CODE_ENTRYPOINT`. A `claude` process that inherits them treats itself as
+a nested child and silently stops writing its transcript — no error, no warning,
+just a continuation with nothing to capture. The scrub is applied per spawn, not
+once at startup.
+
+**Degrade hands the session back.** An unbound deny, a corrupt transcript, a
+payload that cannot be trusted, or a capture that no longer matches its
+`content_hash` all stop the loop with exit 2, a single warning, and the
+copy-pasteable `handoff continue` one-liner. The child is left running and
+nothing is consumed — a degrade is a decision for the operator, and killing
+their session first would take it away from them.
+
+**A failing harness is a failing supervisor.** The wrapper is what a script
+waits on, so it never reports its own success for a session that failed: exit 3
+when the supervised command exits non-zero or is killed, exit 4 when it could
+not be started at all. The harness's own code is carried in the message and the
+JSON payload rather than passed through, because 1 and 2 already mean something
+about the supervision itself. A clean exit and an operator's Ctrl-C are both 0.
+
+**A crashed intermediate is reported, not failed.** A session that writes its
+deny and then dies on its own — non-zero, or a signal the supervisor never sends
+— still hands off: the deny already said it was being replaced, and the
+supervisor terminates it on the ordinary path anyway, so failing the run would
+fail every successful handoff. It is named on stderr and carried in the JSON as
+`abnormalExits`, because a handoff written by a session that crashed came from
+different circumstances than one that stopped when asked.
+
+**A missing transcript is not a failed continuation.** The narrative is optional
+— the deterministic brief still carries ticket, evidence and git state — so a
+session that dies before its transcript appears is continued without one rather
+than degraded. It is reported loudly all the same, because a missing transcript
+is what the item-24 environment scrub failing looks like from the outside.
+
+**The capture is re-verified at the injection point.** The mutation gate already
+re-derives the hash on every evaluation, but that defends mutation; the bootstrap
+prompt is read by a model before it touches a tool, so the supervisor calls
+`readVerifiedCapture` again before spawning the successor.
 
 ```js
 import { WARN_PCT, HANDOFF_PCT, HARD_PCT } from '@adlc/context-handoff/lib/thresholds.mjs';
