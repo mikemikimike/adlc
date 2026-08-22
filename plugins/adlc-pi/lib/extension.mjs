@@ -32,7 +32,13 @@ import { recordGateEvent } from './evidence.mjs';
 import { parseAddedLines } from '@adlc/rails-guard/lib/suppressions.mjs';
 import { appendToSystemPrompt, buildTicketDoctrine, buildErrorDoctrine } from './doctrine.mjs';
 import { createFitnessTracker, checkBuildGate } from './build-gate.mjs';
-import { checkHandoff, resolvePiSessionId, createStickyDenyState } from './handoff-gate.mjs';
+import {
+  checkHandoff,
+  resolveAdlcRoot,
+  resolvePiSessionId,
+  sharedAdlcRootState,
+  createStickyDenyState,
+} from './handoff-gate.mjs';
 import { createFlailTracker } from './flail.mjs';
 import { registerCommands } from './commands.mjs';
 import { renderWidgetLines } from './widget.mjs';
@@ -66,6 +72,10 @@ export function createExtension({ env = process.env } = {}) {
     // Per-session D1 memory: a FAILED deny-marker write must stay sticky after
     // the band cools, and only an in-process caller can carry that fact.
     const handoffSticky = createStickyDenyState();
+    // Opting in is remembered per root, process-wide: removing `.adlc` must not
+    // turn the handoff gate off for a repo already under it, and a reload of
+    // this extension must not forget that it was.
+    const handoffAdlcRoots = sharedAdlcRootState();
     // Most recent gate event, summarized for the live widget (line 3).
     let lastGateEvent = null;
     // TUI-only message renderers, isolated so this module stays loadable under
@@ -271,6 +281,16 @@ export function createExtension({ env = process.env } = {}) {
       // when the host offers none, so D2 still has a stable process identity.
       handoffSessionId = resolvePiSessionId(_event, ctx, { mint: () => handoffSessionId ?? '' });
       reload(ctx.cwd);
+      // Arm the opt-in memory HERE, before any tool call, so the enclosing
+      // repo is remembered from the first gated call onward. The checkout
+      // boundary is a filesystem shape an agent can construct; the memory is
+      // not, and arming it at session start is what leaves no window where a
+      // freshly forged `<cwd>/.git` is the only signal in play.
+      const armedRoot = resolveAdlcRoot(
+        activeCwd,
+        env.ADLC_TICKET_STORE ?? env.ADLC_TICKETS ?? null,
+      );
+      if (armedRoot !== null) handoffAdlcRoots.record(armedRoot);
       fitness.reset();
       flail.reset();
       unvettedSeen.clear();
@@ -347,6 +367,8 @@ export function createExtension({ env = process.env } = {}) {
         root: activeCwd,
         manifestKey,
         sticky: handoffSticky,
+        adlcRoots: handoffAdlcRoots,
+        storeOverride: env.ADLC_TICKET_STORE ?? env.ADLC_TICKETS ?? null,
       });
       if (handoff.decision === 'deny') {
         ctx.ui.notify(`Blocked ${event.toolName}: ${handoff.reason}`, 'error');

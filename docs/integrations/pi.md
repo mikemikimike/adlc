@@ -19,6 +19,7 @@ Nothing below is claimed shipped unless it has a runtime caller in
 | Live deny proof in CI (`scripts/pi-live-deny.mjs`, scripted stub provider, real `pi --mode rpc`) | **Shipped** — required-job step on the Node 22 leg |
 | Build-gate + flail backstops (§Phase 2) | **Shipped** — degraded high-risk builds denied w/o audited override; flail advisories |
 | Evidence rail + custom-tool coverage (§Phase 2) | **Shipped** — `.adlc/`/`.omo/` stay writable; non-core file-write tools are rail-checked |
+| Context-rot handoff deny on live context fill (§3.5) | **Shipped** — pi's real `getContextUsage().percent` drives the bands; contained to repos that installed ADLC |
 | Command suite + scaffolder + footer widget (§Phase 3) | **Shipped** — `/ticket`, `/adlc-ticket`, `/adlc-init`, `/adlc-approve-spec`, `/adlc-accept`, `/adlc-rollback`, prompt templates, ticket/verdict widget |
 | Native `adlc_prosecute` tool: deterministic P5 loop (§4) | **Shipped** — in-session fan-out → verify → loop-until-dry over write-disabled children; live proof `scripts/pi-live-prosecute.mjs` (required, Node 22 leg) |
 | `TICKET-DONE` completion listener → prosecution nudge (§4) | **Shipped** |
@@ -91,6 +92,94 @@ The active ticket is displayed directly in the Pi footer bar using:
 ctx.ui.setStatus("adlc-ticket", `🎟️ Ticket: ${activeTicketId}`);
 ```
 This gives the human constant visibility into the active enforcement context.
+
+### 3.5 Context-Rot Handoff Deny (F3)
+
+pi is the first adapter with a **real** context-fill signal rather than a transcript-size
+proxy: `ctx.getContextUsage().percent` is a live 0–100 reading of the window. The handoff
+gate feeds it to the shared bands in `@adlc/context-handoff` — **50%** warns, **60%** is the
+handoff band, **80%** is hard-degraded. Past the handoff band the session loses `write`,
+`edit`, `bash`, and any third-party tool that can mutate; reads stay open, so the session
+can still explain itself while it is handed off.
+
+Because pi is an *enforcing* tier, this is a deny and not an advisory. Two scoping choices
+follow from what a deny actually means:
+
+- **Not ticket-scoped.** An open deny record is a fact about session trust, so it holds with
+  no active ticket — the one gate here that survives the no-ticket early return.
+- **Not session-scoped.** The record is written to `.adlc/handoffs/denies/` and read back
+  from disk, so it reaches later sessions in the repo too, and an open record denies every
+  session, not only the one that tripped the band.
+
+**Containment.** A **ticket store** is the opt-in — `.adlc/tickets.json`, `.adlc/tickets/`,
+or whatever `ADLC_TICKET_STORE`/`ADLC_TICKETS` names — which is exactly the predicate
+`resolveRailsInForce` keys on. The gate returns allow, writing nothing, wherever there is no
+store, at any fill percent.
+
+Not the presence of `.adlc/`, and this distinction is what completes the fix rather than
+half-making it: the bug littered ordinary directories with `.adlc/.deny-store` and deny
+markers, so a bare-directory test lets the bug's own artifacts vouch for the gate that
+created them and a repo already hit stays bricked. Nor the store AND a local `.adlc/` —
+an absolute `ADLC_TICKET_STORE` is honoured by the rail guard with no local directory, so
+ANDing one on would leave rails enforcing while the deny-set silently stood down. Without that guard the band alone
+denied mutations in whatever directory the agent happened to open, created `.adlc` state
+there, and (the deny store being durable) followed that directory into every later session.
+
+The test is whether the cwd is *inside* an ADLC repo, not whether it *is* one. The gate
+resolves the **outermost** `.adlc` in the checkout and uses that root for containment, the
+deny store, protected-path checks and the printed recovery command alike — one answer, so a
+session in `<repo>/src` cannot read a different store than the one denying it. An
+exact-match check let exactly that happen, and wrote band markers into a stray
+`<repo>/src/.adlc` no operator would think to clear.
+
+Outermost rather than nearest is a security choice: with nearest-match, an agent below the
+band could `mkdir src/.adlc` and have every later call resolve to that empty store, stepping
+around the repo's open deny (measured — deny became allow). The cost is that a nested `.adlc`
+with no `.git` of its own no longer keeps a separate deny store; it answers to the enclosing
+repo. One checkout, one ADLC root.
+
+The `.git` boundary that survives this is honoured only when nothing above it is a real ADLC
+repo — a git checkout that also holds a ticket store. That condition is the tiebreaker
+between two requirements no filesystem test can satisfy at once: a `.git` an agent can create
+must not release an enclosing repo, while a store above an unrelated checkout (a stray
+`~/.adlc/tickets.json`) must not capture it. An enclosing git+store ancestor separates the
+cases, since a home directory is not a checkout. So inside a real ADLC repo the boundary
+never releases enforcement — cold, with no remembered root, however convincing the forgery —
+and the cost is that a vendored checkout there answers to the enclosing store rather than
+keeping its own.
+
+Containment must not become an off switch, so the opt-in is **monotonic** per process: a
+root seen with `.adlc` stays enforced even if the directory is later removed. A custom tool
+whose target the extractor cannot see is not rail-checked while the store is cold, so a
+plain presence check would have let an agent below the band delete `.adlc` and walk past
+every later deny — including one it had already tripped. The memory is keyed by root, so
+remembering one repo never arms another.
+
+**Recovery.** The deny message carries the session id and the recovery command by absolute
+path, pinned to the denied repo with `--dir` (the CLI otherwise resolves `.adlc` from the
+operator's own cwd, writes the grant there and exits 0 regardless). When the deny belongs to
+another session the command carries `--unbound-reason`: a band-generated marker is unbound —
+`ticket_id` and `content_hash` are both null — and a bound grant only authorizes an unbound
+record of its own session, so against a foreign one it is consumed and the caller stays
+denied. The grant is one-shot either way, and it is spent by the next *gated tool call* rather than the
+next mutation — pi gates every tool but a read, so a `bash pwd` consumes it. The message says so
+rather than presenting it as a clear. A store-integrity deny (`D0:deny_store_unavailable`,
+`D3:invalid_record:<label>`) also takes the unbound form: measured, unbound lifts it and bound
+does not, so the message offers the grant that works and names the durable store repair beside
+it. `resume` / `continue` are
+the durable keyed flows.
+
+When no `ADLC_MANIFEST_KEY` is configured — which every mutating verb but one requires —
+the message instead names the keyless path, which is also the only durable clear:
+`rm -rf <repo>/.adlc/handoffs <repo>/.adlc/.deny-store` from a host shell, printed with the
+paths already resolved because `.adlc` may itself be a symlink to an external store and a
+relative `rm` would follow it silently. The whole tree, and no glob — clearing one marker while another remains leaves the repo just as locked, since
+any open marker denies every session; a sentinel makes an emptied `denies/` read as
+tampered-with; the legacy `.adlc/handoffs/.deny-store` re-creates the canonical one on the
+next read, so a recipe that omits it never terminates; and a glob inside `denies/` expands
+through a symlink, so an agent that repoints that directory has the operator delete files
+outside the repo. `adlc handoff unlock` is the one
+keyless mutating verb, but it reclaims a session *lock* rather than a deny.
 
 ---
 
