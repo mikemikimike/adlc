@@ -299,12 +299,189 @@ function signManifestEntry(key, entry) {
   return createHmac('sha256', key).update(JSON.stringify(canonical)).digest('hex');
 }
 
+/**
+ * A multi-entry ledger, written as a real hash chain. `specs` is one object per
+ * entry: `{ storeHash?, sign?, forgeSig? }`. `sign: false` writes an entry with
+ * no `sig` field at all (an honest pre-signing entry); `forgeSig` writes a `sig`
+ * that will not verify (tampering). Chain links are computed the way the ledger
+ * writer computes them, so these fixtures are indistinguishable from real ones.
+ */
+function writeChainedManifest(root, key, specs) {
+  let prev = null;
+  const lines = specs.map((spec, i) => {
+    const entry = {
+      seq: i + 1,
+      gate: 'ticket-complete',
+      ts: `2026-01-0${i + 1}T00:00:00.000Z`,
+      data: spec.storeHash ? { storeHash: spec.storeHash, bindingScope: 'store' } : {},
+      files: {},
+      prev,
+    };
+    if (spec.noData) delete entry.data;
+    if (spec.rawSig !== undefined) entry.sig = spec.rawSig;
+    else if (spec.forgeSig) entry.sig = 'a'.repeat(64);
+    else if (spec.sign !== false) entry.sig = signManifestEntry(key, entry);
+    const line = JSON.stringify(entry);
+    prev = createHash('sha256').update(line).digest('hex');
+    return line;
+  });
+  writeFileSync(join(root, '.adlc', 'manifest.jsonl'), `${lines.join('\n')}\n`);
+  return lines;
+}
+
 function writeSignedManifest(root, key, { storeHash }) {
   const entry = { seq: 1, gate: 'ticket-complete', ts: '2026-01-01T00:00:00.000Z', data: { storeHash, bindingScope: 'store' }, files: {}, prev: null };
   entry.sig = signManifestEntry(key, entry);
   writeFileSync(join(root, '.adlc', 'manifest.jsonl'), `${JSON.stringify(entry)}\n`);
   return entry;
 }
+
+// ---------------------------------------------------------------------------
+// An HONEST legacy prefix: entries written before HMAC signing was enabled carry
+// no `sig` at all. This repo's own ledger has 95 such entries (2026-07-23..26)
+// before its first signed entry, so a blanket "with a key, every entry must be
+// signed" rule made a shipped diagnostic permanently red on honest history.
+//
+// The rule is `seenSignedEntry`, already implemented by gate-manifest's verify.mjs
+// and by chainIsIntact in this package's own manifest-segments.mjs: tolerate a
+// MISSING signature only on the contiguous prefix before this chain's first valid
+// signature, and never tolerate a PRESENT-but-invalid one.
+// ---------------------------------------------------------------------------
+
+test('doctor storehash-manifest-bind: an honest unsigned legacy prefix followed by signed entries verifies', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    const live = store.load().hash;
+    // entry 1 predates signing; entry 2 is signed and carries the checkpoint
+    writeChainedManifest(root, 'test-signing-key', [
+      { sign: false },
+      { sign: true, storeHash: live },
+    ]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(check.ok, true, 'an honest legacy prefix does not fail the check');
+    assert.equal(check.boundStoreHash, live, 'and the signed entry supplies the checkpoint');
+    assert.notEqual(check.drift, true, 'the bound hash matches the live store');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: an unsigned entry AFTER a signed one is still rejected', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // the regression this tolerance must not introduce: an attacker who controls
+    // the tail of a signed chain regressing it to unsigned by appending.
+    writeChainedManifest(root, 'test-signing-key', [
+      { sign: true },
+      { sign: false, storeHash: store.load().hash },
+    ]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(check.ok, false, 'signing cannot be regressed once it has begun');
+    assert.equal(check.code, 'MANIFEST_SIGNATURE_INVALID');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: a PRESENT-but-invalid signature inside the prefix is still rejected', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // leniency means "an honest unsigned prefix is OK", never "tampered
+    // signatures are OK" — a sig that does not verify is tampering at any position.
+    writeChainedManifest(root, 'test-signing-key', [
+      { forgeSig: true },
+      { sign: true, storeHash: store.load().hash },
+    ]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(check.ok, false, 'a bad signature is tampering, not legacy');
+    assert.equal(check.code, 'MANIFEST_SIGNATURE_INVALID');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: an UNSIGNED entry may not supply the bound checkpoint when a key is set', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    const live = store.load().hash;
+    // The whole ledger predates signing. Tolerating the prefix must not promote an
+    // unverifiable checkpoint into an "authenticated" binding — that would convert
+    // this fix's false-RED into a false-GREEN.
+    writeChainedManifest(root, 'test-signing-key', [{ sign: false, storeHash: live }]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    // Tolerated as a chain — an all-unsigned ledger is indistinguishable from one
+    // that honestly predates signing, so calling it tamper would be a false
+    // accusation (verify.mjs documents the same HONEST LIMIT).
+    assert.equal(check.ok, true, 'an all-legacy chain is not adjudicated as tampering');
+    // ...but never promoted to a binding, which is the half that must not regress.
+    assert.notEqual(check.bound, true, 'an unsigned checkpoint is not a binding');
+    assert.notEqual(check.authenticated, true, 'and authentication is never claimed over it');
+    assert.notEqual(check.boundStoreHash, live, 'the unsigned storeHash is not adopted');
+    assert.match(check.reason ?? '', /sign/i, 'and the reason names why it could not bind');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: a one-character signature is tampering, not a legacy entry', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // A `sig` of ANY non-zero length is a present signature and must verify.
+    // Treating a short one as "absent" would let a forger opt back into the
+    // legacy-prefix tolerance simply by truncating the field.
+    writeChainedManifest(root, 'test-signing-key', [
+      { rawSig: 'a' },
+      { sign: true, storeHash: store.load().hash },
+    ]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(check.ok, false, 'a present-but-unverifiable sig is rejected however short');
+    assert.equal(check.code, 'MANIFEST_SIGNATURE_INVALID');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: the failure reason names the OFFENDING line, 1-indexed', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // An operator jumps straight to this line number; an off-by-one sends them
+    // to an innocent entry. Two shapes, so both message paths are pinned.
+    writeChainedManifest(root, 'test-signing-key', [
+      { sign: true },
+      { sign: true },
+      { forgeSig: true },
+    ]);
+    const tampered = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(tampered.code, 'MANIFEST_SIGNATURE_INVALID');
+    assert.match(tampered.reason, /line 3\b/, `bad-signature reason names line 3: ${tampered.reason}`);
+
+    writeChainedManifest(root, 'test-signing-key', [
+      { sign: true },
+      { sign: false },
+    ]);
+    const regressed = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(regressed.code, 'MANIFEST_SIGNATURE_INVALID');
+    assert.match(regressed.reason, /line 2\b/, `unsigned-after-signed reason names line 2: ${regressed.reason}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: an entry carrying no `data` field at all is walked, not thrown on', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    const live = store.load().hash;
+    // Not every gate records data. Reading storeHash off a missing `data` must
+    // not crash the diagnostic — a doctor that throws reports nothing at all.
+    writeChainedManifest(root, 'test-signing-key', [
+      { sign: true, noData: true },
+      { sign: true, storeHash: live },
+    ]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.equal(check.ok, true, 'a data-less entry is skipped, not fatal');
+    assert.equal(check.boundStoreHash, live, 'and the later checkpoint still binds');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('doctor storehash-manifest-bind: with no checkpoint recorded at all, the reason does not blame signing', () => {
+  const { root, store } = storeWithEvidence();
+  try {
+    // Distinct from the all-unsigned case: here nothing was ever recorded, so
+    // the operator must not be told signatures were the obstacle.
+    writeChainedManifest(root, 'test-signing-key', [{ sign: true }]);
+    const check = bindCheck(doctorTicketStore(store, { root, key: 'test-signing-key' }));
+    assert.notEqual(check.bound, true, 'nothing to bind to');
+    assert.equal(check.reason, 'no evidence-required transaction recorded yet');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('doctor storehash-manifest-bind: with a key set, a validly-signed manifest verifies (signaturesVerified)', () => {
   const { root, store } = storeWithEvidence();
