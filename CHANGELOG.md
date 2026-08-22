@@ -9,6 +9,37 @@ version and is published together.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **build-gate / adlc-codex:** the tool-call depth signal now recognizes the
+  real Codex rollout record shape. `countToolCalls` matched only Anthropic
+  `"type":"tool_use"` blocks, so every Codex session — including ones with
+  over a thousand genuine tool calls — measured depth 0. Because
+  `observeHandoffSignals` populates depth and nothing else, that left the
+  enforcing-tier context-handoff deny unable to fire on Codex at all, and
+  reduced the fitness-to-build gate to its byte ceiling alone. The counter now
+  also matches Codex `response_item` call records — `function_call`,
+  `custom_tool_call`, `web_search_call`, `tool_search_call` and
+  `image_generation_call`, which a scan of all 407 rollouts on disk (codex-cli
+  0.118.0 through 0.149.0) established as the complete set. Counting is exact
+  in both directions: the `_output` result half of a call/output pair is not a
+  second call, and the `event_msg` mirrors (`patch_apply_end`,
+  `exec_command_end`, `mcp_tool_call_end`, `web_search_end`,
+  `image_generation_end`) are not counted again on top of the `response_item`
+  that already recorded the call — while omitting any genuine call type would
+  let a session sit one call under the inclusive threshold and mutate anyway.
+  The fix is propagated to all three in-plugin copies of the counter
+  (`adlc-codex`, `adlc-copilot`, `adlc-claude-code`).
+
+  This also makes the earlier byte-threshold recalibration safe. Raising the
+  hook's `DEFAULT_BYTES_THRESHOLD` from 256 KiB to 8 MiB was correct on its own
+  terms — a fresh session with several plugins loaded routinely passes 256 KiB
+  on turn zero — but while depth was permanently 0 on Codex it left the gate
+  with one usable signal set two orders of magnitude above the old one. Depth
+  bands are the primary signal again; the 8 MiB byte count is the secondary
+  ceiling behind them.
+
 ## [1.10.0] - 2026-08-10
 
 ### Added
