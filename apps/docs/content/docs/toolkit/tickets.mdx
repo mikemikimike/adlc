@@ -29,6 +29,41 @@ Writers use a per-worktree lock, expected-hash compare-and-swap, a durable
 journal, final hash verification, and dual ticket/store-hash evidence. Interrupted
 transactions fail closed until explicitly completed or rolled back.
 
+## Writing to a frozen trust root
+
+Once any ticket declares `rails`, the store is the configuration that decides what
+the rail guards freeze, so the store itself is frozen. Every `--write` against it is
+then a deliberate, audited override: the service appends one signed `ticket-mutation`
+entry naming the operation, the ticket, and the store hash either side of the change.
+A mutation that already records its own evidence keeps that entry and gains the audit
+fields — one mutation never becomes two entries.
+
+Signing needs `ADLC_MANIFEST_KEY`. Without it the write refuses before touching the
+store, because an unsigned entry proves nothing about who made the change and the
+manifest is append-only. `--allow-unsigned` records one deliberately and warns.
+
+```sh
+ADLC_MANIFEST_KEY=… adlc ticket create --input ticket.json --write
+adlc ticket create --input ticket.json --write --allow-unsigned   # deliberate, warns
+```
+
+The rule holds on every door into the store, not just `adlc ticket`: the legacy
+migration and its recovery, archive/restore, transaction recovery, `ticket-prune`, and
+the published 1.x `LegacyTicketStore.write(tickets)`, which still works but now routes
+through the audited transaction. A repo where no ticket declares a rail — in the
+active set or the archive — is not a trust root: authoring there needs no key and
+records nothing. One case falls outside this: a repo that removed its last rail
+*before* this change and never recorded a hook override leaves nothing on disk to
+distinguish it from a repo that never used rails. That set cannot grow — every later
+removal leaves a marker — and closing it is tracked by ticket
+`T-01M0TMRSQKGTNWZTFXBPQ2JHNB`.
+
+`ticket-prune` is the one writer that cannot make the store write and the manifest
+append a single act, so it stages, records, then renames. A failed rename leaves an
+entry naming a store hash that was never reached; the ledger is append-only, so prune
+appends a correction (`action: 'abandoned'`, before and after hash equal) instead of
+leaving the claim standing.
+
 ## Legacy migration
 
 Existing `.adlc/tickets.json` repositories remain writable. Interactive writers
