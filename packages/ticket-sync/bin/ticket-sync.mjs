@@ -4,6 +4,7 @@
 // provider; the pull logic itself is in lib/pull.mjs (offline-tested).
 
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { pull } from '../lib/pull.mjs';
 import { push } from '../lib/push.mjs';
@@ -152,7 +153,20 @@ async function main() {
   process.exit(1);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// The file:// URL of the script Node was started with, symlinks resolved — npm's
+// .bin entries are symlinks, so argv[1] is the link while import.meta.url is the
+// real file (#786) — or null when there is no resolvable entry: a bare `node -e`
+// import has no argv[1], and a nonexistent argv[1] cannot be realpath'd.
+function entryUrl() {
+  if (!process.argv[1]) return null;
+  try {
+    return pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return null;
+  }
+}
+
+if (entryUrl() === import.meta.url) {
   main().catch((err) => {
     process.stderr.write(`adlc ticket: ${err?.message ?? err}\n`);
     process.exit(1);

@@ -80,6 +80,17 @@ const allow = () => ({ allow_tool: true });
 const deny = (reason) => ({ allow_tool: false, deny_reason: `ADLC rails-guard: ${reason}` });
 
 /**
+ * A parsed payload the decision tree can reason about: a plain (non-array)
+ * object. Anything else — null, a scalar, an array — has no tool name to
+ * classify and used to fall through as an unclassified tool (#823). ONE
+ * definition, shared by decide() and runFromStdin(): the two call sites must
+ * never disagree about what a payload is.
+ */
+function isToolPayload(p) {
+  return Boolean(p) && typeof p === 'object' && !Array.isArray(p);
+}
+
+/**
  * Pure decision over a parsed agy PreToolUse payload → agy verdict.
  * Never throws (the caller also wraps it). Implements the §5 decision tree.
  */
@@ -87,7 +98,17 @@ export function decide(payload, { env = process.env, trackerCache } = {}) {
   let enforcing = false;
   try {
     enforcing = env?.ADLC_P4_ENFORCEMENT === '1';
+    if (!isToolPayload(payload)) {
+      return enforcing ? deny('unparseable tool payload while enforcing — failing closed') : allow();
+    }
     const tool = extractToolName(payload);
+    // A payload with no tool name is a malformed hook envelope, not an unknown
+    // tool: agy names every PreToolUse call. Without this, {} or {toolCall:{}}
+    // classifies 'other', exposes no path and reaches the allow branch — the
+    // same fall-through #823 closes for scalars, one step later.
+    if (!tool) {
+      return enforcing ? deny('tool payload exposes no tool name while enforcing — failing closed') : allow();
+    }
     const cls = classifyTool(tool);
 
     // Step 2 — classify first. Reads and shell tools are never rail-gated in-session.
@@ -167,15 +188,26 @@ export function decide(payload, { env = process.env, trackerCache } = {}) {
 /** Parse a raw stdin string and return the agy verdict. Enforcement-aware on bad JSON. */
 export function runFromStdin(raw, env = process.env) {
   const enforcing = env?.ADLC_P4_ENFORCEMENT === '1';
-  let payload = {};
-  if (raw && raw.trim()) {
-    try { payload = JSON.parse(raw); }
-    catch { return enforcing ? deny('unparseable tool payload while enforcing — failing closed') : allow(); }
+  if (!raw || !raw.trim()) {
+    return enforcing ? deny('unparseable tool payload while enforcing — failing closed') : allow();
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return enforcing ? deny('unparseable tool payload while enforcing — failing closed') : allow();
+  }
+  if (!isToolPayload(payload)) {
+    return enforcing ? deny('unparseable tool payload while enforcing — failing closed') : allow();
   }
   const toolName = extractToolName(payload);
+  const trackerCache = new Map();
+  // A nameless envelope is decided (denied under enforcement) by decide(); it
+  // must not first count as a tool call against the session — repeated
+  // malformed envelopes would poison persistent depth and deny later edits.
+  if (!toolName) return decide(payload, { env, trackerCache });
   const cls = classifyTool(toolName);
 
-  const trackerCache = new Map();
   const sessionID = resolveSessionId({ payload, env });
 
   // For readonly tools, skip session lock persistence entirely

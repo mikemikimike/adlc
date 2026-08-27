@@ -5,7 +5,8 @@
 import { parseArgs, gateFail, opError, printJson } from '@adlc/core';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { loadPlan, activeTickets } from '../lib/plan.mjs';
 import { planRound } from '../lib/scheduler.mjs';
@@ -180,9 +181,22 @@ if (!['run', 'status', 'unlock'].includes(sub)) {
 }
 }
 
+// The file:// URL of the script Node was started with, symlinks resolved — npm's
+// .bin entries are symlinks, so argv[1] is the link while import.meta.url is the
+// real file (#786) — or null when there is no resolvable entry: a bare `node -e`
+// import has no argv[1], and a nonexistent argv[1] cannot be realpath'd.
+function entryUrl() {
+  if (!process.argv[1]) return null;
+  try {
+    return pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return null;
+  }
+}
+
 // Dispatch the CLI ONLY when run as the entry point. Importing this module (e.g. a unit
 // test importing runLive) must not parse argv, hit process.exit, or gateFail.
-if (import.meta.url === `file://${process.argv[1]}`) runCli();
+if (entryUrl() === import.meta.url) runCli();
 
 // Collaborators are injectable (defaulting to the real implementations) purely for
 // testability: the production call site passes no overrides, so behavior is unchanged, but a

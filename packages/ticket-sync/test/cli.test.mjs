@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseFlags, syncFlow } from '../bin/ticket-sync.mjs';
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'ticket-sync.mjs');
@@ -132,4 +132,51 @@ test('pull with no .adlc/config.json → exit 1 (operational, before any network
     assert.equal(r.code, 1);
     assert.match(r.stdout + r.stderr, /config not found/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('invocation through a symlink (like npm .bin) executes main correctly', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'adlc-symlink-'));
+  const linkPath = join(dir, 'adlc-ticket-sync');
+  symlinkSync(BIN, linkPath);
+  try {
+    const helpOut = execFileSync(process.execPath, [linkPath, '--help'], { encoding: 'utf8' });
+    assert.match(helpOut, /usage: adlc ticket/);
+    assert.match(helpOut, /pull\|push\|sync\|doctor/);
+
+    const doctorRes = (() => {
+      try {
+        const stdout = execFileSync(process.execPath, [linkPath, 'doctor', '--json'], { cwd: dir, encoding: 'utf8' });
+        return { code: 0, stdout };
+      } catch (e) {
+        return { code: e.status ?? 1, stdout: e.stdout ?? '' };
+      }
+    })();
+    assert.notEqual(doctorRes.stdout.trim(), '', 'must not produce empty output through symlink');
+    const parsed = JSON.parse(doctorRes.stdout);
+    assert.equal(typeof parsed.exitCode, 'number');
+    assert.ok(Array.isArray(parsed.checks));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+// The other side of the #786 guard: under `node -e` process.argv is [node]
+// alone, so argv[1] is undefined. That must read as "not the entry point" — a
+// guard that answered true there would run main() from a bare import (this
+// file imports parseFlags/syncFlow from the bin), which prints usage and exits 1.
+test('importing ticket-sync.mjs from a process with NO argv[1] (node -e) does NOT run main', () => {
+  const r = spawnSync(process.execPath,
+    ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(BIN).href)})`],
+    { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '', 'a bare import must not print usage');
+});
+
+// `node -e <script> bogus` puts "bogus" at argv[1]; realpathSync on it throws.
+// That must read as not-the-entry — neither dispatch nor a crash.
+test('a NONEXISTENT argv[1] resolves to "not the entry" instead of dispatching or throwing', () => {
+  const r = spawnSync(process.execPath,
+    ['--input-type=module', '-e', `await import(${JSON.stringify(pathToFileURL(BIN).href)})`, 'definitely-not-a-file'],
+    { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '', 'a bare import must not print usage');
 });

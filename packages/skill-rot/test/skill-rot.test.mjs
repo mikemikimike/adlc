@@ -4,7 +4,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, chmodSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -30,6 +30,11 @@ function writeSkill(dir, relPath, content) {
 function cleanup(dir) {
   try { rmSync(dir, { recursive: true, force: true }); } catch {}
 }
+
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const BIN = fileURLToPath(new URL('../bin/skill-rot.mjs', import.meta.url));
 
 // ─── find-skills ────────────────────────────────────────────────────────────
 
@@ -65,12 +70,89 @@ describe('findSkills', () => {
     }
   });
 
-  test('returns empty array when root does not exist', () => {
+  test('returns empty array when root does not exist (non-strict)', () => {
     const tmp = makeTempDir();
     try {
       const results = findSkills(['nonexistent-root'], tmp);
       assert.deepEqual(results, []);
     } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('throws when root does not exist with strict: true', () => {
+    const tmp = makeTempDir();
+    try {
+      assert.throws(() => {
+        findSkills(['nonexistent-root'], tmp, { strict: true });
+      }, /path does not exist/);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('supports single SKILL.md file path as root', () => {
+    const tmp = makeTempDir();
+    try {
+      const skillPath = writeSkill(tmp, 'my-skill/SKILL.md', '# My Skill');
+      const results = findSkills(['my-skill/SKILL.md'], tmp, { strict: true });
+      assert.equal(results.length, 1);
+      assert.equal(results[0], skillPath);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('strict: an explicit FILE that is not SKILL.md throws (not silently skipped)', () => {
+    const tmp = makeTempDir();
+    try {
+      writeSkill(tmp, 'docs/README.md', '# not a skill');
+      assert.throws(() => {
+        findSkills(['docs/README.md'], tmp, { strict: true });
+      }, /not a skills directory or SKILL\.md file/);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('non-strict: an explicit FILE that is not SKILL.md is skipped', () => {
+    const tmp = makeTempDir();
+    try {
+      writeSkill(tmp, 'docs/README.md', '# not a skill');
+      assert.deepEqual(findSkills(['docs/README.md'], tmp), []);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  // chmod 000 does not restrict root, and is not a permission model Windows
+  // honours — the unreadable-subtree cases only mean something elsewhere.
+  const canLockDirs = process.platform !== 'win32' && process.getuid?.() !== 0;
+
+  test('strict: an unreadable subtree under an explicit root throws (not silently skipped)', { skip: !canLockDirs }, () => {
+    const tmp = makeTempDir();
+    const locked = join(tmp, 'skills', 'locked');
+    try {
+      writeSkill(tmp, 'skills/ok/SKILL.md', '# ok');
+      mkdirSync(locked, { recursive: true });
+      chmodSync(locked, 0o000);
+      assert.throws(() => findSkills(['skills'], tmp, { strict: true }), /cannot read directory .*locked/);
+    } finally {
+      try { chmodSync(locked, 0o755); } catch {}
+      cleanup(tmp);
+    }
+  });
+
+  test('non-strict: an unreadable subtree is skipped and the readable skills are returned', { skip: !canLockDirs }, () => {
+    const tmp = makeTempDir();
+    const locked = join(tmp, 'skills', 'locked');
+    try {
+      const ok = writeSkill(tmp, 'skills/ok/SKILL.md', '# ok');
+      mkdirSync(locked, { recursive: true });
+      chmodSync(locked, 0o000);
+      assert.deepEqual(findSkills(['skills'], tmp), [ok]);
+    } finally {
+      try { chmodSync(locked, 0o755); } catch {}
       cleanup(tmp);
     }
   });
@@ -83,6 +165,97 @@ describe('findSkills', () => {
       // Only these two roots exist
       const results = findSkills(['.claude/skills', '.agents/skills', 'skills'], tmp);
       assert.equal(results.length, 2);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+});
+
+describe('CLI explicit path validation', () => {
+  test('fails with exit 1 when explicit positional directory does not exist', () => {
+    const tmp = makeTempDir();
+    try {
+      const r = spawnSync(process.execPath, [BIN, 'nonexistent-skills-dir'], {
+        cwd: tmp,
+        encoding: 'utf8',
+      });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /explicit search path does not exist/);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('fails with exit 1 when explicit positional does not exist alongside valid root', () => {
+    const tmp = makeTempDir();
+    try {
+      writeSkill(tmp, 'valid-skills/a/SKILL.md', '# Valid Skill\nRun `ls` to list.');
+      const r = spawnSync(process.execPath, [BIN, 'valid-skills', 'missing-dir'], {
+        cwd: tmp,
+        encoding: 'utf8',
+      });
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /explicit search path does not exist/);
+      assert.match(r.stderr, /missing-dir/);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('emits json error with exit 1 when explicit path missing and --json passed', () => {
+    const tmp = makeTempDir();
+    try {
+      const r = spawnSync(process.execPath, [BIN, 'typo-dir', '--json'], {
+        cwd: tmp,
+        encoding: 'utf8',
+      });
+      assert.equal(r.status, 1);
+      const parsed = JSON.parse(r.stdout);
+      assert.equal(parsed.error, 'explicit search path does not exist');
+      assert.equal(parsed.path, 'typo-dir');
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('fails with exit 1 when an explicit positional is a file that is not SKILL.md', () => {
+    const tmp = makeTempDir();
+    try {
+      writeSkill(tmp, 'docs/README.md', '# not a skill');
+      const r = spawnSync(process.execPath, [BIN, 'docs/README.md'], { cwd: tmp, encoding: 'utf8' });
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stderr, /not a skills directory or SKILL\.md file/);
+      assert.match(r.stderr, /README\.md/);
+    } finally {
+      cleanup(tmp);
+    }
+  });
+
+  test('fails with exit 1 when an explicit root holds an unreadable subtree', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+    const tmp = makeTempDir();
+    const locked = join(tmp, 'skills', 'locked');
+    try {
+      writeSkill(tmp, 'skills/ok/SKILL.md', '# ok\nRun `ls` to list.');
+      mkdirSync(locked, { recursive: true });
+      chmodSync(locked, 0o000);
+      const r = spawnSync(process.execPath, [BIN, 'skills'], { cwd: tmp, encoding: 'utf8' });
+      assert.equal(r.status, 1, r.stdout + r.stderr);
+      assert.match(r.stderr, /cannot read directory .*locked/);
+    } finally {
+      try { chmodSync(locked, 0o755); } catch {}
+      cleanup(tmp);
+    }
+  });
+
+  test('succeeds when explicit paths all exist', () => {
+    const tmp = makeTempDir();
+    try {
+      writeSkill(tmp, 'custom/my-skill/SKILL.md', '# Valid Skill\nRun `ls` to list.');
+      const r = spawnSync(process.execPath, [BIN, 'custom'], {
+        cwd: tmp,
+        encoding: 'utf8',
+      });
+      assert.equal(r.status, 0);
     } finally {
       cleanup(tmp);
     }
