@@ -58,8 +58,18 @@ Exit codes:
 // Parse numeric flags
 function parseNum(val, name, defaultVal, integer = false) {
   if (val === undefined || val === null) return defaultVal;
-  const n = integer ? parseInt(val, 10) : parseFloat(val);
-  if (isNaN(n)) opError(`--${name} must be a number, got: ${val}`);
+  // Number() over parseInt/parseFloat: those accept a numeric PREFIX and drop
+  // the rest ('1e2' → 1 as an integer, '2.9' → 2, '0.95junk' → 0.95), so a
+  // malformed flag silently changed the gate's inputs and still exited 0. The
+  // whole token must be one finite number; integer flags must be whole.
+  const text = typeof val === 'string' ? val.trim() : '';
+  const n = text === '' ? NaN : Number(text);
+  if (!Number.isFinite(n)) opError(`--${name} must be a number, got: ${val}`);
+  // isSafeInteger, not isInteger: 1e20 is an "integer" JS cannot represent
+  // exactly, and its decimal spelling is rejected by git (-n 1e20) — the
+  // co-change pass then degrades to a warning and the forecast exits 0
+  // without coupling data.
+  if (integer && !Number.isSafeInteger(n)) opError(`--${name} must be an integer, got: ${val}`);
   return n;
 }
 
@@ -69,6 +79,22 @@ const buildMin = values['build-min'] !== undefined ? parseNum(values['build-min'
 const mergeMin = values['merge-min'] !== undefined ? parseNum(values['merge-min'], 'merge-min', null) : null;
 const coChangeLimit = parseNum(values['co-change-limit'], 'co-change-limit', 500, true);
 const conflictThreshold = parseNum(values['conflict-threshold'], 'conflict-threshold', 0.5);
+
+if (conflictThreshold < 0 || conflictThreshold > 1) {
+  opError(`--conflict-threshold must be between 0 and 1, got: ${conflictThreshold}`);
+}
+if (widthFlag !== null && widthFlag < 1) {
+  opError(`--width must be >= 1, got: ${widthFlag}`);
+}
+if (buildMin !== null && buildMin <= 0) {
+  opError(`--build-min must be > 0, got: ${buildMin}`);
+}
+if (mergeMin !== null && mergeMin <= 0) {
+  opError(`--merge-min must be > 0, got: ${mergeMin}`);
+}
+if (coChangeLimit < 1) {
+  opError(`--co-change-limit must be >= 1, got: ${coChangeLimit}`);
+}
 
 // Load tickets, then drop completed (tombstoned) tickets: finished work must
 // not be scheduled or conflict-forecast as open backlog.

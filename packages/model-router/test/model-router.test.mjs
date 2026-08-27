@@ -72,9 +72,40 @@ test('railDensity: 1 rail, 4 scope → 0.25', () => {
   assert.equal(railDensity(t), 0.25);
 });
 
-test('railDensity: rails present, no scope → denominator is 1 → 1', () => {
-  const t = { id: 'T1', title: 't', rails: ['a'] };
-  assert.equal(railDensity(t), 1);
+test('railDensity: blank or non-string rail entries do not count as coverage', () => {
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: [''], scope: ['src/**'] }), 0);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['   '], scope: ['src/**'] }), 0);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: [null, 42], scope: ['src/**'] }), 0);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['', 'test/a.test.mjs'], scope: ['src/a.mjs', 'src/b.mjs'] }), 0.5);
+});
+
+test('railDensity: invisible-only patterns (zero-width, word joiner, Braille blank, Hangul filler) do not count', () => {
+  for (const ghost of ['\u200b', '\u2060', '\u2800', '\u3164', '\u115f\u1160', '\ufeff', '\u0000']) {
+    assert.equal(railDensity({ id: 'T1', title: 't', rails: [ghost], scope: ['src/**'] }), 0, JSON.stringify(ghost));
+    assert.equal(railDensity({ id: 'T1', title: 't', rails: [ghost], scope: [ghost] }), 0, JSON.stringify(ghost));
+    assert.equal(railDensity({ id: 'T1', title: 't', rails: ['test/a.mjs'], scope: [ghost] }), 0, JSON.stringify(ghost));
+  }
+});
+
+test('railDensity: a glob-only pattern counts, and an invisible suffix does not make a pattern distinct', () => {
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['**'], scope: ['src/**'] }), 1);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['test/a.mjs', 'test/a.mjs\u200b'], scope: ['src/a.mjs', 'src/b.mjs'] }), 0.5);
+});
+
+test('railDensity: duplicate rails and scope entries count once', () => {
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a', 'a', 'a'], scope: ['x', 'y', 'z'] }), 1 / 3);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a', ' a '], scope: ['x', 'x'] }), 1);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a'], scope: ['x', 'x', 'x', 'y'] }), 0.5);
+});
+
+test('railDensity: blank-only scope → 0 (unbounded), not division by a padded length', () => {
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a'], scope: ['', '  '] }), 0);
+});
+
+test('railDensity: rails present, no scope or empty scope → 0', () => {
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a'] }), 0);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a'], scope: [] }), 0);
+  assert.equal(railDensity({ id: 'T1', title: 't', rails: ['a'], scope: null }), 0);
 });
 
 // ── unit: priors ──────────────────────────────────────────────────────────────
