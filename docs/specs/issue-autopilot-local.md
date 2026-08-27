@@ -126,10 +126,12 @@ Non-goals (v1)
 ```
 loop:
   acquire single-instance lock       # §2.2 — atomic, owner-checked
-  preflight()                        # §9 — fail closed on any red item
-  BASE_OID = fetch_base()            # §6.0 — pinned OID; fetch failure → sleep 10m; continue
+  preflightA()                       # §9 phase A (needs no baseline): tools, key file, repo/principal + URL pinning, labels, exclude entries — fail closed
+  BASE_OID = fetch_base()            # §6.0 — pinned OID via the pinned fetch URL; failure → sleep 10m; continue
+  preflightB(BASE_OID)               # §9 phase B (reads the pinned blob): plugin parity, config schema, fleet dry-run, spec-approval binding — fail closed
   recover()                          # §2.1 — resume/finish/retire orphaned runs BEFORE selection
   if !quota().ok                     → sleep 10m; continue         # §3
+  if tokenShort: refresh_token()     # §6.4 item 14 — Claude-consuming, gated + reconciled (§3.2); still short → sleep 10m; continue
   maintain_open_prs()                # §8 — every fix round re-checks quota (§3.2)
   if active_autopilot_prs >= 5       → sleep 10m; continue
   issue = select()                   # §4 — null → sleep 10m; continue
@@ -156,21 +158,48 @@ title/body) and performs zero mutations of any kind: no lock directory,
 no `.git/info/exclude` write, no `git fetch` (the baseline OID comes from
 `git ls-remote` alone and objects are not downloaded), no worktree, no
 ownership marker, no run record, no status-file write, no `gh` mutation,
-and no manifest append; the shaping call is replaced by a deterministic
+and no manifest append — with ONE transient exception, because the
+`ls-remote` needs the isolated transport of §9.1b: dry-run builds its
+§9.4a SSH material directory (wrapper, `known_hosts`, identity copy or
+public line, every validation of §9.4a) under a private `mkdtemp` in
+`$XDG_RUNTIME_DIR` (else `$TMPDIR`), mode `0700`, OUTSIDE `REPO_ROOT`,
+and removes it on exit; nothing under `REPO_ROOT`, on the remote, or in
+the operator's state is touched, and ambient SSH configuration is never
+consulted, dry-run or not; the shaping call is replaced by a deterministic
 placeholder unless `--dry-run-shape` is also passed (which spends the one
-gated Claude call and nothing else). The spawn recorder in AC 10 rejects
+gated Claude call and nothing else). Because dry-run may not fetch or
+create a worktree, phase B (§9) is split for dry-run into its READ-ONLY
+checks (§9.2 plugin parity, §9.4 config schema, the §14 `spec-approval`
+binding — all `git show`/`cat-file` reads) and its one MUTATING check
+(§9.6 fleet dry-run, which needs a detached worktree): the read-only
+checks run only if the resolved `BASE_OID` is already present locally
+(`git cat-file -e <BASE_OID>^{commit}`), and §9.6 is ALWAYS reported as
+`skipped: needs-worktree` in dry-run. The plan therefore carries
+`complete: false` whenever anything was skipped, with `incomplete`
+listing every reason (`baseline-not-local`, `fleet-dry-run-needs-
+worktree`, …); `complete: true` is possible only for a dry-run that ran
+every phase-B check, which by construction never includes §9.6 — so a
+dry-run plan is always `complete: false` with an explicit skip list, and
+the exit code is still 0. A dry-run never claims a full plan and never
+mutates to build one. The spawn recorder in AC 10 rejects
 any argv that is not in the read-only set (`git ls-remote`, `git
-rev-parse`, `git cat-file`, `gh … view|list|api GET`, `adlc … --json`
-without `--write`/`--record`).
+rev-parse`, `git cat-file`, `git config --file <REPO_ROOT>/.git/config
+--get …` — the unoverlaid identity read of §9.1a, which dry-run performs
+exactly like a live run so the binding check is never skipped —, `gh …
+view|list|api GET`, `adlc … --json` without `--write`/`--record`).
 
 ### 2.1 Recovery state machine (runs before selection, every iteration)
 
 Every run has a record `.adlc/autopilot-runs/<issue>.json` (gitignored)
 with `state ∈ {creating, clarify, shaped, dispatched, quota-paused, built,
 attested, pushed, pr-open, ci-watch, oid-mismatch, blocked, stale, ci-red,
-done, remote-pending, orphan}`, `runId`,
+done, remote-pending, remote-deleted, orphan}`, `runId`,
 `ticketId`, `baseOid`, `branch`, `fleetRunId`, `prNumber`,
-`roundsUsed`, `wallClockUsedMs`, `ciRoundsUsed`, and timestamps. The
+`roundsUsed`, `wallClockUsedMs`, `ciRoundsUsed`, `lastPushedOid` and
+`lastPushedAt` (ISO-8601 UTC from the orchestrator clock, both written
+in the SAME atomic record write as the post-push verification of §6.8 —
+never separately, so a crash cannot leave an OID without its time), and
+the other timestamps. The
 label↔state mapping is fixed: `adlc:needs-clarification`↔`clarify`,
 `adlc:autopilot-blocked`↔`blocked`, `adlc:autopilot-stale`↔`stale`,
 `adlc:autopilot-ci-red`↔`ci-red`.
@@ -191,7 +220,8 @@ disambiguate by inspecting git/`gh`.
 | `stale`/`ci-red`/`oid-mismatch` (an open PR exists) whose mapped label a human REMOVED | **re-arm** the run: keep the branch and PR, reset `roundsUsed`, `wallClockUsedMs`, `ciRoundsUsed` and the watch clock to 0, set state `pr-open`; the next `maintain_open_prs()` (§8) or CI watch (§6.9) then performs a full retry round (fresh review + attestation). The PR is never closed by the autopilot; the issue does NOT re-enter selection while its PR is open |
 | `oid-mismatch` (label `adlc:autopilot-blocked` with reason `oid-mismatch` in the comment) | quarantined: branch and PR (if any) preserved untouched; excluded from selection and from maintenance until a human removes the label (row above) or runs `reset --issue N --confirm-delete <OID>` (§2.1a) |
 | branch `adlc/autopilot/issue-<n>` with no record, or with a record whose `token` does not match the branch's ownership marker | mark `orphan` in status with the branch OID; excluded from selection; **never deleted automatically**. `adlc-autopilot reset --issue N --confirm-delete <OID>` deletes LOCAL artifacts only, and only if the branch carries an ownership marker in the LOCAL git config (any token — proof the autopilot created it on this machine), `<OID>` equals the branch tip, and no open PR has that head; for a recordless branch `--delete-remote` is refused (exit 2) because the marker alone is not proof for a remote ref, and `reset` prints the exact `git push` command the operator may run by hand; a branch with NO marker is not the autopilot's and `reset` refuses entirely (exit 2) |
-| record whose local branch and PR are both gone | **canonical deletion rule** (the only path that deletes a record anywhere in this spec): delete the record iff `git ls-remote origin refs/heads/adlc/autopilot/issue-<n>` is empty AND no local branch exists AND no worktree exists; if the remote ref exists → `remote-pending`; if a local branch or worktree exists → retire per §2.1a first. Deletion is not atomic with the remote check, so it leaves a **tombstone** `.adlc/autopilot-runs/<issue>.tombstone.json` `{lastPushedOid, deletedAt}` (kept 30 days) and selection independently runs `git ls-remote` for the issue's branch name: an existing remote ref excludes the issue with rule `remote-ref-exists` whether or not any record or tombstone exists, so a ref that reappears between check and delete can never be collided with. Server-side ownership of `adlc/autopilot/**` (R12 ruleset) is the intended long-term guard. Every other row and §2.1a defer to this rule for the final record deletion |
+| `remote-deleted` (operator delete less than 24 h ago) | re-run `gh pr list --head <branch> --state all`; a PR whose head is that branch → lease-guarded restore at `lastPushedOid` + `adlc:needs-human` (§2.1a); after 24 h with none observed → fall through to the canonical deletion rule |
+| record whose local branch and PR are both gone | **canonical deletion rule** (the only path that deletes a record anywhere in this spec): delete the record iff `git --git-dir=<NET_GIT> ls-remote <remoteFetchUrl> refs/heads/adlc/autopilot/issue-<n>` is empty AND no local branch exists AND no worktree exists; if the remote ref exists → `remote-pending`; if a local branch or worktree exists → retire per §2.1a first. Deletion is not atomic with the remote check, so it leaves a **tombstone** `.adlc/autopilot-runs/<issue>.tombstone.json` `{lastPushedOid, deletedAt}` (kept 30 days) and selection independently runs `git ls-remote` for the issue's branch name: an existing remote ref excludes the issue with rule `remote-ref-exists` whether or not any record or tombstone exists, so a ref that reappears between check and delete can never be collided with. Server-side ownership of `adlc/autopilot/**` (R12 ruleset) is the intended long-term guard. Every other row and §2.1a defer to this rule for the final record deletion |
 
 ### 2.1a Retiring a run — ownership-checked deletion
 
@@ -233,17 +263,36 @@ deleted, so the deletion command stays available): (c)
 is re-evaluated IMMEDIATELY before the push (`gh pr list --repo <repo>
 --head adlc/autopilot/issue-<n> --state open --json number` must be
 empty — a PR that appeared since the earlier check aborts with `orphan`)
-AND `git ls-remote origin refs/heads/adlc/autopilot/issue-<n>` must
+AND `git --git-dir=<NET_GIT> ls-remote <remoteFetchUrl> refs/heads/adlc/autopilot/issue-<n>` must
 equal the record's last pushed OID; then the remote ref is deleted
 with a lease so a tip that moves between the check and the delete is
-protected: `git push
+protected: `git --git-dir=<NET_GIT> push
 --force-with-lease=refs/heads/adlc/autopilot/issue-<n>:<lastPushedOid>
-origin :refs/heads/adlc/autopilot/issue-<n>`. A lease failure → `orphan`,
-remote AND local untouched, stop. After a successful delete, `gh pr list
---head` is queried once more; a PR that was created against the ref in
-the window is reported (`pr-after-delete: <number>`) so the operator can
-restore the ref from the recorded OID — the deletion itself is
-lease-bounded, so the OID is always known. Step L (local; in automatic
+<remotePushUrl> :refs/heads/adlc/autopilot/issue-<n>`. A lease failure → `orphan`,
+remote AND local untouched, stop. GitHub offers no atomic "delete
+unless a pull request exists", so a PR can be opened against the ref
+between the re-check and the lease-guarded delete; that window is an
+accepted residual (§11.1 item 8) and is bounded three ways: the delete
+is operator-only (`--delete-remote`, never automatic), it is REFUSED
+when the record's `lastPushedAt` is absent (fail closed — a record from
+before the field existed, or a crash between push and record, is
+treated as fresh) or younger than 10 minutes (`ref-too-fresh` —
+a PR is opened within minutes of a push, not hours), and after a
+successful delete the ref stays under watch rather than being read
+once: the `reset` command holds for a grace period and re-queries `gh
+pr list --head` at 0 s, 30 s and 120 s, the record moves to
+`remote-deleted` and is kept for 24 h, and every recovery pass (§2.1)
+re-runs the query for such records; a PR observed at ANY of those reads
+is repaired immediately, not merely reported:
+the orchestrator re-creates the ref from the recorded OID with a lease
+that expects the ref to be ABSENT (`git --git-dir=<NET_GIT> push
+--force-with-lease=refs/heads/adlc/autopilot/issue-<n>: <remotePushUrl>
+<lastPushedOid>:refs/heads/adlc/autopilot/issue-<n>` — a ref someone
+re-created meanwhile is never overwritten), reports
+`pr-after-delete-restored: <number>` (or `pr-after-delete-unrestored`
+when that lease fails), labels the issue `adlc:needs-human`, leaves the
+record in place and stops; the deletion itself is lease-bounded, so the
+OID is always known. Step L (local; in automatic
 retirement always, in `reset` only after R succeeded or the record says
 never pushed), cwd `REPO_ROOT`, transactional so that no artifact is
 permanently removed before the conditional ref delete has succeeded:
@@ -354,11 +403,12 @@ across steps beyond that:
 | Step | On refusal |
 |---|---|
 | loop head | sleep 10m |
+| token refresh (§6.4 item 14 — a host-side `claude -p` one-token call, run only when phase B recorded `tokenShort`; counted as a start via `--start-ordinal`, reconciled like shaping, and followed by a fresh sample) | sleep 10m; nothing written, no dispatch |
 | shaping call (§5.2) | sleep 10m; nothing written |
 | coldstart answer call (§6.3 — the `--prompt-only` prompt is answered by a `claude -p` call, so it is Claude-consuming and gated + reconciled exactly like shaping; exactly one per ticket hash) | sleep 10m; the run stays `shaped` with the ticket persisted, resumed next iteration |
 | final review + attestation (§6.7) | not Claude-consuming (Codex); never gated |
 | after PROCEED, before dispatch | cache the shaped ticket in the run record (`state: shaped`, keyed by issue `updatedAt`); sleep 10m; next iteration reuses it via §2.1 |
-| every fleet strike | fleet runs `--pre-strike-argv <json-array>` = `[<pinned absolute adlc path, §9.1>,"autopilot","quota","--json","--model",<effectiveModel>,"--quota-threshold",<T>,"--quota-reserve",<R>]` (the resolved values are passed explicitly as separate argv elements — never a shell string — so the helper cannot re-resolve them differently and no metacharacter can split an argument; the helper runs with a MINIMAL environment — `PATH` = the sanitized list of §9.1, `HOME`, `ADLC_AUTOPILOT_STATUS_FILE`, `ADLC_AUTOPILOT_LOCK_TOKEN` and nothing else, so no orchestrator secret (the manifest key, `gh`/`claude` tokens, `*_KEY`/`*_TOKEN`) is inherited; its executable is the pinned `adlc` path; the array also carries `"--iteration", <iterationId>` and `"--start-ordinal", "auto"`: the helper reads and atomically increments `startsThisIteration` in `.adlc/autopilot-status.json` under the autopilot lock, so the FIRST start of an iteration is gated at the threshold and every later start — including every fleet strike — at threshold minus reserve, exactly as §3.4 requires; a helper invoked without a lock-holding parent refuses with exit 1); non-zero exit → fleet stops cleanly with `reason: "quota-paused"`, exit 2, run resumable; the record becomes `quota-paused` |
+| every fleet strike | fleet runs `--pre-strike-argv <json-array>` = `[<pinned absolute adlc path, §9.1>,"autopilot","quota","--json","--model",<effectiveModel>,"--quota-threshold",<T>,"--quota-reserve",<R>]` (the resolved values are passed explicitly as separate argv elements — never a shell string — so the helper cannot re-resolve them differently and no metacharacter can split an argument; the helper runs with a MINIMAL environment — `PATH` = the sanitized list of §9.1, `HOME`, `ADLC_AUTOPILOT_STATUS_FILE`, `ADLC_AUTOPILOT_LOCK_TOKEN` and nothing else, so no orchestrator secret (the manifest key, `gh`/`claude` tokens, `*_KEY`/`*_TOKEN`) is inherited; its executable is the pinned `adlc` path; the array also carries `"--iteration", <iterationId>`, `"--start-ordinal", "auto"` and `"--wall-clock-remaining", <minutes>` (the helper re-reads the host credential file's `expiresAt` and exits 1 `token-expiring` when `expiresAt − now < minutes + 30`): the helper reads and atomically increments `startsThisIteration` in `.adlc/autopilot-status.json` under the autopilot lock, so the FIRST start of an iteration is gated at the threshold and every later start — including every fleet strike — at threshold minus reserve, exactly as §3.4 requires; a helper invoked without a lock-holding parent refuses with exit 1); non-zero exit → fleet stops cleanly with `reason: "quota-paused"`, exit 2, run resumable; the record becomes `quota-paused` |
 | each maintenance conflict-fix round (§8) | skip that PR this iteration; no label |
 | each CI fix round (§0.11) | pause the CI watch; the 30-minute CI budget does not advance while paused |
 
@@ -480,10 +530,30 @@ issue number and the rule name)
   the autopilot cannot read — is excluded with rule `not-authorized` and
   is never shaped or dispatched.
   An unknown mode value → preflight exit 1 `bad-config`.
+  The predicate is evaluated over the issue REVISION that will be
+  shaped, not over the issue as an object — GitHub lets any collaborator
+  with triage permission edit another user's issue body, so authorship
+  alone does not bind the text: alongside `authorAssociation` and the
+  label timeline the autopilot reads the body-edit history (GraphQL
+  `issue.userContentEdits { editor { login } editedAt }`) and the
+  `renamed` timeline events, and records `issueRevision = {titleSha256,
+  bodySha256, lastEditedAt, editors[]}` at selection. Under the AUTHOR
+  clause of ANY mode — `OWNER` by default, `OWNER`/`MEMBER`/`COLLABORATOR`
+  under `trusted-authors` — every body editor and every rename actor
+  must be the issue's author (an issue whose body or title anyone else
+  touched, a collaborator editing a trusted member's issue included, is
+  `not-authorized` until an authorized actor labels it); under the
+  labeled clause the
+  authorizing `labeled` event must be later than `lastEditedAt` and than
+  every rename by an actor who is not `admin`/`maintain` — the label
+  authorizes THAT revision, and any later edit by anyone revokes it
+  until an authorized actor labels again. An edit history the autopilot
+  cannot read → `not-authorized`. The recorded `issueRevision` is what
+  §5 shapes and what §6.0a revalidates byte for byte.
 - label in {`trust-root-change`, `question`, `wontfix`, `duplicate`,
   `invalid`, `adlc:autopilot-skip`, `adlc:autopilot-blocked`,
   `adlc:autopilot-stale`, `adlc:autopilot-ci-red`, `adlc:needs-clarification`,
-  `adlc:autopilot-log`}
+  `adlc:needs-human`, `adlc:autopilot-log`}
 - milestone title starts with `Programs` (multi-slice work)
 - an open PR exists whose head is `adlc/autopilot/issue-<n>` or whose body
   contains `Closes #<n>` / `Fixes #<n>`
@@ -491,9 +561,21 @@ issue number and the rule name)
 - the issue's `<!-- adlc:begin -->` scope, or the scope produced at shaping
   (§5), intersects the **protected-path denylist** — non-shrinkable, config
   may only extend it:
-  `.adlc/**`, `.github/**`, `scripts/rails-guard-ci.mjs`, `docs/ci/**`,
-  `CODEOWNERS`, `.github/CODEOWNERS`, `docs/CODEOWNERS`, `package.json`,
-  `.npmrc`, plus the **trust-root tier** packages
+  the UNION of (a) every path in rails-guard's
+  `DEFAULT_IMMUTABLE_TRUST_ROOTS` (`packages/rails-guard/lib/ci/trust-roots.mjs`)
+  and this repository's `REPO_TRUST_ROOTS` (`scripts/rails-guard-ci.mjs`),
+  both read from the pinned blob at `BASE_OID` so the denylist can never
+  lag the repository's own trust-root set — today that includes
+  `scripts/preflight.mjs`, `scripts/test/preflight.test.mjs`,
+  `scripts/toolkit-floor.json`, `scripts/toolkit-floor-check.mjs`,
+  `scripts/test/toolkit-floor.test.mjs`,
+  `scripts/check-reviewer-directed-comments.mjs` and its test,
+  `scripts/test/rails-guard-workflow-hashes.json`, `.github/workflows/ci.yml`
+  and `docs/ci/rails-guard.yml` — and (b) the static extras `.adlc/**`,
+  `.github/**`, `scripts/rails-guard-ci.mjs`, `scripts/mutation-gate.mjs`,
+  `scripts/run-tests.mjs`, `docs/ci/**`, `CODEOWNERS`, `.github/CODEOWNERS`,
+  `docs/CODEOWNERS`, `package.json`, `.npmrc`, plus the **trust-root tier**
+  packages
   `packages/rails-guard/**`, `packages/prosecute/**`,
   `packages/gate-manifest/**`, `packages/build-gate/**`,
   `packages/ticket-prune/**`, `packages/ticket-sync/**`, and
@@ -565,11 +647,15 @@ text the repository OWNER wrote.
    retried on a later iteration (at most 3 shaping attempts per issue per
    24 h, then rule `shaping-failed` excludes it until the operator resets).
    The attempt ledger is durable: `.adlc/autopilot-runs/<issue>.attempts.json`
-   (array of `{ts, kind: "shaping"|"coldstart", outcome}`) is appended via
-   write-to-temp + `rename` BEFORE the call is spawned with
+   (array of `{id, ts, kind: "shaping"|"coldstart", outcome}` where `id`
+   is a ULID minted when the entry is created and never changed) is
+   appended via write-to-temp + `rename` BEFORE the call is spawned with
    `outcome:"started"` and updated after it returns; an entry left at
    `started` by a crash counts as a failed attempt; entries older than 7
-   days are pruned on read.
+   days are pruned on read — by ORDINARY reads only; `reset --attempts`
+   (§13.0) reads the raw file without pruning, appends every entry to
+   the archive, and only then truncates the active ledger (temp file +
+   `rename`), so no attempt is ever lost between ledger and archive.
    The prompt is a fixed prompt (in
    `lib/shaping-prompt.mjs`) that returns a JSON ticket
    `{title, body, scope[], rails[], category, duration}` whose body begins
@@ -621,8 +707,15 @@ text the repository OWNER wrote.
    worktree to retire — when a human removes the label, recovery deletes
    the record and the issue re-enters selection.
 
-The shaping call is the only Claude-quota spend before dispatch and is
-bounded by `--max-turns 1`.
+Before dispatch an iteration makes at most THREE Claude-consuming
+calls, and this sentence is the authoritative list: the token refresh
+(§6.4 item 14, only when phase B recorded `tokenShort`), the shaping
+call (bounded by `--max-turns 1`, skipped for a trusted block with
+criteria, §5.1) and the coldstart-answer call (§6.3, exactly one per
+ticket hash). Each is preceded by a fresh quota sample (§3.2), consumes
+one start ordinal (§3.4) and is reconciled afterwards; nothing else
+spends Claude quota before dispatch, and after dispatch only fleet's
+strikes do, each gated by `--pre-strike-argv`.
 
 ## 6. Run — one issue, one ticket, one branch, one PR
 
@@ -642,18 +735,38 @@ fleet at run end. The primary checkout's working tree is never written
 (AGENTS.md); the only writes under `REPO_ROOT` outside `ISSUE_WT` are the
 gitignored `.adlc/autopilot-*` files.
 
-0. **Pinned baseline.** `BASE_OID = git ls-remote --exit-code origin
-   refs/heads/main` (first column; exit ≠ 0 → exit 1 / sleep, no dispatch),
-   then `git fetch --no-tags origin <BASE_OID>` (fetch BY OID — GitHub
-   serves reachable commits by SHA — so a concurrent `git fetch` in another
-   session cannot move what this run resolved; `FETCH_HEAD` is never read),
-   then `git cat-file -e <BASE_OID>^{commit}` must succeed. The OID is
+0. **Pinned baseline.** Both network steps run in the network
+   repository of §9.1c, never against the primary checkout's
+   configuration: `BASE_OID = git --git-dir=<NET_GIT> ls-remote
+   --exit-code <remoteFetchUrl> refs/heads/main` (first column; exit ≠ 0
+   → exit 1 / sleep, no dispatch), then `git --git-dir=<NET_GIT> fetch
+   --no-tags <remoteFetchUrl> <BASE_OID>` (fetch BY OID — GitHub serves
+   reachable commits by SHA — so a concurrent `git fetch` in another
+   session cannot move what this run resolved; `FETCH_HEAD` is never
+   read; the objects land in `NET_GIT`'s own object store), then the
+   objects are IMPORTED into the primary repository over the local file
+   transport only — `git -C <REPO_ROOT> fetch --no-tags <NET_GIT>
+   <BASE_OID>` (a filesystem path, no network, no remote name; the
+   primary's config has already passed the §9.1b audit, so no
+   `url.*.insteadOf` can redirect it) — and `git -C <REPO_ROOT> cat-file
+   -e <BASE_OID>^{commit}` must succeed. No `git fetch`, `ls-remote` or
+   `push` in this spec ever runs with the primary repository as its git
+   dir; the spawn recorder classifies any such spawn as a violation. The OID is
    recorded in the run record and the status file. Every later
-   reference to the base in this run uses that OID, never the name
-   `origin/main` or local `main`: worktree creation, fleet `--base`,
-   `preflight.mjs --base`, `record-cross-model --base`, the rebase target in
-   §8, and the PR body's `base-oid:` line. Two different things are both
-   called "base" and must not be confused: `BASE_OID` is the **evidence
+   reference to the EVIDENCE base in this run uses that OID, never the
+   name `origin/main` or local `main`: worktree creation, every
+   individually invoked gate of §6.6 (`refs/remotes/origin/<BASE_OID>`),
+   `preflight.mjs --base-oid` once R13 exists, `record-cross-model
+   --base`, the rebase target in §8, and the PR body's `base-oid:` line.
+   Fleet's `--base` is deliberately NOT that OID: it is fleet's
+   INTEGRATION START — the issue branch `adlc/autopilot/issue-<n>`, whose
+   tip already carries the ticket commit of §6.2 — so `fleet/run-<id>`
+   is cut from the issue-branch tip, the worker's commits sit on top of
+   the ticket commit, and the §6.5 fast-forward of the issue branch to
+   the integration tip is guaranteed; the run record stores
+   `integrationStart` (that tip's OID at dispatch) beside `baseOid`.
+   Three different things carry the word "base" and must not be
+   confused: fleet's `--base` is the integration start above; `BASE_OID` is the **evidence
    baseline** (what the build, gates and attestation were computed
    against); the **PR base** is the branch NAME `main`, because GitHub PRs
    target a branch, not a commit — `gh pr create --base main` is therefore
@@ -666,11 +779,20 @@ gitignored `.adlc/autopilot-*` files.
    before the fleet dispatch of step 4 (and before every retry dispatch),
    the issue is re-fetched (`gh issue view <n> --repo <repo> --json
    updatedAt,labels,milestone,state,authorAssociation,body`) and every
-   selection input is re-evaluated: `state == "OPEN"`, `updatedAt`
+   selection input is re-evaluated — together with the token margin of
+   §6.4 item 14, re-read from the host file at that moment: `expiresAt −
+   now ≥ remainingWallClock + 30 min`, else the run stays `shaped` with
+   `token-expiring` and the next iteration's gated refresh handles it
+   (and fleet's pre-strike helper, §3.2, receives `"--wall-clock-
+   remaining", <minutes>` and refuses a strike whose margin has become
+   short with the same reason, so no strike starts that its token cannot
+   outlive) — : `state == "OPEN"`, `updatedAt`
    unchanged since selection, the same hard-exclusion verdict (§4.2,
    including `eligibleAuthor` re-evaluated from the timeline), no
-   new open PR or branch for the issue, and — when the body changed — the
-   shaped ticket is discarded. Any change → the candidate is dropped
+   new open PR or branch for the issue, and the `issueRevision` of §4.2
+   (title, body, `lastEditedAt`, editors) equal to the one recorded at
+   selection — any body or title change, by anyone, discards the shaped
+   ticket and the candidate. Any change → the candidate is dropped
    (`revalidation-changed`, nothing written or, if a worktree already
    exists, retired per §2.1a) and selection restarts on the next
    iteration.
@@ -781,17 +903,133 @@ gitignored `.adlc/autopilot-*` files.
      credential helper, hook, other branch, reflog, stash or unreachable
      object); the worker's commits write objects, refs and worktree
      metadata INTO it and nowhere else; (c) a private empty tmpfs at `/tmp`
-     with `TMPDIR`/`TMP`/`TEMP` inside it (item 11).
+     with `TMPDIR`/`TMP`/`TEMP` inside it (item 11); (d) the synthetic
+     `HOME` tmpfs of item 14 — a WRITABLE root whose layout (writable
+     tmpfs with three enumerated read-only leaf binds layered inside) is
+     stated in the `READ_SET` bullet below. The worker's dependency tree
+     is provided BEFORE the sandbox starts, because inside it there is
+     no registry route (the egress allowlist names only the model API)
+     — and npm on the host must never consume worker-controlled input,
+     since on a retry the worktree carries the previous strike's
+     `package.json`, lockfile and any `.npmrc` the worker wrote, none of
+     it validated yet (`--ignore-scripts` silences lifecycle scripts, not
+     manifest-driven registry, `file:`/`git:` or configuration inputs):
+     the orchestrator builds the tree ONCE per run in `<run
+     dir>/worker-deps`, a clone at `BASE_OID` cut from the worker mirror
+     (immutable, reviewed content only), with the sanitized npm
+     invocation of §6.5b(iii) — and fleet item 15, `--worker-deps <abs
+     path>`, makes fleet COPY that tree (`cp -a`, a plain file copy, no
+     npm) into `<worker worktree>/node_modules` on the host before every
+     strike and skip the configured `init`; the worker finds
+     `node_modules` populated from the pinned baseline lock, and npm is
+     never run against anything the worker wrote. The worker's charter
+     states that it cannot install anything (an `npm ci`/`npm install`
+     inside fails for want of a route) and that adding
+     a workspace package means creating the relative symlink
+     `node_modules/@adlc/<x>` → `../../packages/<x>` that npm would
+     create (no network) plus the `link: true` lockfile entry §6.5b
+     admits — the gates rebuild their own tree from the attested lock
+     (`gate-deps`) and never trust the worker's.
    - READ-ONLY binds (`READ_SET`, comma-joined absolute paths): the
      `realpath` of each pinned executable of §9.1 as a single FILE bind
      (never its parent directory), plus `<node prefix>/lib/node_modules/npm`
      and `<node prefix>/lib/node_modules/corepack`, plus `/usr`, `/lib`,
-     `/lib64`, `/etc/ssl`, `/etc/resolv.conf`, `/etc/hosts`, plus the
+     `/lib64`, `/etc/ssl`, `/etc/resolv.conf`, `/etc/hosts`. The
      adapter's synthetic home (fleet §7.3 `homeState`, which necessarily
-     holds the harness's own credentials).
+     holds the harness's own credentials) is NOT a `READ_SET` entry — it
+     is writable root (d), constructed per fleet item 14 (§14) with this
+     explicit mount order: first a private tmpfs at `HOME` (`0700`, the
+     invoking uid), then, layered INSIDE it, exactly three read-only
+     binds — the credential file, `settings.json` and the plugin tree —
+     which fleet's `--json` echo enumerates as `homeBinds`; a write to a
+     bound path fails `EROFS` while the tmpfs around it stays writable.
+     The tmpfs holds ONLY (i) `.claude/.credentials.json`, a `0600` COPY of the host file
+     (validated before copying: regular file, uid-owned, mode `0600`,
+     opened `O_NOFOLLOW`; sha256 recorded), bound READ-ONLY (`0400`,
+     on a read-only bind) — nothing the worker writes is EVER copied
+     back to the host credential store, there is no write-back path at
+     all, and the copy is discarded with the tmpfs; the worker therefore
+     cannot refresh or rotate the operator's token, so validity for the
+     whole run is established BEFORE dispatch, on the host, by the
+     trusted harness: phase B (§9.4) reads the host file's OAuth
+     `expiresAt` and requires `expiresAt − now ≥ wallClock + 30 min`,
+     recording `tokenShort` when it is not — phase B itself never
+     refreshes, because a refresh is Claude-consuming and phase B runs
+     BEFORE the loop-head quota gate; the refresh is its own gated step
+     (§2, §3.2 row "token refresh"): after the loop-head gate has
+     admitted the iteration the orchestrator runs the pinned `claude`
+     on the host as the stdin-bearing refresh call of §12.1 (exact argv,
+     payload, cwd and env stated there; the harness's own refresh path,
+     in the real `HOME` — whether the harness refreshes a not-yet-expired
+     token is the harness's policy, and the autopilot simply keeps
+     sleeping 10 m until a refresh has landed or the operator refreshes
+     interactively, never dispatching into a run the token cannot
+     outlive), counted as a Claude start,
+     reconciled like shaping, followed by a fresh quota sample before
+     any later Claude-consuming step; then the file is re-read and, if
+     the margin is still short, the iteration ends with `token-expiring`
+     (remaining lifetime printed, sleep 10m, no dispatch) — never a
+     mid-run refresh inside the sandbox; (ii) a
+     `.claude/settings.json` generated from an allowlist of keys (model
+     and permission settings; hooks and MCP servers stripped), `0400`;
+     (iii) a minimal `.claude.json` generated from an allowlist (the
+     account record and onboarding flags — never the host file, which
+     carries per-project history), writable inside the tmpfs because
+     the harness rewrites it on every start (the adapter's `homeState.
+     files` also names `.claude.json.backup`), and discarded with the
+     tmpfs; (iv) the pinned plugin tree of §9.2, read-only; (v) the
+     adapter's declared session-state directories — `claude-code`'s
+     `homeState.dirs`: `.claude/projects`, `.claude/todos`,
+     `.claude/statsig`, `.claude/shell-snapshots`, `.claude/file-history`,
+     `.claude/logs`, `.claude/downloads`, `.cache/claude-cli-nodejs` —
+     created EMPTY and writable inside the tmpfs so headless execution
+     can persist its own session state, and discarded with the tmpfs;
+     the operator's copies of those directories are never bound. Nothing
+     else of the operator's `HOME` exists inside — `~/.ssh`,
+     `~/.config/gh`, `~/.gitconfig`, other `~/.claude/*` and `~/.npmrc`
+     are ENOENT, not denied. This profile deliberately departs from the
+     adapter's default rationale for a WRITABLE credential ("the CLI
+     refreshes its OAuth token in place"): under item 14 the file is
+     read-only and the mid-run-expiry failure that rationale guards
+     against is excluded beforehand by the token lifetime gate above.
+   - EGRESS: the model plane runs with `--unshare-net` (loopback only)
+     plus fleet-extensions item 13, `--model-plane-egress allowlist`:
+     fleet starts, on the HOST, a minimal HTTP CONNECT proxy listening on
+     a unix socket under the run directory whose allowlist is exactly the
+     model API host(s) the adapter declares (for `claude-code`:
+     `api.anthropic.com:443`, plus the OAuth refresh host the adapter
+     names) — every other `CONNECT` target, every plain `GET`, and every
+     non-443 port is refused and logged; the socket is bind-mounted into
+     the sandbox, a tiny bridge process inside the sandbox (spawned by
+     fleet from the pinned `node`) listens on `127.0.0.1:<port>` and
+     forwards bytes to the unix socket (unix sockets are filesystem
+     objects and cross network namespaces; TCP does not), and the worker
+     is given `HTTPS_PROXY=http://127.0.0.1:<port>`, `HTTP_PROXY` likewise,
+     and `NO_PROXY=` empty. With no route out of the namespace except the
+     bridge and a proxy that only connects to the model API, the
+     harness's OAuth token can reach exactly the service that issued it
+     and nothing else. Fleet's `--json` reports `egress: "allowlist"` and
+     the allowlist; the orchestrator treats any other value as
+     `sandbox-policy-mismatch`.
    - INVARIANT (checked by the orchestrator before dispatch and asserted
      by fleet's `--json` echo): no `READ_SET` entry is an ancestor of, or
-     equal to, a writable root or a pinned executable's parent; and none of
+     equal to, a writable root; the converse layering — a read-only bind
+     INSIDE a writable root — exists only for the item-14 `homeBinds`
+     (three leaves under the synthetic `HOME`: two files and the plugin
+     tree), each of which must lie under `HOME`, be a file or the plugin
+     directory, and be an ancestor of no scratch directory; any other
+     read-only path under a writable root, or any `homeBinds` entry not
+     under `HOME`, is `sandbox-policy-mismatch`; every `READ_SET` entry
+     is either one of the FIXED
+     SYSTEM ROOTS (`/usr`, `/lib`, `/lib64`, `/etc/ssl`,
+     `/etc/resolv.conf`, `/etc/hosts` — bound whole, and a pinned
+     executable that lives under one of them, e.g. `/usr/bin/git` or
+     `/usr/bin/bwrap`, needs no separate bind) or a single FILE bind of a
+     pinned executable outside those roots (user-installed tools such as
+     `~/.local/bin/claude`, the fnm `node`, the npm-global `adlc`,
+     `adversarial-review`, `codex`) plus the two npm/corepack trees; no
+     other directory bind is permitted, so a user-installed tool's parent
+     directory is never exposed; and none of
      `<REPO_ROOT>`, `<REPO_ROOT>/.git`, `<ISSUE_WT>`, `$HOME`, host `/tmp`
      appears in either set — so `.env.local`, the operator's other
      checkouts, the orchestrator's state, the shared git database and the
@@ -815,10 +1053,25 @@ gitignored `.adlc/autopilot-*` files.
      deterministic gates, prosecution and merge operate unchanged on the
      fetched-back branch, and the `fleet/run-<id>` tip that §6.5
      fast-forwards `adlc/autopilot/issue-<n>` to contains the worker's
-     commits. The mirror is never read by any gate; the mirror is `rm -rf`'d and recreated
-     before every dispatch (under the lock) and removed at retirement
-     Step L with the run directory, so a stale mirror is never read by any
-     gate. What the worker can read of the repository is exactly the
+     commits. This WORKER mirror is never read by any gate — it stops
+     at the pre-dispatch baseline plus the issue branch as it was cut,
+     and the worker's, completion and attestation commits never enter
+     it; it is `rm -rf`'d and recreated before every dispatch (under the
+     lock) and removed at retirement Step L with the run directory. The
+     gates instead read a second, later mirror: after the LAST
+     orchestrator commit (attestation, §6.5a) the orchestrator creates
+     the empty bare **gate mirror** `<run dir>/gate.git`, pushes into it
+     LOCALLY from the caller repository exactly `attestedHead:refs/heads/
+     adlc/autopilot/issue-<n>` and `<BASE_OID>:refs/remotes/origin/
+     <BASE_OID>` (a push transfers only the objects reachable from those
+     two tips — never the caller repository's other branches, stashes or
+     unreachable objects, which a local `git clone` of the caller
+     repository would copy wholesale), verifies `git -C gate.git
+     rev-parse refs/heads/adlc/autopilot/issue-<n>` equals `attestedHead`
+     and `rev-list --all` equals the objects reachable from the two tips
+     (`gate-mirror-stale` otherwise, the run fails), and only then cuts
+     `GATE_REPO` (§6.6) from it; the gate mirror is removed with
+     `GATE_REPO` after the sequence. What the worker can read of the repository is exactly the
      history already published at `BASE_OID` plus the issue branch.
    Fleet: sandboxed worker (`bwrap`, `--permission-mode
    acceptEdits`, allowlist from `fleet.allowedCommands`), deterministic gates
@@ -864,10 +1117,37 @@ gitignored `.adlc/autopilot-*` files.
    `lockfile-drift`; no entry may be removed; any other difference →
    `lockfile-drift`. Because the only admissible additions are workspace
    links, `npm ci --ignore-scripts --no-audit --no-fund` never fetches a
-   new tarball of any kind; (iii) that command is then re-run in `ISSUE_WT` so the
-   install matches the lock the gates will test. All outer gates (5a,
-   preflight, final review, attestation) run in `ISSUE_WT`, never in the
-   worker's worktree.
+   new tarball of any kind; (ii-b) **npm-config drift**: every `.npmrc`
+   and `package.json` `publishConfig`/`overrides`/`resolutions` in the
+   tree must be byte-identical to `BASE_OID`'s, `workspaces` may only
+   gain `packages/<x>` entries, and no `file:`/`git:`/`http:` dependency
+   spec may appear anywhere (`npm-config-drift` otherwise, no gate); (iii)
+   only after (i), (ii) and (ii-b) have passed is the install run by the
+   orchestrator ON THE HOST with `cwd = <run dir>/gate-deps` (§6.6, a
+   clone at `attestedHead` used only for this install), with the
+   **sanitized npm invocation** used for every host-side install of
+   this spec: the pinned `npm` with `ci --ignore-scripts --no-audit
+   --no-fund --offline`, `--userconfig` pointing at an
+   orchestrator-generated file that pins `registry=https://registry.
+   npmjs.org/` and nothing else, `--globalconfig /dev/null`, `HOME` set
+   to an empty private directory (the operator's `~/.npmrc` is never
+   read), an environment containing no inherited `NPM_CONFIG_*`/
+   `npm_config_*`, and `npm_config_cache` = `<run dir>/npm-cache`, the
+   private cache that the once-per-run `worker-deps` install (§6.4,
+   the ONE invocation that may reach the registry, sourced from
+   `BASE_OID` only) populated — so the gate install needs no network
+   at all: because the only admissible lock additions are workspace
+   links, every tarball it needs is already in that cache, and a miss
+   is `gate-deps-missing`. It executes no package code and produces
+   `gate-deps/node_modules`, bound read-only into every per-gate clone,
+   whose workspace links (`node_modules/@adlc/<x>` → the relative
+   `../../packages/<x>`) resolve INSIDE that clone — so the sandboxed
+   gates import the tree built from the attested lockfile; a per-gate
+   clone without that bind fails the gate closed (`gate-deps-missing`),
+   never silently. Every gate that executes repository code (5b's test run,
+   the mutation gate, rails-guard) runs in `GATE_REPO`; the git-only
+   checks (5a's actual-diff check, attestation) read `ISSUE_WT`; nothing
+   runs in the worker's worktree.
 5a. **Actual-diff check** (deterministic, orchestrator-side, independent of
    fleet's rails gate and of what the worker declared): `git diff
    --name-only <BASE_OID>...HEAD` in `ISSUE_WT` must satisfy (i) every path
@@ -884,8 +1164,19 @@ gitignored `.adlc/autopilot-*` files.
    appended line must be one the ORCHESTRATOR wrote this run — it keeps
    the sha256 of each entry it appends in the run record and any added
    line outside that set is a violation `foreign-manifest-line` — AND
-   `adlc gate-manifest verify --dir <ISSUE_WT>/.adlc` must exit 0, which
-   rejects any line not signed with the key the worker never holds; a
+   `adlc gate-manifest verify --dir <ISSUE_WT>/.adlc` — a key-bearing
+   child (§9.3): keyless verification checks only chain consistency,
+   so the orchestrator passes it `ADLC_MANIFEST_KEY` together with
+   `--allow-legacy-unsigned`, because the repository's root manifest
+   begins with a legacy UNSIGNED prefix that strict verification rejects
+   at `seq 1` (verified against the real verifier: strict → "chain
+   broken at seq 1: unsigned entry"; tolerant → "manifest ok"); the
+   flag tolerates a MISSING signature only on that legacy prefix — a
+   forged signature anywhere, and a missing one on any later entry,
+   still fail — and the orchestrator additionally requires every entry
+   it appended this run (§6.5a's recorded sha256 set) to be present AND
+   signed (`run-entry-unsigned` otherwise) — must exit 0, which rejects
+   any line not signed with the key the worker never holds; a
    diff to
    `.adlc/findings.jsonl` is a violation — neither the worker nor fleet's
    inner review may write it, and fleet's inner review runs without
@@ -909,14 +1200,71 @@ gitignored `.adlc/autopilot-*` files.
    attested or pushed. The same check runs again immediately before
    step 7 and before every push in §6.8/§8/§6.9 — a diff that passed once
    is not trusted after any later write.
-6. Final local gate in the issue worktree: `node scripts/preflight.mjs --base
-   <BASE_OID>` (tests + rail-freeze + mutation-gate + ledger + comment
-   gates, CI order). Failure consumes one round of the SAME budget (§7):
-   the run record's `roundsUsed` is incremented and steps 4–6 repeat with
+6. Final local gates — the SAME gate sequence `scripts/preflight.mjs`
+   runs in CI order (`scripts/run-tests.mjs`, `scripts/rails-guard-ci.mjs
+   refs/remotes/origin/<BASE_OID>`, `scripts/mutation-gate.mjs
+   refs/remotes/origin/<BASE_OID> --max 12`, the findings-ledger,
+   findings-append-only and reviewer-directed-comment gates), invoked
+   gate by gate by the orchestrator with `scripts/preflight.mjs` as the
+   normative ORDER (its `buildGates()` list is read from the pinned blob
+   and the sequence must match it exactly, `preflight-order-drift`
+   otherwise) — and every gate that EXECUTES repository code (the test
+   run, the mutation gate, anything that imports from `ISSUE_WT`) runs
+   inside a **repo-command-plane sandbox** whose git view is fully
+   inside it: the gates need `.git` (rails-guard and the mutation gate
+   diff against `refs/remotes/origin/<BASE_OID>`, the test run resolves
+   `HEAD`), and neither the host `.git` nor the mirror is ever bound, so
+   before the gate sequence the orchestrator cuts `GATE_REPO` — a
+   throwaway single-branch `git clone` of the GATE mirror of §6.4
+   (`<run dir>/gate.git`, synchronized to `attestedHead` after the last
+   orchestrator commit; local, hard links disabled) under the run
+   directory, checked out at `attestedHead` (`gate-repo-stale` if
+   `rev-parse HEAD` differs), with `refs/remotes/origin/<BASE_OID>`
+   created inside it and no config beyond `core.*` (the clone's
+   `remote.origin.*` is deleted). Because repository code runs inside
+   the writable clone — including its `.git`, where the baseline ref
+   the trust-root gates diff against lives — no gate may inherit a git
+   view another gate's code could have touched, and no gate's verdict
+   is accepted from a view its own code changed: EVERY gate gets its
+   OWN fresh clone (`GATE_REPO-<k>` for the k-th gate, cut from the
+   gate mirror immediately before it, removed immediately after), the
+   dependency tree is installed ONCE per sequence into `<run
+   dir>/gate-deps` (a further clone at `attestedHead` used only for the
+   host-side `npm ci --ignore-scripts` of §6.5b) and bound READ-ONLY at
+   `GATE_REPO-<k>/node_modules` (the workspace links are relative, so
+   they resolve inside each clone), and around each gate the
+   orchestrator snapshots and re-verifies the clone's git state — `git
+   rev-parse HEAD` (= `attestedHead`), `git rev-parse
+   refs/remotes/origin/<BASE_OID>` (= `BASE_OID`), the complete
+   `for-each-ref` output, `git config --list --local`, the absence of
+   `.git/hooks/*` executables and of `.git/info/exclude` changes, and
+   `git status --porcelain` being empty — before the gate spawn and
+   after it exits; any difference → `gate-repo-moved`, the gate's verdict
+   is discarded and the run fails. Each gate runs with `cwd =
+   GATE_REPO-<k>` under fleet's `bwrap` profile with network DENIED,
+   reads bounded to the clone, the read-only dependency tree, the pinned
+   tool files and system roots, writes bounded to the clone and a
+   private tmpfs, a synthetic empty `HOME`. Gate results are attached to
+   `attestedHead`, never to a path. The sandbox environment contains no
+   `SSH_AUTH_SOCK`, no `gh`/`GITHUB_TOKEN`, no `ADLC_MANIFEST_KEY`, no
+   `.env.local`, none of the orchestrator's state paths): the worker's
+   code never runs on the host with the orchestrator's credentials or
+   filesystem. The base fetch the script would perform is unnecessary —
+   the tracking ref is pre-created (below) and the objects are local —
+   so no gate needs network. `scripts/preflight.mjs` itself is an
+   immutable trust root (§4.2) that performs its own `git fetch origin`
+   and cannot be run with network denied; §15 R13 requests `--no-fetch
+   --sandboxed` so the script itself can be the runner; until then the
+   orchestrator runs its gates. `npm ci --ignore-scripts --no-audit
+   --no-fund` (§6.5b) executes no package code, stays on the host, and
+   targets `GATE_REPO`, so the sandboxed gates find the dependency tree
+   where they run.
+   Failure of any gate consumes one round of the SAME budget (§7): the
+   run record's `roundsUsed` is incremented and steps 4–6 repeat with
    `--max-strikes <15 − roundsUsed>` and `--wall-clock-minutes <remaining>`;
    if either remaining budget is 0 the run is `blocked` exactly as a fleet
    exit 2 would be.
-   **Retry protocol** (identical for a preflight failure here, a
+      **Retry protocol** (identical for a preflight failure here, a
    final-review failure in §6.7a, a CI red in §6.9, and a rebase conflict
    in §8). Step 0 — **reopen if completed**: if the run has passed §6.6a
    in a previous round, the shard is `completed:true` and fleet would not
@@ -1005,14 +1353,21 @@ gitignored `.adlc/autopilot-*` files.
 8. **Verify, then push, then verify.** Before pushing: `git rev-parse HEAD`
    in `ISSUE_WT` must equal `attestedHead` (the HEAD recorded alongside the
    step-7 attestation in the run record), the actual-diff check (§6.5a)
-   must pass again, and the working tree must be clean. Push with `git push
+   must pass again, and the working tree must be clean. Push from the network repository (§9.1c), which holds no local
+   branch refs, by explicit OID refspec: `git --git-dir=<NET_GIT> push
    --force-with-lease=refs/heads/adlc/autopilot/issue-<n>:<expectedRemoteOid>
-   origin adlc/autopilot/issue-<n>` where `expectedRemoteOid` is the OID
+   <remotePushUrl> <attestedHead>:refs/heads/adlc/autopilot/issue-<n>` —
+   the source is the immutable attested OID (readable through the
+   alternates), never a branch name that could move — where
+   `expectedRemoteOid` is the OID
    recorded at the previous push (or the empty-ref form for a first push);
    a lease failure means someone else pushed to the autopilot's branch →
    state `oid-mismatch`, no PR upsert, comment on the PR if one exists.
-   After pushing: `git ls-remote origin refs/heads/adlc/autopilot/issue-<n>`
-   must equal `attestedHead`; otherwise state `oid-mismatch`. Only after
+   After pushing: `git --git-dir=<NET_GIT> ls-remote <remotePushUrl> refs/heads/adlc/autopilot/issue-<n>`
+   must equal `attestedHead`; otherwise state `oid-mismatch`; on
+   success the record's `lastPushedOid = attestedHead` and
+   `lastPushedAt = now` are written in one atomic record write with the
+   state change. Only after
    the post-push verification does the autopilot **upsert** the PR keyed by
    head branch (never a body sentinel), and the upsert is itself bound:
    immediately before `gh pr create`/`gh pr edit` the `ls-remote` check is
@@ -1156,7 +1511,7 @@ and is reported in status:
 - `headRefOid` equals the record's `attestedHead` (the PR head is the tree
   the autopilot last attested and pushed) — a mismatch is `oid-mismatch`
   (§6.8), not `orphan`;
-- `git ls-remote origin refs/heads/adlc/autopilot/issue-<n>` equals the
+- `git --git-dir=<NET_GIT> ls-remote <remoteFetchUrl> refs/heads/adlc/autopilot/issue-<n>` equals the
   record's last pushed OID.
 
 Then:
@@ -1197,9 +1552,23 @@ Then:
 
 ## 9. Preflight (fail closed, printed by `adlc-autopilot status`)
 
+Preflight has two phases with a strict ordering, because several checks
+read the pinned baseline: **phase A** (§9.1, §9.1a, §9.3, §9.3a, §9.5)
+needs no baseline and runs before `BASE_OID` is resolved — it is what
+makes the fetch itself trustworthy (pinned tools, pinned remote URLs);
+**phase B** (§9.2, §9.4, §9.6, and the `spec-approval`/`specBlob`
+binding of §14) runs only after §6.0 has produced `BASE_OID` and reads
+every repository input as `git show <BASE_OID>:<path>`. No phase-B check
+may ever fall back to a working-tree file or a tracking ref when
+`BASE_OID` is unavailable — an unavailable baseline is itself a phase-A
+failure (`base-unresolved`) and the iteration sleeps.
+
 9.1 Toolchain: `adlc` (the key-bearing CLI — its pinned path is also
 asserted by the key-hygiene test, AC 12), `bwrap`, `claude`, `codex`,
-`adversarial-review`, `gh`, `git`, `npm`, `node >= 18` are resolved ONCE
+`adversarial-review`, `gh`, `git`, `ssh` (the transport executable the `GIT_SSH`
+wrapper execs, §9.1b), `ssh-add` and `ssh-keygen` (agent enumeration and
+public-key derivation, §9.1b — invoked by their pinned absolute paths
+only), `npm`, `node >= 18` are resolved ONCE
 at preflight to absolute paths from
 a sanitized search list — the orchestrator's PATH entries that are
 absolute, exist, and are not under `REPO_ROOT`, any `.worktrees/`, or any
@@ -1218,28 +1587,260 @@ placed in a child environment. Children receive
 applies), never the raw inherited PATH. `gh auth status` ok; `claude auth
 status --json` `loggedIn:true`.
 
-9.1a Repository and principal binding: `autopilot.repo` (repo-committed,
-e.g. `"voodootikigod/adlc"`) is the canonical identity. Preflight requires
-`git remote get-url origin` AND `git remote get-url --push origin` to
-resolve (after normalizing `git@github.com:` / `https://github.com/` /
-trailing `.git`) to exactly that repo; `gh repo view <repo> --json
+9.1b (phase A) Git transport sanitization: a pinned URL is only as
+trustworthy as the transport git resolves it through, so EVERY git
+process the orchestrator spawns — including the bracketed
+`scripts/preflight.mjs` and fleet's own git calls via the env fleet
+inherits — runs with `GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and with every
+`GIT_SSH*`, `GIT_PROXY_COMMAND`, `GIT_ASKPASS`, `SSH_ASKPASS`,
+`GIT_CONFIG_PARAMETERS`, inherited `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/
+`GIT_CONFIG_VALUE_*`, `http_proxy`/`https_proxy`/`all_proxy`
+(any case) and `GIT_TERMINAL_PROMPT` variable removed from the
+environment; the transport itself is ISOLATED, not inherited: for SSH URLs the
+orchestrator always sets `GIT_SSH` (which git executes DIRECTLY, without
+a shell, and prefers over any `core.sshCommand`) to an orchestrator-
+generated wrapper at `<SSH_DIR>/wrapper`
+— a regular file, mode `0500`, owned by the invoking uid, whose sha256
+is recorded in the status file and re-verified immediately before every
+spawn that carries it (`ssh-wrapper-tampered` otherwise), containing a
+fixed template that `exec`s the pinned `ssh` executable with the
+options below, every embedded path written with POSIX single-quote
+escaping (`'…'` with `'\''` for embedded quotes) so `REPO_ROOT`,
+known_hosts, identity and socket paths containing spaces or shell
+metacharacters are passed intact, and forwarding git's own arguments
+(`"$@"`) unchanged — the pinned `ssh` executable with
+`-F /dev/null` (no user or system `ssh_config`, so no `Host`/`HostName`/
+`ProxyCommand`/`ProxyJump`/`LocalCommand` rewrite can apply),
+`-o StrictHostKeyChecking=yes`, `-o UserKnownHostsFile=<SSH_DIR>/known_hosts`
+(an orchestrator-owned file written by `init` from `gh api meta`'s
+`ssh_keys` for the pinned host and refreshed only by `init --write`; a
+host-key mismatch fails the operation, never prompts), `-o
+IdentitiesOnly=yes`, `-o BatchMode=yes`, and exactly ONE authentication
+mode resolved in phase A — the modes are EXCLUSIVE: `--ssh-identity`
+present → explicit mode and the agent is not consulted at all (if
+`SSH_AUTH_SOCK` is also set the run stops with `ssh-mode-ambiguous`
+rather than silently preferring either); `--ssh-identity` absent and
+`SSH_AUTH_SOCK` naming an existing socket → agent mode; neither → phase
+A exits 1 `ssh-auth-missing`. In BOTH modes the key that will
+authenticate is bound to the `gh`-verified principal (§9.1a) with the
+fingerprint taken from the material that will actually be used, and
+the binding happens AFTER that material is under the orchestrator's
+control so nothing can be swapped between verification and use:
+- explicit mode: the orchestrator first COPIES the operator's file into
+  the per-iteration directory (§9.4a) — opened with `O_NOFOLLOW`, must be
+  a regular file owned by the invoking uid with mode `0600`, copied with
+  `0600`, and the copy's inode/device/size/sha256 recorded — then derives
+  the public key from the COPY (`ssh-keygen -y -f <copy>`) and requires
+  it to be one of the principal's registered keys per the **key-match
+  rule**: `gh api --hostname <host> --paginate user/keys` returns
+  objects carrying each registered public key's `key` line (`<type>
+  <base64 blob> [comment]`), `id`, `title`, `created_at`, `verified`,
+  `read_only` — and NO fingerprint field — so the orchestrator canonic-
+  alizes both sides to `<type> <base64 blob>` (comment dropped, one
+  space) and requires byte equality with at least one returned `key`
+  across ALL pages, additionally recording the pinned `ssh-keygen -lf`
+  SHA256 fingerprint of the matched key for the log; an empty or
+  unparseable response, or a page fetch failure, is `ssh-identity-
+  unbound`, never a pass; only then it generates the wrapper with `-o
+  IdentityAgent=none -i <copy>`; a `.pub`
+  beside the original is never read; the original path is never named
+  in any argv;
+- agent mode: the candidates are the keys the agent holds (the PINNED `ssh-add -L`
+  over the recorded socket, §9.1), matched by the same key-match rule
+  against the paginated `user/keys` `key` lines; exactly the matched key's public line is
+  written by the orchestrator to `<ssh dir>/identity.pub` (`0600`,
+  recorded), and the wrapper carries `-o IdentityAgent=<socket> -i
+  <ssh dir>/identity.pub` (with `IdentitiesOnly=yes`, naming an agent
+  key's public file makes ssh offer only that agent identity);
+no match in either mode → exit 1 `ssh-identity-unbound`, no network
+spawn; every file named here is re-validated before each network spawn
+per §9.4a. The generated unit (§9.3a) must carry exactly one mode:
+`Environment=SSH_AUTH_SOCK=<abs socket>` when `init --service` is run
+with the socket present and no `--ssh-identity`, or the `--ssh-identity`
+path baked into `ExecStart` (and no `SSH_AUTH_SOCK` line); `init --service` refuses to generate a unit with neither;
+`--git-ssh-command` is NOT an option (a free-form command cannot be
+validated). HTTPS remotes are not supported in v1 (§9.1a), so no HTTP transport
+setting can apply; the phase-A audit nevertheless rejects ANY `http.*` /
+`https.*` / `credential.*` / `core.sshCommand` / `core.gitProxy` key in
+the repo-local config outright. In addition EVERY `GIT_*` variable inherited from the orchestrator's
+own environment is removed before the bound set is applied — in
+particular the repository-selection variables `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_NAMESPACE`, `GIT_CEILING_DIRECTORIES`,
+`GIT_DISCOVERY_ACROSS_FILESYSTEM`, `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`,
+`GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`
+and every `GIT_TRACE*`/`GIT_ATTR_*`/`GIT_LITERAL_PATHSPECS`-style
+variable — so a poisoned inherited environment cannot redirect which
+repository, index or object store a spawn operates on; and before every
+destructive or network git operation the orchestrator asserts `git -C
+<cwd> rev-parse --show-toplevel` equals the expected `REPO_ROOT` or
+`ISSUE_WT` and `git -C <cwd> rev-parse --git-dir` lies under
+`<REPO_ROOT>/.git` (`repo-identity-mismatch` otherwise). **`origin` is
+BOUND, not observed:** after stripping, the orchestrator sets its OWN
+environment-supplied configuration on every git process —
+the following env-supplied configuration table, numbered in this
+order with `GIT_CONFIG_COUNT=7` (exactly these rows; the test asserts
+the exact list):
+
+| n | key | value |
+|---|---|---|
+| 0 | `remote.origin.url` | `<remoteFetchUrl>` |
+| 1 | `remote.origin.pushurl` | `<remotePushUrl>` |
+| 2 | `core.hooksPath` | `/dev/null` |
+| 3 | `url.<remoteFetchUrl>.insteadOf` | `<remoteFetchUrl>` |
+| 4 | `url.<remotePushUrl>.pushInsteadOf` | `<remotePushUrl>` |
+| 5 | `url.<remotePushUrl>.insteadOf` | `<remotePushUrl>` (identical to row 3 when the URLs are byte-identical, kept as its own row so a future split-URL mode cannot forget it) |
+| 6 | `core.sshCommand` | the single-quoted absolute path of the `GIT_SSH` wrapper (belt and braces: `GIT_SSH` already wins, this row also pins the file-level key to the same wrapper) |
+
+Because remotes are SSH-only (§9.1a), no HTTP credential helper, proxy,
+TLS, redirect, cookie or header setting can ever apply to an autopilot
+network operation — `credential.*`, `http.*` and `https.*` keys in the
+repo-local config are still rejected by the phase-A audit so their
+appearance is reported, but they have no transport to influence.
+
+git applies these with precedence over every config FILE, so any process
+that names `origin` (including the immutable `scripts/preflight.mjs` and
+fleet's git calls) resolves it to the pinned URLs for the lifetime of
+that process regardless of what `.git/config` says at any instant, and
+the HTTPS safety settings likewise cannot be undone by a file edit
+during the operation. Entries 3–5 are defense in depth only: git rewrites a URL with the
+LONGEST matching `insteadOf` / `pushInsteadOf` key but keeps the FIRST
+of equal-length matches, and files are read before the environment, so
+an exact-URL rewrite in `.git/config` would still win — which is why no
+network operation ever runs against the repository's configuration
+(§9.1c); inside `NET_GIT` there are no file rewrites for these rows to
+lose to. The phase-A audit still forbids
+such entries so their appearance is reported. Finally every network
+operation is VERIFIED at the endpoint, not the config: after a push,
+`git --git-dir=<NET_GIT> ls-remote <remotePushUrl> refs/heads/<branch>` (itself run under the
+same bound environment, and by §9.1a the same endpoint as every fetch)
+must return `attestedHead` (§6.8); after a fetch, the fetched object's
+OID must equal the one `ls-remote` announced (§6.0). The repository-local
+`<REPO_ROOT>/.git/config` (operator-owned, never part of a PR) is
+audited in phase A: any `url.*.insteadOf` / `url.*.pushInsteadOf`,
+`core.sshCommand`, `core.gitProxy`, `http.proxy`, `https.proxy`,
+`remote.*.proxy`, `remote.*.uploadpack`/`receivepack`, `credential.*`, `include.*`/`includeIf.*`, or
+`core.hooksPath` entry → exit 1 `git-config-untrusted`, no network
+operation. The audit re-runs inside the preflight bracket of §6.6 and
+before every push.
+
+9.1c (phase A) Network repository — the ONLY place network git runs:
+git resolves `url.*.insteadOf` by longest match and, among EQUAL-length
+matches, keeps the first one read, and config FILES are read before
+environment-supplied entries; so an exact-URL rewrite planted in
+`.git/config` would beat the env identity pin of §9.1b. The autopilot
+therefore never performs a network operation against the repository's
+own configuration. Every `ls-remote`, `fetch` and `push` (and every
+lease-guarded delete) runs as `git --git-dir=<NET_GIT> …` where
+`NET_GIT` = `<REPO_ROOT>/.adlc/autopilot-runs/net.git`, a bare
+repository the orchestrator creates at `init --write` and re-verifies in
+phase A: its `config` is orchestrator-written from a fixed template
+(`core.repositoryformatversion=0`, `core.bare=true`,
+`remote.origin.url`/`pushurl` = the pinned URL, `core.sshCommand` = the
+wrapper path, `core.hooksPath=/dev/null`, nothing else — in particular no
+`url.*`, `credential.*`, `http.*`, `include*`), its sha256 is recorded in
+the status file and re-checked immediately before every network spawn
+(`net-config-tampered` → `orphan`, nothing sent), its `hooks/` directory
+is empty, and `objects/info/alternates` names `<REPO_ROOT>/.git/objects`
+so the network repository can read every object the main repository has
+without copying. Fetches land in `NET_GIT`'s own object store and refs
+(`refs/autopilot/fetched/*`); the orchestrator then moves what it needs
+into the main repository with a LOCAL, file-transport `git -C <REPO_ROOT>
+fetch <NET_GIT> <oid>` (no network, no rewrite surface). Pushes read the
+attested objects through the alternates and always name the source as an
+OID refspec (`<attestedHead>:refs/heads/<branch>`), since `NET_GIT`
+deliberately has no `refs/heads/*` of its own. `GIT_CONFIG_GLOBAL`/`SYSTEM` =
+`/dev/null` still apply, so `NET_GIT`'s config is the complete
+configuration of every network process; the env-bound rows of §9.1b are
+retained as defense in depth, not as the boundary. The immutable
+`scripts/preflight.mjs` is the one network user that cannot be routed
+through `NET_GIT`: its fetch is by OID with the tracking ref pre-created
+(§6.6), so the worst a redirected endpoint can do is answer or refuse —
+it cannot substitute content for a requested OID — and the after-call
+checks discard the run if the ref moved.
+
+9.1a (phase A) Repository and principal binding: the expected identity
+comes from an OPERATOR-LOCAL source that exists before any repository
+content is trusted — `--repo <owner/name>` or `ADLC_AUTOPILOT_REPO`
+(the generated unit file carries it as `Environment=`), validated
+against `^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`; without it phase A exits 1
+`repo-unbound`. Phase B then requires `autopilot.repo` in the config
+read from the pinned blob (§9.4) to EQUAL the operator-local value
+(`repo-mismatch` otherwise), so the committed config confirms but never
+defines the identity. The HOST of the pinned URLs is bound to the host `gh` is authenticated
+against: the pinned `gh auth status --hostname <host> --active --json
+hosts` (gh ≥ 2.40 grammar; `--json hosts` yields `{"hosts":{"<host>":
+[{state,active,host,login,…}]}}`) must yield exactly one entry for
+`<host>` with `state:"success"` and `active:true`, where `<host>` is the
+host part of the pinned SSH URL (`github.com` or a GHES host) — any other
+shape, a non-zero exit, or a `login` different from the `gh api user`
+principal of §9.1a → `gh-host-unbound`; every `gh api` call in this spec
+passes `--hostname <host>` explicitly. So the SSH URL's host part must
+equal the authenticated host exactly (`remote-host-mismatch` otherwise, before any network
+operation), and the pinned `known_hosts` is sourced only from that
+host's `gh api meta` — so the repository identity (§9.1a), the SSH
+endpoint and the host keys all name one host. Preflight OBSERVES the
+repository's own remote configuration with a read that the bound
+environment of §9.1b cannot influence — `git config
+--file <REPO_ROOT>/.git/config --get remote.origin.url` and `--get
+remote.origin.pushurl` (falling back to `url` when `pushurl` is unset),
+run WITHOUT the `GIT_CONFIG_COUNT` overlay (only the sanitization of
+§9.1b applies) — and requires both observed values to normalize (after
+`git@github.com:` / `ssh://git@github.com/` / `https://github.com/` /
+trailing `.git` canonicalization) to exactly that repo; the observed,
+canonical values are what get pinned as `remoteFetchUrl` /
+`remotePushUrl` — and in v1 the two canonical strings MUST be
+BYTE-IDENTICAL (`remote-url-split`, exit 1, otherwise; canonicalization
+maps `git@<host>:<o>/<r>.git` and `ssh://git@<host>/<o>/<r>.git` to one
+form first), so every fetch, `ls-remote` and push, and every
+post-operation verification, addresses one endpoint through one string
+that the same identity `insteadOf`/`pushInsteadOf` rows protect — and
+every later "immediately before the operation"
+re-read uses the same `--file` form, so identity is always verified
+against the file and never against the overlay that would echo it back; `gh repo view <repo> --json
 nameWithOwner,defaultBranchRef` must return that name and default branch
 `main`; `gh api user` must return a login whose `gh api
 repos/<repo>/collaborators/<login>/permission` is `admin`, `maintain` or
 `write`. Any mismatch → exit 1 (`repo-mismatch` / `principal-unauthorized`)
-before any issue, PR or git write. Every `gh` invocation thereafter passes
-`--repo <repo>` explicitly (never relies on cwd inference). The verified
+before any issue, PR or git write. Every `gh` invocation thereafter is
+host-bound twice over, so a verified GHES host can never fall back to
+`github.com`: wherever this spec writes `--repo <repo>`, `<repo>` is
+`REPO_SPEC` = `<host>/<owner>/<name>` (gh's `HOST/OWNER/REPO` form),
+passed explicitly on every command that accepts `--repo` (issue
+list/view/edit/comment, pr create/view/edit/list/checks, repo view —
+never cwd inference); `gh api` and `gh auth status` carry `--hostname
+<host>`; and every gh spawn's environment carries `GH_HOST=<host>` (the
+one variable gh consults for host selection) and no other `GH_*`/
+`GITHUB_*` variable but the token gh itself manages. The verified
 fetch and push URLs are PINNED for the iteration (stored in the status
 file and copied into each run record as `remoteFetchUrl` /
-`remotePushUrl`), and every network git operation — `ls-remote`, `fetch`,
-`push`, including the lease-guarded deletes — is invoked with that URL
-literal as the remote argument, never with the mutable name `origin`;
-immediately before each such operation `git remote get-url [--push]
-origin` is re-read and must still normalize to the pinned value,
+`remotePushUrl`) in CANONICAL form, and in v1 they MUST be SSH URLs
+(`git@<host>:<owner>/<repo>.git` or `ssh://git@<host>/<owner>/<repo>.git`
+with the user part exactly `git`): an `https://` (or any non-SSH) remote
+is rejected at phase A (`remote-url-scheme`, exit 1) — HTTPS transport
+would need credential helpers and TLS/proxy/cookie/header settings that
+a mutable config can influence, and SSH with an isolated `ssh_config`
+and pinned host keys (§9.1b) has no such surface; a URL with any other
+userinfo is rejected (`remote-url-credentials`) rather than
+canonicalized, so no token can reach argv, the status file, a run
+record, a comment or the journal; authentication is the SSH agent or an
+explicit `--ssh-identity`, never the URL, and every network git operation — `ls-remote`, `fetch`,
+`push`, including the lease-guarded deletes — is invoked as `git
+--git-dir=<NET_GIT>` (§9.1c) with that URL literal as the remote
+argument, never with the mutable name `origin` and never against the
+repository's own configuration;
+immediately before each such operation `git config --file
+<REPO_ROOT>/.git/config --get remote.origin.url` (and `.pushurl`) is
+re-read WITHOUT the overlay and must still normalize to the pinned
+value,
 otherwise the run is `orphan` (`remote-url-changed`) and nothing is
-pushed.
+pushed. The bound overlay of §9.1b is applied ONLY to processes that
+perform network operations (and to the bracketed preflight and fleet,
+which may); observation reads never carry it.
 
-9.2 Plugin parity: the installed `adlc@adlc` plugin version
+9.2 (phase B) Plugin parity: the installed `adlc@adlc` plugin version
 (`~/.claude/plugins/installed_plugins.json`) equals the `version` in
 `git show <BASE_OID>:plugins/adlc-claude-code/.claude-plugin/plugin.json`
 — read from the pinned baseline of THIS iteration (§6.0), never from a
@@ -1259,7 +1860,9 @@ from every other spawn (the **key-bearing allowlist**, asserted by AC 12):
 `adlc ticket create --write`, `adlc ticket complete --write`, `adlc ticket
 update --write` (reopen-for-retry only, §6.6), `adlc coldstart
 --record-verdict`, `adlc spec-lint --record`, `adlc prosecute
-record-cross-model`. Fleet, the shaping/coldstart `claude -p` calls, both
+record-cross-model`, and `adlc gate-manifest verify` (§6.5a — the one
+reader on the list, because signature verification is inert without
+the key). Fleet, the shaping/coldstart `claude -p` calls, both
 `adversarial-review` invocations, `gh`, `git`, `npm`, and `preflight.mjs`
 never receive it.
 
@@ -1268,14 +1871,26 @@ carries an absolute `WorkingDirectory=<repo root>` (validated at generation
 and at start: the directory must contain `.git` and `.adlc/config.json`,
 else exit 1 `bad-working-directory`), an absolute `ExecStart=<abs path to
 node> <abs path to packages/autopilot/bin/adlc-autopilot.mjs> loop --rest
-10m`, `EnvironmentFile=<abs repo root>/.env.local`, `Restart=on-failure`,
+10m [--ssh-identity <abs private key path>]` — the `--ssh-identity`
+argument is emitted exactly when `init --service` was run in explicit
+mode (§9.1b) and then no `Environment=SSH_AUTH_SOCK=` line is emitted;
+in agent mode the reverse; a unit with both or neither is never
+generated — `EnvironmentFile=<abs repo root>/.env.local`,
+`Environment=ADLC_AUTOPILOT_REPO=<owner/name>` (the phase-A identity, set
+at generation from `--repo` and never read from the repository),
+`Restart=on-failure`,
 `RestartSec=60`, `KillMode=control-group`, and `TimeoutStopSec=120` (the
 loop traps SIGTERM: finishes the current git/gh step, writes the run record,
 releases the lock, exits 0; an in-flight fleet run is left resumable per
 §2.1). No `%h` expansion is used for paths the tests must assert
 byte-for-byte.
 
-9.4 Repo: `.adlc/config.json` exists on `origin/main` with a `fleet` block
+9.4 (phase B) Repo: `.adlc/config.json` is read as `git show
+<BASE_OID>:.adlc/config.json` — the pinned baseline of this iteration,
+never the working tree, a local `main`, or a tracking ref — parses as
+JSON, validates against the schema the autopilot ships for its own
+block and against `packages/ticket-sync/schemas/adlc-config.schema.json`
+for `ticketSync`, and carries a `fleet` block
 (`gate.build`, `gate.test`, `init`, `allowedCommands`, `reviewProvider:
 "codex"`, `prosecuteFailOn`, `timeoutMinutes`) and a `ticketSync` block
 that validates against
@@ -1283,13 +1898,58 @@ that validates against
 required; `query` is omitted or a string, never `null`) — §0.12. The R1
 ticket's AC1 runs that schema validation.
 
+9.4a (phase A) SSH material directory and revalidation: everything the
+transport depends on lives in ONE exclusive per-iteration directory
+`SSH_DIR` — `<REPO_ROOT>/.adlc/autopilot-runs/ssh-<iterationToken>/`
+in a run, created with mode `0700` by the orchestrator (`ssh-dir-exists`
+if it already exists — never reused); under `--dry-run` the `mkdtemp`
+directory outside `REPO_ROOT` of §0, with the same contents and
+validations, removed on exit. Every path the wrapper names —
+`known_hosts`, the identity copy or public line, the wrapper itself —
+is derived from the ACTUAL `SSH_DIR` of that invocation and nothing is
+ever hard-coded under `REPO_ROOT`, so a dry-run wrapper references only
+its temporary directory and can never read a stale repository-local
+file: the `GIT_SSH` wrapper (§9.1b), `known_hosts` (copied from
+`<REPO_ROOT>/.adlc/autopilot-known_hosts`, which `init --write` creates
+from `gh api meta` of the gh host and which must be a regular `0600`
+file owned by the invoking uid, else `known-hosts-missing`), the
+matched agent public key file in agent mode, and — in explicit mode — a
+`0600` COPY of the private key made at phase A after its fingerprint was
+bound (§9.1b), so the key that authenticates is the one that was
+verified. At creation the orchestrator records, for every file in the
+directory, its sha256, size, owner uid, mode, inode and device in the
+status file; IMMEDIATELY before every network spawn it re-`stat`s and
+re-hashes each file and requires all six to be unchanged, requires the
+directory itself to still be `0700`/owned with the same inode, and in
+agent mode re-runs `ssh-add -L` over the socket (whose inode/device are
+also recorded) and requires the bound fingerprint to still be offered;
+any difference → `ssh-material-tampered`, the run is `orphan`, nothing
+is sent. The directory is removed at the end of the iteration. All of it
+is gitignored via `.git/info/exclude` with the other `.adlc/autopilot-*`
+entries.
+
 9.5 Labels exist: `adlc:autopilot`, `adlc:autopilot-skip`,
 `adlc:needs-clarification`, `adlc:autopilot-blocked`, `adlc:autopilot-stale`,
-`adlc:autopilot-ci-red`, `adlc:autopilot-log` (`adlc-autopilot init
---labels` creates them idempotently).
+`adlc:autopilot-ci-red`, `adlc:needs-human`, `adlc:autopilot-log`
+(`adlc-autopilot init --labels` creates them idempotently; phase A
+fails closed with `labels-missing` naming the absent ones, so every
+label mutation this spec performs — the `adlc:needs-human` escalation
+of §2.1a included — targets a label that is known to exist).
 
-9.6 Fleet dry-run: `adlc fleet run --dry-run --json` from the primary
-checkout exits 0.
+9.6 (phase B) Fleet dry-run at the pinned baseline: a detached temporary
+worktree is created at `BASE_OID` under
+`<REPO_ROOT>/.adlc/autopilot-runs/preflight-<BASE_OID>` (`git worktree
+add --detach <path> <BASE_OID>`; objects are local by phase-B
+precondition), `adlc fleet run --dry-run --base <BASE_OID> --json` runs with cwd = that
+worktree — so it reads the pinned `.adlc/config.json` and ticket store,
+never the primary checkout's working tree, and its `--base` is the OID
+literal, never `main` — must exit 0 and its `--json` must report
+`baseSha == BASE_OID`, and the
+worktree is removed afterwards (a leftover from a crash is removed before
+the next attempt). The primary checkout is never the cwd of any
+preflight command. Fleet's own git processes inherit the same bound
+environment (§9.1b) from the orchestrator, so their `origin` is pinned
+too.
 
 ## 10. Observability
 
@@ -1390,18 +2050,17 @@ worktree rules as a human session (§11). Deferred to a follow-up ticket.
   environment; (4) the worker's harness credentials (its OAuth token in
   the synthetic home) are the ONE secret it must hold — the harness
   cannot authenticate without them and there is no external auth broker
-  for the CLI — which is why (1) and (2) exist. **Accepted residuals:** network
-  egress from the model plane is not filtered in v1 (fleet K2; a
-  destination-allowlisting proxy inside the network namespace is the v2
-  item, tracked in the fleet ticket's NOT-IN-SCOPE), so anything within
-  `READ_SET` — the published baseline, the issue branch, and the worker's
-  own harness credentials — can in principle leave through model
-  traffic; the credential exposure is inherent to running the harness
-  at all (the CLI has no external auth broker and a scoped
-  non-exportable credential does not exist for it) and is bounded — not
-  eliminated — by the authorization boundary above together with §5's
-  rule that only OWNER-authored body text drives an unlabeled dispatch;
-  and the diff
+  for the CLI — which is why (1) and (2) exist. **Egress is allowlisted, not open:** the model plane has no network
+  route except a loopback bridge to a host-side CONNECT proxy whose only
+  permitted destination is the model API (§6.4, fleet item 13), so the
+  harness's OAuth token — which the worker must hold, the CLI having no
+  external auth broker — can be presented only to the service that
+  issued it; content in `READ_SET` can still leave INSIDE model requests
+  to that service (inherent to using a hosted model at all, and bounded
+  by the authorization boundary above together with §5's rule that only
+  OWNER-authored body text drives an unlabeled dispatch), but it cannot
+  be posted anywhere else. **Accepted residual:** the model API itself
+  is the one permitted destination; and the diff
   secret scan of §6.5a(iv) protects only what reaches GitHub — it is NOT
   a mitigation for content exposed in model requests and is not claimed
   as one.
@@ -1426,6 +2085,39 @@ worktree rules as a human session (§11). Deferred to a follow-up ticket.
   CI, and CI red is treated as blocking (§0.11).
 - **Stale plugin** → parity check (§9.2) refuses to dispatch.
 
+### 11.1 Accepted residuals (canonical, hashed)
+
+This numbered list is the ONLY input of the `spec-approval` assumptions
+binding (§14): the extractor takes the ordered items of this section,
+each item being the text after its `N. ` marker up to the next item or
+blank line with every run of whitespace (including line breaks)
+collapsed to one space, and hashes `JSON.stringify(items)` with sha256.
+The newest `spec-approval` record's `approved_assumptions` must equal
+that array element for element and its `assumptions_hash` that digest.
+Prose elsewhere in §11 explains the residuals; only these items bind.
+
+1. The model API host is the one permitted model-plane egress
+   destination; content in READ_SET can leave inside model requests to
+   that service (§6.4, §11).
+2. The worker holds the harness OAuth token in its synthetic home
+   because the CLI has no external auth broker; the egress allowlist
+   bounds where it can be presented (§11).
+3. The diff secret scan of §6.5a(iv) protects only what reaches GitHub;
+   it is not a mitigation for content exposed in model requests.
+4. The quota gate makes overshoot visible and refuses the next start;
+   it never prevents a single step's overshoot (§3.4).
+5. The #141 non-author-CODEOWNER ceremony is unsatisfiable with a single
+   CODEOWNER; .adlc/config.json lands by deliberate admin merge (§0).
+6. scripts/preflight.mjs gates run gate by gate in a sandbox until R13
+   lands (§6.6).
+7. Five spec-review residuals are enforced as build-ticket AC2–AC6
+   rather than as spec prose.
+8. An operator-requested remote branch delete cannot be made atomic
+   against a concurrent pull-request creation; the window is bounded by
+   ref-too-fresh, a 120 s post-delete grace loop and 24 h of
+   per-iteration re-checks, and repaired by the lease-guarded restore of
+   §2.1a; a pull request opened after the last re-check is the residual.
+
 ## 12. Failure policy
 
 | Condition | Effect |
@@ -1447,11 +2139,17 @@ process group, with a deadline, and with stdin CLOSED — except the
 enumerated **stdin-bearing commands**, whose stdin receives exactly the
 orchestrator-serialized bytes and is then ended: `adlc ticket create
 --input -`, `adlc ticket update --input -`, `adlc coldstart
---record-verdict -`, and the two `claude -p` calls (shaping, §5.2, and
-the coldstart answer, §6.3) — their PROMPT is the stdin payload (`claude
--p` with no positional prompt reads it from stdin), never an argv element
-(argv is visible to every process on the host via `/proc`) and never a
-file; both are also subject to the 5-minute deadline of §12.1. The shared spawn wrapper takes an explicit
+--record-verdict -`, and the three `claude -p` calls (shaping, §5.2;
+the coldstart answer, §6.3; and the **token refresh**, §6.4 item 14 —
+argv exactly `claude -p --model <effectiveModel> --output-format json
+--permission-mode plan --max-turns 1`, stdin payload exactly the bytes
+`ok\n`, `cwd` an empty private directory under the run directory, env
+the minimal set of §3.2's helper plus the real `HOME`, `ADLC_MANIFEST_
+KEY` scrubbed, stdout capped at 64 KiB and discarded after the exit
+status is read) — their PROMPT is the stdin payload (`claude -p` with no
+positional prompt reads it from stdin), never an argv element (argv is
+visible to every process on the host via `/proc`) and never a file; all
+three are also subject to the 5-minute deadline of §12.1. The shared spawn wrapper takes an explicit
 `stdinBytes` option; every other spawn passes none and gets a closed
 stream; on expiry SIGTERM is sent to the group, SIGKILL 15 s later, and
 the step fails with `reason:"timeout:<command>"`. The orchestrator's own
@@ -1473,6 +2171,47 @@ SIGTERM handler forwards to the current child's group and exits within
 | CI poll (`gh pr checks`) | 60 s per poll, 30-min watch | per §6.9 |
 
 ## 13. Configuration
+
+### 13.0 Normative CLI grammar (`adlc-autopilot`, also reachable as `adlc autopilot`)
+
+```
+loop    [--rest <duration>] [--dry-run]
+once    [--issue <n>] [--force] [--dry-run] [--dry-run-shape]
+status  [--json]
+select  [--top <n>] [--json]
+quota   [--json] [--model <m>] [--quota-threshold <T>] [--quota-reserve <R>]
+        [--iteration <id>] [--start-ordinal auto]        # pre-strike helper form
+triage  --issue <n> [--json]
+reset   --issue <n> ( --confirm-delete <OID> [--delete-remote] | --attempts )
+init    [--labels] [--service] [--write]
+```
+Global operator-local flags: `--repo` (or `ADLC_AUTOPILOT_REPO`; required
+for `loop`/`once`), `--model`, `--adapter`, `--quota-threshold`,
+`--quota-reserve`, `--trusted-bin-dirs`, `--ssh-identity`. Every subcommand exits 0/1/2 and
+supports `--json`. `reset --attempts` is a journaled, crash-idempotent transaction under
+the autopilot lock: (1) write
+`.adlc/autopilot-runs/<issue>.attempts.reset.journal` `{startedAt,
+ledgerSha256}`; (2) read the ledger RAW (no retention pruning) and append
+to `.adlc/autopilot-runs/<issue>.attempts.archive.jsonl` (append-only,
+never pruned; ONE complete JSON record per line, each line carrying its
+own `sha256` of the record and written with a single `O_APPEND` write
+that ends in `\n`, so a crash can leave at most one truncated tail line — which readers
+and recovery discard when its trailing newline is missing — whereas a
+COMPLETE line whose checksum does not match is an integrity failure,
+not a crash artifact: the archive is quarantined as
+`<name>.corrupt-<ts>` (bytes preserved, never rewritten), a fresh
+archive is rebuilt atomically from the valid lines, the event is
+reported in status as `archive-corrupt`, and only then does replay
+continue) every entry — including `started` entries and entries
+older than 7 days — whose `id` is not already present in the archive
+(replay is deduplicated by `id`, so a crash after a partial append never
+duplicates); (3) truncate the active ledger (temp + `rename`); (4)
+remove the journal. Recovery, and every other ledger operation, first
+checks for a journal under the lock and completes steps 2–4 before doing
+anything else. The command needs no OID, touches nothing else, is
+idempotent (a second call archives nothing and exits 0), and is the only
+exit from `shaping-failed`; `reset
+--confirm-delete` is §2.1a; `--delete-remote` is §2.1a Step R.
 
 Repo-committed (`.adlc/config.json`, trust root):
 
@@ -1505,6 +2244,10 @@ Repo-committed (`.adlc/config.json`, trust root):
 }
 ```
 
+`autopilot.repo` in the committed block must EQUAL the operator-local
+`--repo` / `ADLC_AUTOPILOT_REPO` of §9.1a — the committed value confirms
+the identity, it never defines it.
+
 Operator-local only — the quota is the OPERATOR's, so its policy never comes
 from repo-committed config (same rule as fleet's `adapter`/`model`):
 `--quota-threshold` (default 50, integer 1–50 — values above 50 are
@@ -1523,13 +2266,30 @@ ignored (AC 28). Repo-config keys (`restMinutes`, `maxOpenPrs`,
 
 None is trust-root tier; each is a small, separately testable diff.
 
-- `@adlc/fleet`: CLI flags `--model-plane-read host|bounded` and
+- `@adlc/fleet`: `--model-plane-egress open|allowlist` (item 13:
+  `allowlist` = `--unshare-net` for the model plane + a host-side CONNECT
+  proxy on a unix socket with the adapter-declared model hosts as the
+  only permitted targets + an in-sandbox loopback bridge + `HTTPS_PROXY`
+  for the worker; default unchanged = `open`; `--json` reports the mode
+  and allowlist), CLI flags `--model-plane-read host|bounded` and
   `--model-plane-read-only <abs,abs,…>` (operator-local; `bounded`
   selects the sandbox module's existing `READ_POLICY.BOUNDED` for the
   MODEL plane — worktree + synthetic home + the allowlist — instead of the
   current `READ_POLICY.HOST`; the adapter's `homeState` still provides
   the harness's own config/credentials inside the synthetic home; default
-  unchanged = `host`), `--model-plane-git mirror` (item 12 of the fleet ticket: the worker's
+  unchanged = `host`), the synthetic-home construction contract (item
+  14: tmpfs `HOME` populated from the allowlist of §6.4 — validated
+  `0600` credential copy bound read-only with NO write-back, generated
+  `settings.json`/`.claude.json` from key allowlists, pinned plugin tree,
+  the adapter's `homeState.dirs` as empty writable scratch, everything
+  else ENOENT; real-bwrap tests for authentication, refresh
+  read-only enforcement and denial; `--json` echoes `homeBinds`),
+  `--worker-deps <abs path>` (item 15: fleet copies the caller-built
+  dependency tree into `<worker worktree>/node_modules` on the host
+  before every strike — a plain copy, never an npm run — and skips the
+  configured `init`; the worker starts with `node_modules` populated
+  and no install path of its own; real-bwrap worker-start test),
+  `--model-plane-git mirror` (item 12 of the fleet ticket: the worker's
   worktree is cut from a caller-supplied bare mirror holding only the
   pinned baseline and the issue branch, and the worker branch is fetched
   back into the caller's repository before gates/merge; real-bwrap
@@ -1569,7 +2329,12 @@ None is trust-root tier; each is a small, separately testable diff.
   changes go through their own reviewed PR. Before dispatching the build
   ticket, preflight reads the newest `spec-approval` entry bound to the
   ticket from the manifest and requires its recorded `spec_hash` to
-  equal the sha256 of the blob at `specBlob` AND `adlc run p1 --ticket
+  equal the **sha256 of the CONTENT** of the blob at `specBlob` — the
+  bytes `git cat-file blob <specBlob>` emits, i.e. what `sha256sum
+  docs/specs/issue-autopilot-local.md` prints at that commit; this is
+  NOT the git object id (`git hash-object` / `git rev-parse
+  HEAD:<path>`, a SHA-1 over a `blob <size>\0` header plus content, 40
+  hex) and the two are never compared to each other — AND `adlc run p1 --ticket
   <build ticket> --json` to exit 0 (spec-lint + premortem + spec-approval
   all present, ordered and bound) AND a **human-identity binding** the
   manifest alone cannot forge: the commit that introduced `specBlob` on
@@ -1580,6 +2345,14 @@ None is trust-root tier; each is a small, separately testable diff.
   `spec-approval` record's `approver` must name that same login or the
   e-mail GitHub reports for it; any mismatch → exit 1
   `spec-approval-unbound`. Otherwise → exit 1 `spec-approval-stale`, no
+  dispatch. The record's `approved_assumptions[]` must describe THIS
+  revision's residuals (§11), not an earlier design's: the record also
+  carries `assumptions_hash` (sha256 of the canonical JSON of
+  `approved_assumptions`) and preflight requires it to equal the hash of
+  the §11.1 items extracted from the blob at `specBlob` by the rule
+  stated there (a pure extractor with a fixture for the current §11.1),
+  and `approved_assumptions` to equal those items element for element;
+  mismatch or absent hash → exit 1 `spec-approval-assumptions-stale`, no
   dispatch. The record's `spec_hash` states WHAT was gated; GitHub's
   merge identity states WHO — the manifest is data the preflight checks,
   never a claim it trusts.
@@ -1610,6 +2383,7 @@ None is trust-root tier; each is a small, separately testable diff.
 | R10 | Confirm rails-guard-ci accepts a PR that ADDS a ticket shard which is `completed:true` on arrival (fleet completes on the integration branch) — otherwise the completion commit moves to a post-merge step | build canary | open |
 | R11 | Keep PR diffs under adversarial-review's 256 KB grounding limit: deterministic size gate before every review (§6.7a), `--max-bytes` from `reviewMaxBytes` on both reviewers, fleet gains a `reviewMaxBytes` config key (§14) | build | open |
 | R12 | GitHub ruleset restricting pushes to `refs/heads/adlc/autopilot/**` to the operator identity (branch-level write isolation; §6.8 detects intrusion without it but cannot prevent it) | operator | recommended |
+| R13 | `scripts/preflight.mjs --fetch-url <url>`, `--base-oid <oid>`, `--no-fetch` and `--sandboxed` so the script itself can be the gate runner inside the repo-command-plane sandbox with no network and an immutable OID (trust-root change, #141 ceremony); until then §6.6 runs the script's gate list gate by gate with the order checked against the pinned script | operator (ceremony) | follow-up |
 
 ## 16. Acceptance criteria
 
@@ -1621,10 +2395,25 @@ None is trust-root tier; each is a small, separately testable diff.
    every criterion number in this section to one or more exported test
    functions; `spec-coverage.test.mjs` parses this section at the pinned
    blob, fails on any number missing from the registry or any registered
-   function that is not defined, and statically checks that each
-   registered test imports at least one module from `packages/autopilot/lib/`
-   and contains at least one `assert` call whose argument references
-   that import (a test with no production seam is rejected); in addition
+   function that is not defined, EXECUTES every registered function at
+   runtime (a registered test that does not run is a failure), requires
+   each registered test's title to begin with `AC<n>:` for the number it
+   is registered under, and statically checks that each registered test
+   imports at least one module from `packages/autopilot/lib/` and
+   contains at least one `assert` call whose argument references that
+   import (a test with no production seam is rejected — and an assertion
+   whose subject is merely a module's existence, an exported constant, or
+   a value unrelated to the criterion's behavior is rejected by the same
+   static check, which requires the asserted expression to reference a
+   CALL into the imported module or its recorded side effect); for EVERY
+   registered criterion the registry names a **mutation fixture** — a
+   deterministic defect injected through a documented seam in `lib/`
+   (e.g. `redactor.disable`, `quota.forceOk`, `selector.ignoreLabels`) —
+   and the gate asserts the registered test FAILS with that fixture
+   applied and passes without it; a criterion for which no fixture can be
+   named must be justified in the registry with a `noFixture:` reason the
+   gate prints, and the count of such criteria is capped at 5; in
+   addition
    `node scripts/mutation-gate.mjs origin/<base> --max 12` must pass on
    the package (CI already runs it) and, for the security- and
    lifecycle-critical criteria (quota, authorization, redaction,
@@ -1682,10 +2471,15 @@ None is trust-root tier; each is a small, separately testable diff.
 9. **Wall clock**: a fleet fake that never returns is killed at 90 minutes
    (fake timers), outcome `wall-clock`, label applied (`run.test.mjs`).
 10. **Dry-run honesty**: `adlc-autopilot once --dry-run --issue N` exits 0,
-    prints the full plan, and the spawn recorder shows only argv from the
-    read-only set of §2 (assert: no `git fetch`, `git worktree`, `git
-    config`, `git push`, `mkdir` of the lock, `.git/info/exclude` write,
-    `gh` mutation, or `--write`/`--record` flag), the filesystem fixture
+    prints the plan with `complete: false` and an `incomplete` list that
+    always contains `fleet-dry-run-needs-worktree` (and
+    `baseline-not-local` when the objects are absent, in which case every
+    phase-B item is `skipped`; assert both fixtures), and the spawn
+    recorder shows only argv from the read-only set of §2 (assert: no `git
+    fetch`, `git worktree`, `git push`, no `git config` WRITE — the
+    `git config --file … --get` identity read is present and allowed —,
+    `mkdir` of the lock, `.git/info/exclude` write, `gh` mutation, or
+    `--write`/`--record` flag), the filesystem fixture
     is byte-identical before and after, and no manifest line was
     appended.
 11. **Preflight**: each §9 item has a red fixture that makes `once` exit 1
@@ -1695,11 +2489,14 @@ None is trust-root tier; each is a small, separately testable diff.
     `ADLC_MANIFEST_KEY` — each → `key-file-insecure` with zero key-bearing
     spawns (`preflight.test.mjs`).
 12. **Key hygiene** (`keys.test.mjs`): the spawn recorder asserts
-    `ADLC_MANIFEST_KEY` is present in the env of exactly the six
-    key-bearing commands of §9.3 (`ticket create --write`, `ticket complete
-    --write`, `ticket update --write`, `coldstart --record-verdict`,
-    `spec-lint --record`, `record-cross-model`) and absent from every other
-    spawn in a full
+    `ADLC_MANIFEST_KEY` is present in the env of exactly the key-bearing
+    commands of §9.3 — that list is the ONE authority: the orchestrator
+    exports it as the constant `KEY_BEARING_ARGV` and the test's table is
+    built from the same export, so the two cannot drift; today seven
+    entries: `ticket create --write`, `ticket complete --write`, `ticket
+    update --write`, `coldstart --record-verdict`, `spec-lint --record`,
+    `record-cross-model`, `gate-manifest verify` — and absent from every
+    other spawn in a full
     `once` sequence (fleet, shaping, coldstart answer, both
     `adversarial-review` calls, `gh`, `git`, `npm`, `preflight.mjs`); the
     assertion is table-driven over the complete recorded spawn list so a
@@ -1744,10 +2541,20 @@ None is trust-root tier; each is a small, separately testable diff.
     assert over the full label list), and never the protected-path,
     `trust-root-change`, milestone, or open-PR rules.
 20. **Pinned baseline** (`run.test.mjs`): fetch-fake failure → exit 1 and
-    zero worktree/dispatch calls; on success the recorded `baseOid` appears
-    verbatim in the `git worktree add`, fleet `--base`, `preflight.mjs
-    --base`, and `record-cross-model --base` argv even when the fake moves
-    `origin/main` between steps.
+    zero worktree/dispatch calls; on success the recorded `baseOid`
+    appears verbatim in the `git worktree add` argv, in every
+    individually invoked gate spawn of §6.6 (`rails-guard-ci.mjs
+    refs/remotes/origin/<baseOid>`, `mutation-gate.mjs
+    refs/remotes/origin/<baseOid> --max 12`, the findings gates) and in
+    `record-cross-model --base`, even when the fake moves `origin/main`
+    between steps; fleet's `--base` argv is `adlc/autopilot/issue-<n>`
+    (the integration start, whose tip OID is recorded as
+    `integrationStart` and equals the ticket commit) and never `baseOid`;
+    a `scripts/preflight.mjs` spawn appears in the sequence ONLY when
+    the pinned blob's R13 flags exist (its argv then carries `--no-fetch
+    --sandboxed --base-oid <baseOid>` and runs inside the repo-command
+    sandbox) and never otherwise — a `preflight.mjs` spawn lacking those
+    flags, or any such spawn before R13, fails the test.
 21. **Recovery state machine** (`recover.test.mjs`): one fixture per row of
     the §2.1 table asserts the named action and the resulting state; a
     retire whose `ls-remote` still shows the ref → state `remote-pending`,
@@ -1806,16 +2613,24 @@ None is trust-root tier; each is a small, separately testable diff.
     on PATH that record argv and create the files the real tools would):
     a full `once --issue N` run produces the worktree at `ISSUE_WT`, the
     ticket shard under `<ISSUE_WT>/.adlc/tickets/`, the ownership marker in
-    the repo's local config, a branch whose merge-base with `origin/main`
-    is `baseOid`, and a pushed head equal to the OID passed to the
+    the repo's local config, a branch whose merge-base with the recorded
+    `baseOid` IS `baseOid` (asserted with `git merge-base` against the OID
+    literal — the test never reads or sets `origin/main`), and a pushed head equal to the OID passed to the
     `record-cross-model` fake; a preflight-fake failure on the first pass
     yields a second fleet invocation carrying `--dead-end-file` and
     `--max-strikes 14`, with `adlc ticket complete` invoked exactly once,
     after the last successful preflight.
 31. **Pinned baseline by OID** (`run.test.mjs`): the fetch fake asserts
-    `git fetch --no-tags origin <40-hex>` (never `main`, never
-    `FETCH_HEAD`); an `ls-remote` fake returning a different OID on a second
-    call does not change the run's recorded `baseOid`.
+    `git --git-dir=<NET_GIT> fetch --no-tags <remoteFetchUrl> <40-hex>`
+    (never `main`, never `FETCH_HEAD`, never the remote NAME `origin`)
+    preceded by `git --git-dir=<NET_GIT> ls-remote --exit-code
+    <remoteFetchUrl> refs/heads/main` and followed by the local import
+    `git -C <REPO_ROOT> fetch --no-tags <NET_GIT> <40-hex>`; an
+    `ls-remote` fake returning a different OID on a second call does not
+    change the run's recorded `baseOid`; the spawn recorder's
+    classification rejects any `fetch`/`ls-remote`/`push` spawn whose git
+    dir is the primary repository or whose URL argument is a remote NAME,
+    over the complete recorded spawn list of a full `once` sequence.
 32. **Trusted block assembly** (`triage.test.mjs`): an OWNER issue whose
     body has a block and an `## Acceptance criteria` list → ticket fields as
     §5.1 with zero shaping calls; the same issue without the criteria
@@ -1983,7 +2798,11 @@ None is trust-root tier; each is a small, separately testable diff.
     `package-lock.json` change that adds `node_modules/left-pad`, changes
     an existing entry's `resolved` or `integrity`, or removes an entry →
     `lockfile-drift`; one that adds a `packages/autopilot` workspace link
-    and `node_modules/@adlc/autopilot` with `link: true` → pass; `npm ci`
+    and `node_modules/@adlc/autopilot` with `link: true` → pass, and so
+    does the COMPLETE lockfile a real `npm install --package-lock-only
+    --ignore-scripts --offline` writes for adding `packages/autopilot`
+    to the workspace (fixture generated by that command, not
+    hand-written); `npm ci`
     argv carries `--ignore-scripts --no-audit --no-fund`.
 57. **Upsert head binding** (`pr.test.mjs`): an `ls-remote` fake that
     changes between the post-push check and the upsert → zero `gh pr`
@@ -2032,8 +2851,19 @@ None is trust-root tier; each is a small, separately testable diff.
     <OID> --delete-remote` deletes the remote ref using
     `--force-with-lease=<ref>:<oid>`; when the remote tip was advanced by
     another push, the delete fails the lease, the remote ref survives,
-    and the run is `orphan`; a PR fake that appears right after a
-    successful delete is reported as `pr-after-delete`.
+    and the run is `orphan`; a record whose last push is 5 minutes old →
+    `ref-too-fresh`, zero pushes; a PR fake that appears right after a
+    successful delete → the ref is re-created at the recorded OID with a
+    lease expecting absence (asserted on the real bare `origin`), the
+    result is `pr-after-delete-restored: <number>`, the issue carries
+    `adlc:needs-human` and the record survives; a fake that re-creates
+    the ref at another OID before the restore → the restore's lease
+    fails, the foreign ref survives, `pr-after-delete-unrestored`. A record
+    without `lastPushedAt` → `ref-too-fresh`, zero pushes; a PR fake
+    that appears only at the 120 s re-query → restored and
+    `pr-after-delete-restored`; a record in `remote-deleted` for 2 h
+    whose next recovery pass finds a PR → restored; one older than 24 h
+    with none → deleted by the canonical rule.
 64. **Argv-safe pre-strike** (`run.test.mjs`): with `--model
     'opus;touch /tmp/x'` preflight exits 1 `model-unknown` (grammar
     `^[a-z0-9][a-z0-9.-]{0,63}$`); the `--pre-strike-argv` value parses
@@ -2084,7 +2914,12 @@ None is trust-root tier; each is a small, separately testable diff.
     line-anchored `WorkingDirectory=/<abs>`, `ExecStart=/<abs node>
     /<abs>/packages/autopilot/bin/adlc-autopilot.mjs loop --rest 10m`,
     `EnvironmentFile=/<abs>/.env.local`, `Restart=on-failure`,
-    `KillMode=control-group`; no `%h`; a working directory lacking
+    `KillMode=control-group`; no `%h`; generated in explicit mode the
+    `ExecStart` line ends with `--ssh-identity /<abs key>` and no
+    `SSH_AUTH_SOCK` line exists, generated in agent mode the reverse, and
+    a start under each generated unit reaches phase A's auth-mode
+    resolution with that mode (service.test spawns the ExecStart argv
+    against fakes); a working directory lacking
     `.adlc/config.json` makes generation exit 1 `bad-working-directory`.
 72. **P0/P1 record mechanics** (`sequence.test.mjs`): the coldstart
     fake is invoked with cwd = `ISSUE_WT`, `--tickets
@@ -2173,8 +3008,13 @@ None is trust-root tier; each is a small, separately testable diff.
     binary against a temporary manifest): a segment with `spec-lint` +
     `premortem` + a `spec-approval` whose `data` has the full contract
     → exit 0 and dispatch allowed; missing `premortem`, `unresolved: 1`,
-    `rounds: 0`, or a `spec_hash` that differs from the blob at `specBlob`
-    → `spec-approval-stale`, zero dispatches.
+    `rounds: 0`, or a `spec_hash` that differs from the sha256 of the
+    content of the blob at `specBlob` → `spec-approval-stale`, zero
+    dispatches; a record carrying the git blob OID of the same file
+    (`git rev-parse HEAD:<path>`) instead of the content sha256 is
+    `spec-approval-stale` too (the identities are never conflated), and
+    a repository test recomputes `sha256sum` of the committed spec and
+    asserts it equals the newest committed `spec-approval` record.
 84. **Git mirror** (`sequence.test.mjs`, real temporary git repository):
     the mirror created before dispatch has exactly one branch
     (`adlc/autopilot/issue-<n>`), no `remote.*`/`credential.*`/`hooksPath`
@@ -2330,11 +3170,466 @@ None is trust-root tier; each is a small, separately testable diff.
     revalidation and triage.
 110. **Pinned remote URL** (`run.test.mjs` + `recover.test.mjs`): every
     recorded `git ls-remote`/`fetch`/`push` argv carries the pinned URL
-    literal and never the word `origin` as the remote argument; a `git
-    remote get-url` fake that changes between preflight and a push →
-    `remote-url-changed`, zero pushes, state `orphan`.
+    literal and never the word `origin` as the remote argument; a `git config --file … --get remote.origin.url` fake that changes
+    between preflight and a push → `remote-url-changed`, zero pushes,
+    state `orphan`.
 111. **Coverage gate is not vacuous** (`spec-coverage.test.mjs` self-test):
     a registry entry pointing at a test with no `lib/` import or no
     `assert` call fails the gate; a criterion number absent from the
     registry fails it; renumbering the spec without updating the registry
     fails it.
+112. **Credential-free remote URLs** (`preflight.test.mjs`): an `origin`
+    URL with userinfo (`https://x:ghp_abc@github.com/o/r.git`) →
+    `remote-url-credentials`, exit 1, and the token string appears in no
+    recorded argv, status file or record; both SSH forms are accepted
+    and pinned; the plain `https://` form → `remote-url-scheme`.
+113. **System-root exception** (`run.test.mjs`): a pinned `git` at
+    `/usr/bin/git` yields no extra file bind (covered by `/usr`); a pinned
+    `claude` at `~/.local/bin/claude` yields exactly one file bind and no
+    bind of `~/.local/bin`; `/usr` being an ancestor of `/usr/bin/git`
+    does not trip the invariant, while `~/.local/bin` in the list does.
+114. **Registry executes and mutation fixtures bite**
+    (`spec-coverage.test.mjs`): every registered function is invoked
+    (spy count equals registry size); a registered test titled without
+    its `AC<n>:` prefix fails the gate; for each critical criterion the
+    named mutation fixture makes its test fail and its removal makes it
+    pass (table-driven over the critical set).
+115. **`reset --attempts` grammar** (`triage.test.mjs`): the command
+    archives the attempt ledger, is refused without the lock, is
+    idempotent on a second call, and touches no other file (fixture
+    directory byte-identical apart from the ledger and archive).
+116. **Config is read from the pinned blob** (`preflight.test.mjs`): the
+    config read is `git show <baseOid>:.adlc/config.json`; a working-tree
+    `.adlc/config.json` and a local `origin/main` ref carrying different
+    (even invalid) content do not change the preflight verdict; a blob
+    that fails either schema → exit 1 `bad-config`, zero dispatches.
+117. **Preflight phases** (`preflight.test.mjs` + `sequence.test.mjs`):
+    the spawn recorder shows every phase-A check before `git ls-remote`
+    of §6.0 and every phase-B `git show <oid>:…` after the fetch, with the
+    OID equal to the one `ls-remote` returned; a phase-B check invoked
+    with no baseline throws `base-unresolved` rather than reading the
+    working tree; an `ls-remote` fake failure yields zero phase-B reads
+    and zero dispatches.
+118. **Archive precedes pruning** (`triage.test.mjs`): a ledger holding a
+    9-day-old entry, a `started` entry and a recent entry → `reset
+    --attempts` archives all three (archive count 3) and leaves an empty
+    active ledger; an ordinary read of the same ledger returns only the
+    recent entry and never writes the archive.
+119. **Phase-A identity is operator-local** (`preflight.test.mjs`): with
+    no `--repo`/`ADLC_AUTOPILOT_REPO`, `once` exits 1 `repo-unbound`
+    before any `git`/`gh` spawn; with it set, phase A binds the remote
+    URLs against it; a pinned-blob config whose `autopilot.repo` differs
+    → `repo-mismatch` in phase B; the generated unit carries
+    `Environment=ADLC_AUTOPILOT_REPO=`.
+120. **Fleet dry-run at the baseline** (`preflight.test.mjs` +
+    `sequence.test.mjs`): the fleet dry-run argv runs with cwd =
+    `<REPO_ROOT>/.adlc/autopilot-runs/preflight-<baseOid>` created by
+    `git worktree add --detach … <baseOid>`; a working-tree
+    `.adlc/config.json` with an invalid fleet block does not change the
+    result; the temporary worktree is removed afterwards and a stale one
+    is removed first.
+121. **Every criterion has a fixture** (`spec-coverage.test.mjs`
+    self-test): a registry entry without a mutation fixture and without a
+    `noFixture:` reason fails the gate; more than 5 `noFixture` entries
+    fail it; an assertion that only checks a module's existence or an
+    exported constant is rejected by the static check.
+122. **preflight.mjs is bracketed** (`sequence.test.mjs`): a `git config --file … --get
+    remote.origin.url` fake that returns the pinned URL before the
+    preflight spawn and a different URL after → the preflight result is discarded, no
+    attestation, no push, state `orphan` with `remote-url-changed`; an
+    object-store fake in which `<baseOid>` no longer resolves after the
+    script → the same; unchanged URLs and object → the pass is honored.
+123. **Crash-idempotent reset** (`triage.test.mjs`): a crash injected
+    after a partial archive append (journal present, ledger intact) is
+    recovered on the next ledger operation: the archive contains each
+    attempt `id` exactly once, the ledger is empty, the journal is gone;
+    running `reset --attempts` twice in a row archives nothing the second
+    time; every ledger entry carries a ULID `id` minted at creation.
+124. **Sanitized git transport** (`preflight.test.mjs` + `run.test.mjs`):
+    every recorded `git` spawn (orchestrator, preflight bracket, fleet
+    env) has `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`,
+    `GIT_CONFIG_NOSYSTEM=1`, and none of the removed variables (table-
+    driven over the §9.1b list, seeded in the orchestrator env); a
+    repo-local config fixture with each of `url.<x>.insteadOf`,
+    `core.sshCommand`, `credential.helper` (non-allowlisted), `http.proxy`
+    and `includeIf` → `git-config-untrusted` before any `ls-remote`; a
+    real temporary repository with `url.<evil>.insteadOf=<pinned>` proves
+    no push argv is issued.
+125. **Config example is valid JSON** (`config.test.mjs`): the §13
+    example block parses with `JSON.parse` and validates against both
+    schemas (self-test that reads the block out of the spec at the pinned
+    blob).
+126. **`origin` is bound per process** (`preflight.test.mjs` +
+    `sequence.test.mjs`, real temporary git repository): every recorded
+    `git` spawn env carries `GIT_CONFIG_KEY_0=remote.origin.url` with the
+    pinned value and `GIT_CONFIG_KEY_1=remote.origin.pushurl`; inside a
+    child started with that env, `git config --get remote.origin.url`
+    returns the pinned value even after `.git/config` is rewritten to a
+    different URL mid-run; a preflight fake that performs a real `git
+    fetch origin` against a bare fixture reaches the pinned fixture and
+    not the rewritten one; inherited `GIT_CONFIG_COUNT`/`KEY`/`VALUE`
+    variables from the orchestrator's own env are dropped before the
+    bound ones are set.
+127. **Identity rewrite beats prefix rewrites** (`preflight.test.mjs`,
+    real temporary repository with two bare remotes): with
+    `url.<evil>.insteadOf=<prefix of pinned>` written into `.git/config`
+    AFTER the audit, a push under the bound env still lands in the pinned
+    bare repo and never in the evil one (assert by ref presence in each);
+    the bound env carries the full §9.1b table (count 7 for an SSH URL)
+    with the two identity `insteadOf` entries; a post-push `ls-remote <pinned>` mismatch →
+    `oid-mismatch`.
+128. **Dry-run never needs a worktree** (`run.test.mjs`): in dry-run the
+    spawn recorder shows no `git worktree add` and no fleet spawn; the
+    plan's `incomplete` list contains `fleet-dry-run-needs-worktree`; the
+    read-only phase-B checks run when the baseline objects are local and
+    are all `skipped` when they are not.
+129. **Isolated SSH transport** (`preflight.test.mjs` + `run.test.mjs`):
+    every git spawn for a network operation carries `GIT_SSH` naming the
+    generated wrapper (mode `0500`, sha256 verified before the spawn);
+    the wrapper's content execs the pinned `ssh` path with `-F /dev/null`,
+    `StrictHostKeyChecking=yes`,
+    `UserKnownHostsFile=<SSH_DIR>/known_hosts`,
+    `IdentitiesOnly=yes`, `BatchMode=yes`; a `~/.ssh/config` fixture that
+    rewrites `github.com` via `HostName` is not consulted (real `ssh -G`
+    under that command prints the pinned host); a missing or `0644`
+    known_hosts → `known-hosts-missing`; a repo-local `http.sslVerify`,
+    `credential.helper` or `core.sshCommand` key → `git-config-untrusted`
+    (HTTPS transport does not exist in v1, so these keys have nothing to
+    influence and are rejected for reporting).
+130. **Identity is observed unoverlaid** (`preflight.test.mjs`): the
+    identity read is `git config --file <REPO_ROOT>/.git/config --get
+    remote.origin.url` with NO `GIT_CONFIG_COUNT` in its env; a
+    `.git/config` whose `remote.origin.url` names a different repository
+    → `repo-mismatch` even though a bound-env read would have returned
+    the pinned value (assert both reads in one fixture); every
+    "immediately before" re-read uses the `--file` form.
+131. **SSH transport survives a config race** (`preflight.test.mjs`, real
+    temporary repository with a bare remote reached through a logging
+    `ssh` wrapper as the pinned executable): after the audit,
+    `core.sshCommand=<evil wrapper>` and `url.<evil>.insteadOf=<prefix>`
+    are written into `.git/config`; a push under the bound env is
+    executed by the PINNED wrapper (its log shows the pinned `-F
+    /dev/null … UserKnownHostsFile=…` argv reaching it through the
+    generated `GIT_SSH` wrapper, the evil wrapper's log is empty) and lands in the pinned bare repo; `GIT_CONFIG_COUNT` equals 7
+    and row 6 pins `core.sshCommand` to the same string.
+132. **SSH-only remotes** (`preflight.test.mjs`): `https://github.com/o/r.git`
+    → `remote-url-scheme`, exit 1, zero network spawns; `git@github.com:o/r.git`
+    and `ssh://git@github.com/o/r.git` are accepted and canonicalize to the
+    same pinned pair; `ssh://alice@github.com/o/r.git` →
+    `remote-url-credentials`; `ssh` is in the pinned toolchain and a PATH
+    entry under `REPO_ROOT` containing an `ssh` is never selected.
+133. **Fleet dry-run bound to the OID** (`preflight.test.mjs`): the
+    dry-run argv carries `--base <baseOid>`; a fixture where `main`
+    points elsewhere still reports `baseSha == baseOid`; a fake reporting
+    a different `baseSha` fails phase B.
+134. **Framed archive recovery** (`triage.test.mjs`): an archive whose
+    last line is truncated (no newline) or has a wrong checksum is read
+    without that line, recovery re-appends the missing attempt by `id`,
+    and the resulting archive has each `id` exactly once with valid
+    checksums on every line.
+135. **Tracking ref pre-created and verified** (`sequence.test.mjs`, real
+    temporary git repository): before the preflight spawn
+    `refs/remotes/origin/<baseOid>` equals `baseOid`; a fixture that moves
+    that ref while the preflight fake runs → result discarded,
+    `base-ref-moved`, `orphan`, no attestation; on success the ref is
+    deleted afterwards; the preflight argv's `--base` is the 40-hex OID.
+136. **SSH auth mode** (`preflight.test.mjs` + `service.test.mjs`): with
+    `SSH_AUTH_SOCK` set to an existing socket the command carries
+    `IdentityAgent=<sock>`; unset with `--ssh-identity` (mode `0600`) →
+    `IdentityAgent=none -i <ssh dir>/identity`; unset without it → `ssh-auth-missing`
+    before any network spawn; a `0644` identity → `key-file-insecure`;
+    the string `IdentityAgent=` followed by a space never appears in any
+    argv; `init --service` without a socket or identity exits 1, and with
+    a socket writes `Environment=SSH_AUTH_SOCK=`.
+137. **One endpoint, verified where pushed** (`preflight.test.mjs` +
+    `run.test.mjs`): a repo whose `pushurl` canonicalizes to a different
+    host than `url` → `remote-url-split`; the post-push `ls-remote` argv
+    carries the push URL; a fixture in which only the fetch endpoint has
+    the pushed ref → `oid-mismatch`.
+138. **Repository-selection env scrubbed** (`run.test.mjs`, real
+    temporary repository): with `GIT_DIR`, `GIT_WORK_TREE`,
+    `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and
+    `GIT_ALTERNATE_OBJECT_DIRECTORIES` seeded in the orchestrator env to
+    point at a decoy repository, every recorded git spawn env lacks all of
+    them, the identity assertion (`rev-parse --show-toplevel`/`--git-dir`)
+    passes for the real repository and fails (`repo-identity-mismatch`)
+    when the cwd is the decoy.
+139. **SSH wrapper is safe for odd paths** (`preflight.test.mjs`, real
+    `ssh -G`): with `REPO_ROOT`, the known_hosts path and an identity
+    path each containing a space, a `$(`, and a single quote, the
+    generated wrapper resolves them intact (`ssh -G` reports the exact
+    paths), the wrapper is mode `0500`, its recorded sha256 matches, a
+    modified wrapper → `ssh-wrapper-tampered` before any network spawn,
+    and no git spawn carries `GIT_SSH_COMMAND`.
+140. **Denylist derives from the trust-root lists** (`select.test.mjs` +
+    `diffcheck.test.mjs`): the denylist used at triage and in the
+    actual-diff check is built from the pinned blob's
+    `DEFAULT_IMMUTABLE_TRUST_ROOTS` and `REPO_TRUST_ROOTS` plus the static
+    extras; a shaped scope naming `scripts/preflight.mjs` or
+    `scripts/toolkit-floor.json` → CLARIFY; a worker fake that edits
+    `scripts/preflight.mjs` despite a `packages/foo/**` scope → actual-diff
+    violation, no attestation, no push; adding a path to either source
+    list in the fixture blob extends the denylist without any autopilot
+    change.
+141. **Tracking ref is never clobbered** (`sequence.test.mjs`, real
+    temporary git repository): a pre-existing `refs/remotes/origin/<oid>`
+    equal to the OID is left untouched and survives the bracket; one with
+    a different value → `base-ref-conflict`, zero preflight spawns; an
+    absent ref is created with the zero-OID compare-and-swap and deleted
+    afterwards with `update-ref -d <ref> <oid>`; a ref that appears
+    between the read and the create → `base-ref-conflict`.
+142. **Byte-identical endpoint** (`preflight.test.mjs`): `url =
+    git@github.com:o/r.git` with `pushurl = ssh://git@github.com/o/r.git`
+    canonicalize to one string and are accepted; a push URL with a
+    different owner/repo or host → `remote-url-split`; the bound table has
+    seven rows including `url.<pushUrl>.insteadOf`; a post-audit
+    `url.<prefix>.insteadOf` race against the post-push `ls-remote` still
+    resolves to the pinned endpoint (real fixture, two bare remotes).
+143. **Network repository isolates transport** (`preflight.test.mjs` +
+    `sequence.test.mjs`, real temporary repositories with two bare
+    remotes): every recorded network git spawn carries
+    `--git-dir=<NET_GIT>`; an EXACT-URL `url.<pinned>.insteadOf=<evil>`
+    planted in `<REPO_ROOT>/.git/config` after the audit does not affect
+    a push (the ref lands only in the pinned bare remote) — the same
+    fixture run against the main repository's config, without `NET_GIT`,
+    is shown to redirect, proving the isolation is load-bearing; a
+    modified `NET_GIT/config` → `net-config-tampered`, zero network
+    spawns; `NET_GIT/hooks` is empty; a fetched OID reaches the main
+    repository only through a local `git fetch <NET_GIT>` argv.
+144. **Push source is the attested OID** (`sequence.test.mjs`, real
+    temporary repositories): the push argv is `--git-dir=<NET_GIT> push
+    --force-with-lease=… <pushUrl> <attestedHead>:refs/heads/adlc/autopilot/issue-<n>`;
+    `NET_GIT` has no `refs/heads/*` before or after; the bare remote's
+    branch equals `attestedHead`; moving `ISSUE_WT`'s branch between
+    attestation and push does not change what is pushed.
+145. **SSH key bound to the gh principal** (`preflight.test.mjs`): a
+    `gh api --hostname <host> --paginate user/keys` fake whose SECOND
+    page carries key A's `key` line (with a comment that differs from the
+    agent's) and an agent fake offering keys A and B → the wrapper
+    carries `-i <A.pub>` only and the log names A's SHA256 fingerprint;
+    an agent offering only B → `ssh-identity-unbound`, zero network
+    spawns; `--ssh-identity` whose derived public key equals no returned
+    `key` → `ssh-identity-unbound`; a fake returning a `fingerprint`
+    field but no `key` field, an empty array, or a failing second page →
+    `ssh-identity-unbound`; the matcher is a pure function with fixtures
+    for comment/whitespace variants of the same key.
+146. **Identity binding uses the authenticating copy** (`preflight.test.mjs`,
+    real `ssh-keygen`): in explicit mode the orchestrator copies the key
+    (`O_NOFOLLOW`, `0600`) BEFORE fingerprinting, the fingerprint is
+    computed from the copy, a mismatched `.pub` sidecar beside the
+    original changes nothing, and the wrapper carries `IdentityAgent=none
+    -i <ssh dir>/identity` — never the original path; a fixture that
+    swaps the original file between the copy and the fingerprint step has
+    no effect (the copy is what was fingerprinted and what is used);
+    `--ssh-identity` together with `SSH_AUTH_SOCK` → `ssh-mode-ambiguous`,
+    zero network spawns; in agent mode the wrapper carries
+    `IdentityAgent=<socket> -i <ssh dir>/identity.pub` holding only the
+    matched key; a live agentless push against a bare fixture over a
+    local `sshd` succeeds with the bound copy and is refused
+    (`ssh-identity-unbound`) when only an unlisted key is available
+    (skipped loudly without `sshd`).
+147. **SSH material revalidated before every spawn** (`preflight.test.mjs`
+    + `run.test.mjs`, real files): the per-iteration `ssh-<token>/`
+    directory is `0700` and holds the wrapper, `known_hosts`, and the
+    bound key material; replacing `known_hosts` with same-size different
+    content, `chmod 0644` on the private-key copy, swapping the file for
+    a new inode with identical bytes, or an agent that stops offering the
+    bound fingerprint → `ssh-material-tampered` immediately before the
+    spawn, zero network spawns; unchanged material → the spawn proceeds;
+    a pre-existing directory of the same name → `ssh-dir-exists`.
+148. **Remote host bound to the gh host** (`preflight.test.mjs`): with
+    a fake `gh` answering `auth status --hostname github.com --active
+    --json hosts` with one `success`/`active` entry for `github.com`,
+    `git@ghe.example.com:o/r.git` → `remote-host-mismatch`; an empty
+    `hosts`, `state:"error"`, a mismatched `login`, or the old
+    `--json`-only argv → `gh-host-unbound`; `git@github.com:o/r.git` is accepted; the
+    `known_hosts` fixture is written from `gh api meta` of that host and
+    a key for any other host is ignored.
+149. **Gates that run repository code are sandboxed** (`sequence.test.mjs`
+    + fleet's real-bwrap test): every gate spawn that executes code from
+    the issue branch (`run-tests`, `mutation-gate`, rails-guard) is
+    wrapped in the repo-command-plane sandbox with `cwd = GATE_REPO` —
+    argv shows `bwrap` with `--unshare-net`, a bind of `GATE_REPO` and
+    no bind of `$HOME`, `.env.local`, the host `.git`, the mirror, the
+    agent socket or the orchestrator state — and its env lacks
+    `SSH_AUTH_SOCK`, `GH_TOKEN`, `GITHUB_TOKEN` and `ADLC_MANIFEST_KEY`;
+    the REAL `scripts/rails-guard-ci.mjs` and `scripts/mutation-gate.mjs`
+    executed inside the sandbox against a fixture `GATE_REPO` (a clone of
+    a fixture mirror with `refs/remotes/origin/<BASE_OID>` created)
+    produce the same verdicts as on the host — including a planted
+    trust-root edit and a planted surviving mutant being caught — while
+    `git rev-parse --git-dir` resolves inside `GATE_REPO`; a fixture in
+    the clone that tries to read `~/.claude/.credentials.json`, open a
+    TCP socket, or read `.env.local` fails inside the sandbox; a gate
+    that commits inside its clone, and a gate whose fixture rewrites
+    `refs/remotes/origin/<BASE_OID>` or adds a `.git/hooks/pre-commit`
+    WITHOUT moving `HEAD` → `gate-repo-moved`, verdict discarded, run
+    failed; two consecutive gates receive different clone paths and the
+    second's `for-each-ref` equals the mirror's, not the first's; the gate order equals
+    the pinned `preflight.mjs` `buildGates()` list and a reordered list
+    → `preflight-order-drift`.
+150. **Corrupt archive line is quarantined** (`triage.test.mjs`): an
+    archive with a complete line whose checksum is wrong → the file is
+    moved to `.corrupt-<ts>` byte-for-byte, a rebuilt archive holds only
+    valid lines, status shows `archive-corrupt`, replay then re-appends
+    missing ids exactly once; a merely truncated tail is still handled
+    without quarantine.
+151. **Explicit key is the verified copy** (`preflight.test.mjs`): in
+    explicit mode the wrapper's `-i` names
+    `<REPO_ROOT>/.adlc/autopilot-runs/ssh-<token>/identity`, never the
+    `--ssh-identity` path; replacing the original file after phase A
+    changes nothing; replacing the copy → `ssh-material-tampered`.
+152. **Model-plane egress is allowlisted** (`run.test.mjs` + fleet's
+    real-bwrap test): the fleet argv carries `--model-plane-egress
+    allowlist`; a fleet fake echoing `egress: "open"` →
+    `sandbox-policy-mismatch`; inside the real sandbox a process can
+    reach `127.0.0.1:<port>` and, through it, only `CONNECT
+    api.anthropic.com:443` succeeds while `CONNECT example.com:443`, a
+    plain `GET`, a direct TCP connect to any external address, and DNS
+    resolution all fail; the proxy log shows the refused targets; the
+    worker env has `HTTPS_PROXY`/`HTTP_PROXY` set to the bridge and an
+    empty `NO_PROXY`.
+153. **Pinned ssh-add and ssh-keygen** (`preflight.test.mjs`): the
+    agent-enumeration and key-derivation spawns use the pinned absolute
+    paths; an `ssh-add` that resolves under `REPO_ROOT` or a
+    user-writable directory → `untrusted-tool:ssh-add`, zero network
+    spawns.
+154. **Assumptions bound to the revision** (`preflight.test.mjs`): a
+    `spec-approval` fixture whose `assumptions_hash` or
+    `approved_assumptions` differ from the §11.1 items of the pinned blob
+    → `spec-approval-assumptions-stale`, zero dispatches; a matching one
+    passes; the extractor is a pure function with a fixture for the
+    current §11.1; and a test reads THIS repository's committed spec and
+    the newest `spec-approval` record of the build ticket's manifest
+    segment and asserts the real preflight comparison passes (the
+    committed approval must satisfy its own binding).
+155. **Authorization binds the issue revision** (`select.test.mjs`,
+    `sequence.test.mjs`): under `owner-or-label` an OWNER-authored issue
+    whose `userContentEdits` lists a collaborator editor, or whose
+    timeline holds a `renamed` event by a collaborator → `not-authorized`,
+    never shaped; under `trusted-authors` a MEMBER-authored unlabeled
+    issue edited or renamed by a different COLLABORATOR → `not-authorized`,
+    and edited only by its author → eligible; the same issue after an
+    `admin` `labeled` event later than `lastEditedAt` → eligible in every
+    mode; a body edit AFTER that label event → `not-authorized` again; an
+    unreadable edit history → `not-authorized`; a body edited between
+    selection and §6.0a revalidation → `revalidation-changed`, the shaped
+    ticket discarded, zero dispatches.
+156. **Synthetic HOME contract** (fleet `sandbox.test.mjs`, real `bwrap`,
+    skipped loudly without it): inside the model plane
+    `$HOME/.claude/.credentials.json` is readable, `0400`, and byte-equal
+    to the host file; a worker fake that tries to rewrite, truncate,
+    unlink or rename over it fails (`EROFS`/`EACCES`) and the host file is
+    byte-identical and has the same inode afterwards; the orchestrator
+    has no code path that opens the host credential file for writing
+    (a spawn/fs recorder asserts zero writes under `~/.claude`);
+    `settings.json` inside carries no `hooks`/`mcpServers` keys; each of
+    the adapter's `homeState.dirs` exists inside, empty and writable
+    (a file written there is absent from the host's directory of the
+    same name afterwards), and `.claude.json` inside is writable;
+    `~/.ssh`, `~/.config/gh`, `~/.gitconfig` and `~/.npmrc` are ENOENT
+    inside; the host `HOME` is not bound; and an integration test runs
+    the pinned harness headless (`claude -p` with a trivial prompt)
+    inside the synthetic HOME to completion, asserting it initialized
+    and wrote only under the scratch directories (skipped loudly without
+    `bwrap` or the harness, recorded as such in the AC registry). Fleet's `--json`
+    echo lists `homeBinds` as exactly the credential file, `settings.json`
+    and the plugin tree under the synthetic `HOME`; the invariant test
+    accepts those three and rejects a fourth read-only path under `HOME`,
+    a `homeBinds` entry outside `HOME`, and a read-only bind of a scratch
+    directory (`sandbox-policy-mismatch`, no dispatch).
+157. **Sandboxed gates find their dependencies** (`sequence.test.mjs` +
+    fleet real-bwrap test): the gate install spawn has `cwd = <run
+    dir>/gate-deps`, runs on the host (no `bwrap` in its argv), carries
+    `--offline`, `--userconfig <generated>`, `--globalconfig /dev/null`,
+    an env whose `HOME` is an empty private directory and which holds no
+    `NPM_CONFIG_*`/`npm_config_*` beyond `npm_config_cache=<run
+    dir>/npm-cache`, and is recorded AFTER the dependency-diff, lockfile
+    and npm-config checks; a worker-written `.npmrc`, a changed
+    `overrides`, or a `file:` spec → `npm-config-drift` and no install
+    spawn at all; a lock addition that is not a workspace link never
+    reaches the install; a cache miss → `gate-deps-missing`, the run
+    fails; inside the sandbox a fixture test that imports a workspace
+    package through `<clone>/node_modules/@adlc/<x>` (a read-only bind —
+    a write into it fails `EROFS`) passes and `scripts/run-tests.mjs`
+    resolves `node_modules/.bin`; a per-gate clone whose bind was
+    skipped → `gate-deps-missing`, the run fails, no attestation.
+158. **Token lifetime gate** (`preflight.test.mjs`, `quota.test.mjs`):
+    a host credential fixture whose `expiresAt` is 100 minutes away with
+    a 90-minute wall clock → phase B records `tokenShort` and spawns
+    nothing; the pinned `claude -p` refresh spawn is recorded AFTER the
+    loop-head quota sample, with a quota sample and reconciliation
+    entry of its own (`startsThisIteration` incremented) and a fresh
+    sample before shaping; when the fixture then reports a later
+    `expiresAt`, dispatch proceeds; when it does not → `token-expiring`
+    naming the remaining minutes, sleep, zero dispatches; a quota fake
+    refusing at the loop head → no refresh spawn at all; a fixture with
+    8 hours left → no refresh spawn; the refresh spawn's argv equals the
+    §12.1 refresh argv exactly, its `stdinBytes` equal `ok\n`, its `cwd`
+    is an empty directory under the run directory, its env lacks
+    `ADLC_MANIFEST_KEY`, and it never carries the sandbox argv. A fixture whose
+    margin is sufficient in phase B but, after a slow shaping fake,
+    short at §6.0a revalidation → the run stays `shaped` with
+    `token-expiring`, zero dispatches; a pre-strike helper invocation
+    with `--wall-clock-remaining 60` against a file expiring in 70
+    minutes → exit 1 `token-expiring`, and fleet's fake stops with the
+    run resumable.
+159. **Dry-run transport is transient and isolated** (`preflight.test.mjs`
+    with the spawn recorder): under `--dry-run` the `ls-remote` spawn
+    carries a `GIT_SSH` wrapper whose realpath is under `mkdtemp` in
+    `$XDG_RUNTIME_DIR`, not under `REPO_ROOT`; `ls -A
+    <REPO_ROOT>/.adlc/autopilot-runs` is unchanged before and after; the
+    temporary directory is gone at exit; the dry-run wrapper's text and
+    argv name no path under `REPO_ROOT` (its `UserKnownHostsFile` and
+    `-i` values are under the temporary directory) and a stale
+    `<REPO_ROOT>/.adlc/autopilot-runs/ssh-*/known_hosts` planted before
+    the dry-run is never opened; a planted `~/.ssh/config` is not read
+    (`-F /dev/null` present).
+160. **Manifest verification is keyed** (`keys.test.mjs`): the
+    `gate-manifest verify` spawn's env carries `ADLC_MANIFEST_KEY` and
+    its argv carries `--allow-legacy-unsigned`; run against a copy of
+    THIS repository's real manifest (legacy unsigned prefix included)
+    plus a signed run segment the gate passes, while a forged signature
+    on any line, a missing signature on a post-prefix line, or one of
+    the run's own appended entries left unsigned (`run-entry-unsigned`)
+    makes the gate fail; the key-bearing allowlist
+    fixture lists exactly the §9.3 children and a `verify` spawn without
+    the key fails the test.
+161. **Gate mirror is synchronized after the last orchestrator commit**
+    (`sequence.test.mjs`, real temporary git repositories): with a
+    caller repository holding the worker's commits, the completion
+    commit and the attestation commit on `adlc/autopilot/issue-<n>`, plus
+    an unrelated branch and a dangling commit, the gate mirror created
+    after attestation has exactly two refs whose tips are `attestedHead`
+    and `BASE_OID`, `rev-list --all` equals the objects reachable from
+    them (the unrelated branch's and dangling objects are absent), and
+    `GATE_REPO`'s `HEAD` is `attestedHead` with the completion and
+    attestation commits present; a mirror created BEFORE the attestation
+    commit → `gate-mirror-stale`, no gate runs, no attestation.
+162. **Worker starts with its dependencies** (`run.test.mjs` + fleet
+    real-bwrap test): the fleet argv carries `--worker-deps <run
+    dir>/worker-deps/node_modules` and no `--init-on-host`; the only
+    `npm` spawn before the worker has `cwd = <run dir>/worker-deps` (a
+    clone at `BASE_OID`), the sanitized invocation of §6.5b(iii) minus
+    `--offline`, and precedes the worker spawn; on a retry whose
+    worktree carries a worker-written `.npmrc` and a rewritten
+    `package.json`, NO `npm` spawn has `cwd` under the worker worktree
+    and the copy is byte-identical to `worker-deps`; inside the sandbox
+    `node -e "import('@adlc/core')"` run from the worker worktree
+    resolves, an `npm ci` attempted inside exits non-zero with no
+    registry connection observed at the proxy, and a symlink
+    `node_modules/@adlc/<new>` → `../../packages/<new>` created by the
+    worker makes `import('@adlc/<new>')` resolve; a run whose
+    `worker-deps` build failed never spawns the worker (`init-failed`).
+163. **Every gh spawn is host-bound** (`keys.test.mjs`, spawn recorder
+    over a full `once` sequence against a GHES fixture whose pinned URL is
+    `git@ghe.example.com:o/r.git`): every recorded `gh` spawn carries
+    `GH_HOST=ghe.example.com` in its env, `--hostname ghe.example.com`
+    when it is `gh api`/`gh auth status`, and `--repo ghe.example.com/o/r`
+    when its subcommand accepts `--repo` — covering issue list, view,
+    edit and comment, pr create, view, edit, list and checks, and repo
+    view; the assertion is table-driven over the complete spawn list so
+    an unclassified gh spawn fails; a spawn with `--repo o/r`, without
+    `GH_HOST`, or with `GH_HOST=github.com` fails the test; the same
+    sequence against a `github.com` fixture passes with
+    `--repo github.com/o/r`.
