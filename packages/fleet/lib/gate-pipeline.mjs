@@ -48,10 +48,10 @@ export function collectProtectedCandidates({ listProtected, readBytes }) {
  */
 export async function runGatePipeline(ticket, deps) {
   // 1. build/test inside the sandbox.
-  const build = await runGates(deps.sandbox, deps.gate, deps.env);
+  const build = await runGates(deps.sandbox, deps.gate, deps.env, { timeoutMs: deps.timeoutMs ?? null, remaining: deps.remaining ?? null });
   if (!build.ok) {
     const failed = build.results.find((r) => !r.ok);
-    return { ok: false, stage: `build/test:${failed?.key ?? '?'}`, output: failed?.output ?? '' };
+    return { ok: false, stage: `build/test:${failed?.key ?? '?'}`, output: failed?.output ?? '', timedOut: failed?.timedOut === true };
   }
 
   // 2. ticket-local scope check (tracked diff).
@@ -73,7 +73,7 @@ export async function runGatePipeline(ticket, deps) {
   // 4. rails-guard (delegated to the adlc CLI in the live builder).
   if (deps.railsGuard) {
     const rg = await deps.railsGuard();
-    if (!rg.ok) return { ok: false, stage: 'rails-guard', output: rg.output ?? 'rail touched' };
+    if (!rg.ok) return { ok: false, stage: 'rails-guard', output: rg.output ?? 'rail touched', timedOut: rg.timedOut === true };
   }
 
   return { ok: true, stage: 'passed', output: '' };

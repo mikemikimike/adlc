@@ -19,17 +19,19 @@ import { usageEvidence } from './adapters/usage.mjs';
 import { transportCredential, transportEvidence } from './adapters/transport-credential.mjs';
 import { ladderAdapters, seatForAttempt } from './quartermaster.mjs';
 import { prosecute as prosecuteGate } from './prosecute.mjs';
-import { makeReviewRunner } from './review-runner.mjs';
+import { makeReviewRunner, DEFAULT_REVIEW_TIMEOUT_MS } from './review-runner.mjs';
 import { builderPrompt, fixPrompt } from './charters.mjs';
 import { PROTECTED_PREFIXES, isUnderProtectedPrefix } from './protected-paths.mjs';
 import { BASE_MANIFEST } from './protected-paths.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, appendFileSync, cpSync, rmSync, lstatSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnAsync } from './spawn-async.mjs';
 import { completeTicketOnIntegration, revertCompletionCommit, assertOnBranch } from './complete.mjs';
 import { resolveKeyFromEnv } from '@adlc/tickets/lib/key-contract.mjs';
+import { assertWorktreeLink, assertMirrorConfigPristine, HOST_SAFE_GIT_FLAGS, gitCommonDir } from './git-mirror.mjs';
+import { buildBoundedModelSandbox, bridgeArgv, mirrorCreateWorktree, mirrorFetchBack, mirrorCleanup, policyFromConfig } from './extensions.mjs';
 
 // Ignore fleet working state WITHOUT committing to the base checkout
 // (adversarial-review L2). `.git/info/exclude` is a local, per-repo, UNcommitted
@@ -71,9 +73,10 @@ function ensureLocalExclude(repoDir) {
  * into an execFileSync-shaped throw carrying `status` + `stdout` routes both
  * this path and `defaultExec` through checkFlail's single exit-code trust rule.
  */
-export function flailExec(io) {
+export function flailExec(io, remaining = null) {
   return (bin, args) => {
-    const r = io.adlc(args, { bin, maxBuffer: MAX_OUTPUT_BYTES });
+    // Bounded by the remaining wall clock when the run has one (codex r10).
+    const r = io.adlc(args, { bin, maxBuffer: MAX_OUTPUT_BYTES, ...(typeof remaining === 'function' ? { timeout: remaining() } : {}) });
     // Could not spawn at all, or no exit status to trust → unverifiable (§12).
     if (r?.error) throw r.error;
     if (typeof r?.status !== 'number') throw new Error('flail-detector did not run');
@@ -111,6 +114,10 @@ export function defaultIo() {
     spawnWorker: (cmd, args, opts) => spawnAsync(cmd, args, { encoding: 'utf8', ...opts }),
     readFile: (p) => readFileSync(p, 'utf8'),
     exists: (p) => existsSync(p),
+    // fleet-ext item 13: the bounded read invariant admits a pinned FILE under the
+    // synthetic HOME only when this predicate attests it. lstat, never stat: a
+    // symlink is not a regular file, so a link planted under HOME is refused.
+    isFile: (p) => { try { return lstatSync(p).isFile(); } catch { return false; } },
     mkdirp: (p) => mkdirSync(p, { recursive: true }),
     writeJson: (p, obj) => { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, JSON.stringify(obj, null, 2) + '\n'); },
     // Best-effort: losing a transcript line must never fail a build. A missing
@@ -123,12 +130,25 @@ export function defaultIo() {
       } catch { /* best effort */ }
     },
     ensureGitignore: (repoDir) => ensureLocalExclude(repoDir),
+    // fleet-ext item 15: a PLAIN copy of a caller-built dependency tree — never
+    // an npm run — replacing whatever the worktree carries. `verbatimSymlinks`
+    // keeps the workspace links (`node_modules/@adlc/<x>` → `../../packages/<x>`)
+    // relative, so they resolve inside the destination worktree.
+    copyTree: (src, dest) => {
+      rmSync(dest, { recursive: true, force: true });
+      cpSync(src, dest, { recursive: true, verbatimSymlinks: true, force: true, errorOnExist: false });
+    },
+    now: () => Date.now(),
     env: process.env,
     hasGh: () => { try { execFileSync('gh', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } },
   };
 }
 
 const PROSECUTE_GATED_MANIFEST = BASE_MANIFEST;
+/** The pre-strike helper's own maximum (fleet-ext item 7); the remaining wall clock lowers it. */
+export const PRE_STRIKE_MAX_MS = 120_000;
+/** The pre-strike helper's output budget per stream (its result is a status line, not a transcript). */
+export const PRE_STRIKE_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /** Parse `git status --porcelain --ignored -uall` output to worktree paths. */
 function parseStatusPaths(out) {
@@ -210,8 +230,34 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
     reviewBin: config.reviewBin ?? 'adversarial-review',
     provider: config.reviewProvider,
     failOn: config.prosecuteFailOn,
+    // The reviewer is spawned through the same async primitive as every other
+    // child (defaultIo's spawnWorker IS spawnAsync), so the injected io observes
+    // it — the argv the trusted binary receives is asserted, not assumed.
+    spawn: (cmd, args, opts) => io.spawnWorker(cmd, args, opts),
+    // fleet-ext item 8: the repo-configured grounding limit reaches the reviewer
+    // as --max-bytes; --allow-summary-review is never passed (see review-runner).
+    maxBytes: config.reviewMaxBytes ?? null,
   });
   const adlcBin = config.adlcBin ?? 'adlc';
+  const now = io.now ?? (() => Date.now());
+  const boundedMode = config.modelPlaneRead === 'bounded';
+  const mirrorMode = config.modelPlaneGit === 'mirror';
+  // Per-ticket compare-and-swap baselines for the mirror fetch-back (item 12):
+  // the cut tip first, then whatever the last successful fetch-back landed.
+  const cutTips = new Map();
+  let lastPolicy = null;
+  // fleet-ext item 6: the charter addendum is appended AFTER the Constraints
+  // block on every strike's prompt, so the constraints keep their authority.
+  const charterAddendum = config.charterAddendum ?? null;
+  // fleet-ext item 5: a dispatch may never outlive the external wall clock. The
+  // per-dispatch timeout is the SMALLER of the configured one and what remains.
+  const dispatchTimeoutMs = () => {
+    const perDispatch = (config.timeoutMinutes ?? 30) * 60000;
+    if (config.deadline == null) return perDispatch;
+    // The EXACT remaining budget, never padded: an expired deadline yields a
+    // 1 ms timeout (spawnAsync treats 0 as "no timeout"), i.e. immediate expiry.
+    return Math.max(1, Math.min(perDispatch, config.deadline - now()));
+  };
 
   // A per-worktree Sandbox on the repo-command plane (§7.3). exec runs the
   // wrapped argv via the worker-spawn primitive so tests can observe it.
@@ -224,8 +270,16 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       // The synthetic HOME is a bind SOURCE for bwrap — it must exist before the
       // wrapped command runs, or bwrap aborts (adversarial-review L4).
       io.mkdirp(join(worktree, '.fleet-home'));
-      const res = await io.spawnWorker(argv[0], argv.slice(1), { cwd: worktree, ...opts });
+      // A repo command is a process TREE too (a test runner forks workers): on
+      // timeout the whole group is signalled, never just the sandbox leader (codex r4).
+      const res = await io.spawnWorker(argv[0], argv.slice(1), { cwd: worktree, killGroup: true, ...opts });
       if (res.error) throw res.error;
+      if (res.timedOut) {
+        // A timed-out child reports status null — that is a FAILURE with its own
+        // marker, never an empty success (codex r5).
+        const e = new Error(`command timed out${opts?.timeout ? ` after ${opts.timeout} ms` : ''}`);
+        e.stdout = res.stdout; e.stderr = res.stderr; e.timedOut = true; throw e;
+      }
       if (typeof res.status === 'number' && res.status !== 0) {
         const e = new Error(`command failed (exit ${res.status})`);
         e.stdout = res.stdout; e.stderr = res.stderr; throw e;
@@ -316,15 +370,47 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
     },
 
     createWorktree: async ({ ticket, integrationBranch }) => {
-      const wt = worktrees.createWorktree(repo, ticket.id, { integrationBranch, git: repoGit });
+      // fleet-ext item 12: in mirror mode the worker's worktree belongs to the
+      // caller-supplied bare mirror; the gates run in a caller-repo worktree.
+      const wt = mirrorMode
+        ? mirrorCreateWorktree({ repo, ticketId: ticket.id, integrationBranch, mirror: config.modelPlaneGitMirror, repoGit, gitAt: io.git })
+        : worktrees.createWorktree(repo, ticket.id, { integrationBranch, git: repoGit });
+      if (mirrorMode) cutTips.set(ticket.id, wt.cutTip);
       // Initialize the worktree THROUGH the sandbox (§6.3, M1) — repo-config init
       // (npm install) runs arbitrary lifecycle code and must be contained.
-      if (config.init) {
-        try { await sandboxFor(wt.path).run(['/bin/sh', '-c', config.init], { env: repoCmdEnv(wt.path) }); }
+      // fleet-ext item 15: with --worker-deps the caller-built tree is COPIED in
+      // before every strike (see dispatch) and the configured init never runs —
+      // the worker starts with node_modules populated and has no install path.
+      if (config.init && !config.workerDeps) {
+        // Bounded by the remaining wall clock like every other repo command (codex r7).
+        try { await sandboxFor(wt.path).run(['/bin/sh', '-c', config.init], { env: repoCmdEnv(wt.path), timeout: dispatchTimeoutMs() }); }
         catch (e) { throw new Error(`worktree init failed for ${ticket.id}: ${e.message}`); }
       }
       return wt;
     },
+
+    // fleet-ext item 7: the operator's pre-strike command, spawned with an argv
+    // ARRAY and no shell, with EXACTLY the environment the operator supplied —
+    // nothing from this process's env, nothing from the worker's. A non-zero
+    // exit pauses the ticket (scheduler: 'quota-paused'), never fails it.
+    preStrike: config.preStrikeArgv ? async ({ ticket, strike }) => {
+      const [cmd, ...args] = config.preStrikeArgv;
+      let res;
+      try {
+        // Bounded by the smaller of the helper maximum and the run's remaining wall clock (codex r4).
+        res = await io.spawnWorker(cmd, args, { cwd: repo, env: { ...(config.preStrikeEnv ?? {}) }, shell: false, killGroup: true, maxOutputBytes: PRE_STRIKE_MAX_OUTPUT_BYTES, timeout: Math.max(1, Math.min(PRE_STRIKE_MAX_MS, config.deadline == null ? PRE_STRIKE_MAX_MS : config.deadline - now())) });
+      } catch (e) {
+        return { ok: false, reason: `pre-strike command could not be spawned for ${ticket.id} strike ${strike}: ${e.message}` };
+      }
+      if (res?.error) return { ok: false, reason: `pre-strike command could not run: ${res.error.message ?? res.error}` };
+      if (res?.status === 0) return { ok: true };
+      return { ok: false, reason: `pre-strike command exited ${res?.status ?? '?'} before strike ${strike}: ${String(res?.stderr ?? '').trim().slice(0, 300)}` };
+    } : undefined,
+
+    // The effective model-plane policy, echoed in the --json result so a caller
+    // can assert what actually applied (fleet-ext items 9, 11–15): what the LAST
+    // bounded dispatch actually built, else the config-derived policy.
+    describeSandbox: () => ({ ...policyFromConfig(config), ...(lastPolicy ?? {}) }),
 
     // provision is OPTIONAL per the WorkerAdapter contract (§4): only claude-code
     // writes a settings file; codex/agy/opencode/pi/cursor have none (adversarial-review A1).
@@ -344,8 +430,19 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       return undefined;
     },
 
-    dispatch: async ({ ticket, worktree, strike, deadEnds = [] }) => {
-      const prompt = strike > 1 ? fixPrompt(ticket, config.gate, deadEnds) : builderPrompt(ticket, config.gate);
+    dispatch: async ({ ticket, worktree, strike, deadEnds = [], gateWorktree, branch }) => {
+      // Strike 1 with caller-supplied dead-end material (fleet-ext item 3) is a
+      // FIX prompt too: the material describes a previous round's failure.
+      const prompt = (strike > 1 || deadEnds.length > 0)
+        ? fixPrompt(ticket, config.gate, deadEnds, { addendum: charterAddendum })
+        : builderPrompt(ticket, config.gate, { addendum: charterAddendum });
+      // fleet-ext item 15: the dependency tree is a plain host-side copy made
+      // before EVERY strike, so a retry never inherits a worker-written
+      // node_modules and npm never runs against worker-controlled input.
+      if (config.workerDeps) {
+        try { io.copyTree(config.workerDeps, join(worktree, 'node_modules')); }
+        catch (e) { return { exitCode: 1, output: `worker-deps copy failed: ${e.message}`, timedOut: false, usageStatus: 'unreported' }; }
+      }
       const attempt = attemptFor(ticket, strike);
       const seat = attempt?.seat ?? null;
       const adapter = adapterForSeat(ticket, seat);
@@ -365,20 +462,55 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       // tells it to run -- execute with the operator's WRITES bounded to this
       // worktree. Every ladder rung contributes its state declaration, because an
       // escalation can move a later strike onto a different harness.
-      const modelSandbox = modelSandboxFor(worktree, ladderAdaptersFor(ticket, adapter));
-      const res = await adapter.dispatch({
-        worktree, prompt, timeoutMs: (config.timeoutMinutes ?? 30) * 60000, env,
-        exec: (cmd, args, opts) => modelSandbox.run([cmd, ...args], opts),
-        // Operator-local binary override (A2) + non-executable data from config.
-        command: config.adapterCommand ?? undefined,
-        args: config.adapterArgs ?? undefined,
-        // §4c force half: the registry's model goes onto the command line
-        // explicitly, never the harness's ambient default. A seat always wins
-        // over `fleet.model` — the whole point of the registry is that supply is
-        // decided by the operator's file, not by run config.
-        model: seat ? seat.model : (config.model ?? undefined),
-        useStdin: config.adapterStdin === true, // pi RPC/stdin prompt transport (A3)
-      });
+      //
+      // fleet-ext items 11/13/14: in BOUNDED mode the profile is the bounded
+      // model plane with a synthetic HOME (and, under allowlist egress, no
+      // network namespace but a bridge to the host-side CONNECT proxy).
+      let modelSandbox; let egress = null; let boundedCleanup = null;
+      if (boundedMode) {
+        let built;
+        try {
+          built = await buildBoundedModelSandbox({
+            config, io, sandboxSpec, worktree, adapter, ticketId: ticket.id, repo,
+            extraWritable: mirrorMode ? [config.modelPlaneGitMirror] : [],
+          });
+        } catch (e) {
+          return { exitCode: 1, output: e.message, timedOut: false, usageStatus: 'unreported', policyMismatch: e.code === 'sandbox-policy-mismatch' };
+        }
+        modelSandbox = built.sandbox; egress = built.egress; boundedCleanup = built.cleanup;
+        lastPolicy = { ...built.description, gitSource: mirrorMode ? 'mirror' : 'shared', mirror: mirrorMode ? config.modelPlaneGitMirror : null };
+      } else {
+        modelSandbox = modelSandboxFor(worktree, ladderAdaptersFor(ticket, adapter));
+      }
+      let res;
+      // The strike's budget: the configured per-dispatch timeout, or LESS when the wall
+      // clock has less left. A strike that times out on a deadline-truncated budget never
+      // had its full attempt — the scheduler hands that strike back (codex r23 #3).
+      const timeoutMs = dispatchTimeoutMs();
+      const deadlineTruncated = config.deadline != null && timeoutMs < (config.timeoutMinutes ?? 30) * 60000;
+      try {
+        res = await adapter.dispatch({
+          worktree, prompt, timeoutMs, env: { ...env, ...(egress?.env ?? {}) },
+          // `killGroup`: the worker is a process TREE; on timeout the whole group
+          // is signalled (SIGTERM, then SIGKILL), not just the sandbox leader.
+          // The executable mapping is applied BEFORE the bridge prefix, so the bridge
+          // spawns the bound absolute path, never a bare name PATH cannot find (codex r6).
+          exec: (cmd, args, opts) => modelSandbox.run(bridgeArgv({ egress, argv: modelSandbox.mapCommand ? modelSandbox.mapCommand([cmd, ...args]) : [cmd, ...args] }), { ...opts, killGroup: true }),
+          // Operator-local binary override (A2) + non-executable data from config.
+          command: config.adapterCommand ?? undefined,
+          args: config.adapterArgs ?? undefined,
+          // §4c force half: the registry's model goes onto the command line
+          // explicitly, never the harness's ambient default. A seat always wins
+          // over `fleet.model` — the whole point of the registry is that supply is
+          // decided by the operator's file, not by run config.
+          model: seat ? seat.model : (config.model ?? undefined),
+          useStdin: config.adapterStdin === true, // pi RPC/stdin prompt transport (A3)
+        });
+      } finally {
+        // The proxy, its socket and the staged credential copy live exactly as
+        // long as the dispatch they served — on every exit path.
+        if (boundedCleanup) await boundedCleanup();
+      }
       // Persist the transcript BEFORE anything can return early, so the flail
       // consultation between strikes has something to analyze. Without this the
       // detector is handed a nonexistent path, exits 1, and every consultation
@@ -402,10 +534,31 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       const where = attempt?.channel
         ? ` channel=${attempt.channel}${attempt.escalatedFrom ? ` (escalated from ${attempt.escalatedFrom})` : ''}`
         : '';
+      res = { ...res, deadlineTruncated };
       write(`=== ${ticket.id} strike ${strike}${where} ===\n${res.output ?? ''}\n`);
       // Commit the worker's changes (orchestrator commits; §6.3 pathspec excludes control dirs).
       if (res.exitCode === 0 && !res.timedOut && !/TICKET-BLOCKED/.test(res.output)) {
-        try { worktrees.commitWorker(worktree, ticket.id, io.git(worktree)); }
+        try {
+          // The host is about to run git INSIDE the worker's worktree (codex r15 #1): the worktree's
+          // `.git` link must still point into the expected git directory, the mirror (if any) must be
+          // pristine, and the commands carry the host-safe overrides. A failure is a strike, never a run.
+          // The git-dir root is the repository's COMMON dir (a linked-worktree caller has a `.git` FILE), or the mirror.
+          if (existsSync(worktree)) assertWorktreeLink({ path: worktree, gitDirRoot: mirrorMode ? config.modelPlaneGitMirror : gitCommonDir(repo, io.git) });
+          if (mirrorMode) assertMirrorConfigPristine({ mirror: config.modelPlaneGitMirror, gitAt: io.git });
+          const hostGit = io.git(worktree);
+          worktrees.commitWorker(worktree, ticket.id, (...args) => hostGit(...HOST_SAFE_GIT_FLAGS, ...args));
+          // fleet-ext item 12: bring the worker branch back from the mirror by
+          // compare-and-swap and refresh the gate worktree. A failure here is
+          // terminal for the run — the scheduler maps it to `mirror-fetch-failed`.
+          if (mirrorMode) {
+            const fb = mirrorFetchBack({ repo, mirror: config.modelPlaneGitMirror, workerBranch: branch, cutTip: cutTips.get(ticket.id), gatePath: gateWorktree, gitAt: io.git });
+            if (!fb.ok) {
+              write(`mirror fetch-back failed: ${fb.detail ?? fb.reason}\n`);
+              return { ...res, exitCode: 1, output: `${res.output}\nmirror fetch-back failed (${fb.step ?? '?'}): ${fb.detail ?? fb.reason}`, timedOut: false, mirrorFetchFailed: true };
+            }
+            cutTips.set(ticket.id, fb.sha);
+          }
+        }
         catch (e) {
           // This IS the failure the scheduler will act on, so it belongs in the
           // transcript the flail check analyzes — otherwise a commit failure
@@ -423,7 +576,7 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       return { ...res, blocked: /TICKET-BLOCKED/.test(res.output) };
     },
 
-    gate: ({ ticket, worktree, startSha }) => {
+    gate: ({ ticket, worktree, startSha, remainingMs = null }) => {
       const wtGit = io.git(worktree);
       const changedPaths = wtGit('diff', '--name-only', `${startSha}..HEAD`).split('\n').map((s) => s.trim()).filter(Boolean);
       // Authoritative templates = the startSha-committed version of each manifest file.
@@ -437,13 +590,19 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       };
       const readBytes = (p) => (io.exists(join(worktree, p)) ? io.readFile(join(worktree, p)) : undefined);
       const railsGuard = async () => {
-        const res = await io.adlcAsync(['rails-guard', '--base', startSha, '--ticket', ticket.id], { cwd: worktree });
-        return { ok: res.status === 0, output: `${res.stdout ?? ''}${res.stderr ?? ''}` };
+        // Bounded by the remaining wall clock and killed as a group like every other gate phase (codex r9).
+        const left = config.deadline != null ? Math.max(1, config.deadline - now()) : remainingMs;
+        const res = await io.adlcAsync(['rails-guard', '--base', startSha, '--ticket', ticket.id], { cwd: worktree, killGroup: true, ...(left != null ? { timeout: left } : {}) });
+        return { ok: res.status === 0 && !res.timedOut, output: `${res.stdout ?? ''}${res.stderr ?? ''}${res.timedOut ? '\nrails-guard timed out' : ''}`, timedOut: res.timedOut === true };
       };
       return runGatePipeline(ticket, {
         sandbox: sandboxFor(worktree),
         gate: config.gate,
         env: repoCmdEnv(worktree),
+        // fleet-ext item 5: every gate command is bounded by the run's REMAINING wall
+        // clock, re-read immediately before it runs (codex r10).
+        timeoutMs: remainingMs ?? undefined,
+        remaining: config.deadline != null ? () => Math.max(1, config.deadline - now()) : null,
         changedPaths,
         templates,
         listProtected,
@@ -452,13 +611,25 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       });
     },
 
-    prosecute: ({ ticket, worktree, startSha }) =>
-      prosecuteGate({ worktree, startSha, ticket }, { runReview: review, failOn: config.prosecuteFailOn }),
+    prosecute: async ({ ticket, worktree, startSha, remainingMs = null }) => {
+      // fleet-ext item 5: the reviewer is bounded by the remaining wall clock too.
+      // The SMALLER of the reviewer's own budget and what remains — a long remaining wall clock never
+      // widens the reviewer's timeout, and a short one bounds it (agy fleet3 c3).
+      const runReview = (args) => review({ ...args, timeoutMs: remainingMs != null ? Math.min(remainingMs, DEFAULT_REVIEW_TIMEOUT_MS) : undefined });
+      const r = await prosecuteGate({ worktree, startSha, ticket }, { runReview, failOn: config.prosecuteFailOn });
+      // The revision the review judged: HEAD of the reviewed worktree at this
+      // instant (fleet-ext item 9). Best effort — a missing revision is null,
+      // never a fabricated one.
+      let revision = null;
+      try { revision = io.git(worktree)('rev-parse', 'HEAD') || null; } catch { revision = null; }
+      const verdictWord = r.review?.verdict ?? ({ pass: 'approve', block: 'needs-attention', unavailable: 'unavailable' })[r.verdict] ?? r.verdict;
+      return { ...r, review: { provider: r.review?.provider ?? config.reviewProvider ?? null, verdict: verdictWord, revision } };
+    },
 
     flail: ({ ticket }) => checkFlail(
       fleetLogPath(statusDir, repo, ticket.id),
       ticket.scope,
-      { adlcBin, exec: flailExec(io) },
+      { adlcBin, exec: flailExec(io, config.deadline != null ? () => Math.max(1, config.deadline - now()) : null) },
     ),
 
     // Rebase inside the ticket's own worktree, merge inside the integration worktree —
@@ -470,7 +641,7 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       integrationGit,
     }),
 
-    postMergeGate: async ({ integrationBranch }) => {
+    postMergeGate: async ({ integrationBranch, remainingMs = null }) => {
       // Gate inside the integration worktree — no checkout, nothing shared. The branch
       // identity and SHA are pinned either side: the worktree removes the
       // external-interference class, and these assertions keep the verdict provably
@@ -488,7 +659,8 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
       // ref movement DURING the build/test would be invisible and a stale passing verdict
       // would be trusted (adversarial-review round-30). The whole point of the after-gate
       // pin is to observe the branch tip AS IT WAS while the gate executed.
-      const result = await runGates(sandboxFor(integrationPath), config.gate, repoCmdEnv(integrationPath));
+      const gated = await runGates(sandboxFor(integrationPath), config.gate, repoCmdEnv(integrationPath), { timeoutMs: remainingMs ?? undefined, remaining: config.deadline != null ? () => Math.max(1, config.deadline - now()) : null });
+      const result = { ...gated, timedOut: (gated.results ?? []).some((r) => r.timedOut === true) };
       try {
         assertOnBranch(integrationGit, integrationBranch, 'after gating', 'trust the gate');
         if (integrationGit('rev-parse', 'HEAD') !== gatedSha) {
@@ -515,9 +687,16 @@ export function buildLiveDeps({ repo, config, statusDir, sandboxSpec, reviewRunn
     revertCompletion: ({ toSha, shardPath, completionSha, integrationBranch, ledgerPath, raced }) =>
       revertCompletionCommit({ repo: integrationPath, toSha, shardPath, completionSha, integrationBranch, ledgerPath, raced, git: integrationGit }),
 
-    cleanup: ({ worktree, state }) => {
+    cleanup: ({ ticket, worktree, state }) => {
       // Keep failed worktrees for inspection; remove merged ones.
-      if (state === 'merged') worktrees.removeWorktree(repo, worktree, repoGit);
+      if (state === 'merged') {
+        if (mirrorMode) {
+          const id = String(ticket?.id ?? '').toLowerCase();
+          mirrorCleanup({ repo, mirror: config.modelPlaneGitMirror, path: worktree, gatePath: join(repo, '.worktrees', `fleet-${id}-gate`), repoGit, gitAt: io.git });
+        } else {
+          worktrees.removeWorktree(repo, worktree, repoGit);
+        }
+      }
       worktrees.pruneWorktrees(repo, repoGit);
     },
 

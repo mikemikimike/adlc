@@ -13,7 +13,7 @@
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { spawnAsync } from '../spawn-async.mjs';
-import { modelArgs } from './_shared.mjs';
+import { modelArgs, TRUNCATED_NOTE } from './_shared.mjs';
 import { UNREPORTED, normalizeUsage, reported } from './usage.mjs';
 
 export const name = 'claude-code';
@@ -85,6 +85,14 @@ export const transports = Object.freeze({
   subscription: Object.freeze({}),
   api: Object.freeze({ env: 'ANTHROPIC_API_KEY' }),
 });
+
+/**
+ * Model-plane egress allowlist (issue-autopilot spec §6.4 "EGRESS", §14 item 13):
+ * the model API plus the OAuth refresh hosts the CLI is known to contact. Under
+ * `--model-plane-egress allowlist` these exact `host:port` pairs are the ONLY
+ * CONNECT targets the host-side proxy will open for this harness.
+ */
+export const egressHosts = Object.freeze(['api.anthropic.com:443', 'console.anthropic.com:443', 'platform.claude.com:443']);
 
 /**
  * Translate a config command string into a Claude Code permission rule. A raw
@@ -192,7 +200,7 @@ export function parseText(output) {
   } catch { return null; }
 }
 
-export async function dispatch({ worktree, prompt, timeoutMs, env, exec = defaultExec, model }) {
+export async function dispatch({ worktree, prompt, timeoutMs, env, exec = defaultExec, model, command = 'claude' }) {
   // §4c force half: the registry's model goes on the command line explicitly —
   // never the harness's ambient default.
   //
@@ -200,14 +208,17 @@ export async function dispatch({ worktree, prompt, timeoutMs, env, exec = defaul
   // is recovered from the document's `result` below, so downstream consumers
   // (the flail transcript, the TICKET-BLOCKED probe) see what they saw before.
   const args = ['-p', prompt, '--permission-mode', 'acceptEdits', '--output-format', 'json', ...modelArgs('--model', model)];
-  const res = await exec('claude', args, { cwd: worktree, env, timeout: timeoutMs });
+  const res = await exec(command, args, { cwd: worktree, env, timeout: timeoutMs });
   const timedOut = res.signal === 'SIGTERM' || res.killed === true || res.timedOut === true;
   const stdout = `${res.stdout ?? ''}`;
   const text = parseText(stdout);
+  const status = typeof res.status === 'number' ? res.status : (timedOut ? 124 : 1);
   return {
-    exitCode: typeof res.status === 'number' ? res.status : (timedOut ? 124 : 1),
-    output: text === null ? `${stdout}${res.stderr ?? ''}` : `${text}${res.stderr ?? ''}`,
+    // A truncated stream is never a success (codex r24 #4): its document may be the part cut off.
+    exitCode: res.truncated === true && status === 0 ? 1 : status,
+    output: `${res.truncated === true ? TRUNCATED_NOTE : ''}${text === null ? `${stdout}${res.stderr ?? ''}` : `${text}${res.stderr ?? ''}`}`,
     timedOut,
+    ...(res.truncated === true ? { truncated: true } : {}),
     ...parseUsage(stdout),
   };
 }

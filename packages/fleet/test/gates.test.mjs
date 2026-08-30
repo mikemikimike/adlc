@@ -52,3 +52,29 @@ test('checkFlail FAILS OPEN on any error (§12 backstop)', async () => {
   assert.equal(r.flail, false);
   assert.equal(r.failedOpen, true);
 });
+
+test('runGates forwards a remaining-wall-clock bound to the sandbox as `timeout` and passes nothing when unbounded (fleet-ext item 5, codex r2)', async () => {
+  const seen = [];
+  const sandbox = { run: async (argv, opts) => { seen.push(opts); return 'ok'; } };
+  await runGates(sandbox, { build: 'b', test: 't' }, { PATH: '/usr/bin' }, { timeoutMs: 1234 });
+  assert.deepEqual(seen.map((o) => o.timeout), [1234, 1234], 'both gate commands carry the bound');
+  assert.deepEqual(seen[0].env, { PATH: '/usr/bin' });
+  seen.length = 0;
+  await runGates(sandbox, { build: 'b' }, {});
+  assert.ok(!('timeout' in seen[0]), 'no bound → no timeout key at all');
+});
+
+test('a gate command ended by its timeout is a FAILURE carrying timedOut (never an empty success) (codex r5)', async () => {
+  const sandbox = { run: async () => { const e = new Error('command timed out after 5 ms'); e.timedOut = true; e.stdout = 'partial'; throw e; } };
+  const r = await runGates(sandbox, { build: 'b' }, {}, { timeoutMs: 5 });
+  assert.equal(r.ok, false);
+  assert.equal(r.results[0].timedOut, true);
+  assert.match(r.results[0].output, /timed out/);
+});
+
+test('runGates re-reads the remaining budget before EVERY command: the test command gets what the build left, never the stale figure (codex r10)', async () => {
+  let left = 10_000; const seen = [];
+  const sandbox = { run: async (argv, opts) => { seen.push(opts.timeout); left -= 6_000; return 'ok'; } };
+  await runGates(sandbox, { build: 'b', test: 't' }, {}, { remaining: () => Math.max(1, left) });
+  assert.deepEqual(seen, [10_000, 4_000]);
+});

@@ -23,6 +23,9 @@ test('running fleet.mjs directly DISPATCHES the CLI (--help prints usage)', () =
   const r = spawnSync(process.execPath, [BIN, '--help'], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /fleet — parallel ADLC ticket orchestration/, 'the entry-point guard dispatches when run directly');
+  // The documented exit-code contract is part of the CLI's interface (CONVENTIONS rule 4):
+  // 0 = ok, 1 = operational error, 2 = a ticket failed/blocked/paused.
+  assert.match(r.stdout, /Exit codes: 0 ok · 1 operational error · 2 a ticket failed\/blocked\/paused \(see --json "reason"\)\./);
 });
 
 // ── the argv slice is a real boundary (#530 mutation gate) ───────────────────
@@ -96,4 +99,56 @@ test('a NONEXISTENT argv[1] resolves to "not the entry" instead of dispatching o
     { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.stdout, '', 'a bare import must not print usage');
+});
+
+import { loadExtensionFiles as loadExt, MAX_EXTENSION_FILE_BYTES, readBoundedFile } from '../bin/fleet.mjs';
+test('caller-supplied files must be REGULAR and bounded: a FIFO and an oversize file are refused before anything else runs (codex r7)', () => {
+  // The checks live in the single-descriptor reader (fstat of the OPEN descriptor, bounded read): drive it with fake fs calls.
+  const reader = (p) => { let done = false; return readBoundedFile(p, MAX_EXTENSION_FILE_BYTES, { openSync: () => 7, closeSync: () => {}, fstatSync: () => ({ isFile: () => p !== '/fifo', size: p === '/huge' ? MAX_EXTENSION_FILE_BYTES + 1 : 8 }), readSync: (fd, buf, off) => { if (done) return 0; done = true; buf.write('material', off); return 8; } }); };
+  assert.equal(loadExt({ charterFile: '/c' }, reader).charterAddendum, 'material');
+  assert.throws(() => loadExt({ charterFile: '/fifo' }, reader), /not a regular file/);
+  assert.throws(() => loadExt({ deadEndFile: '/huge' }, reader), /exceeds/);
+  assert.throws(() => loadExt({ deadEndFile: '/missing' }, () => { throw new Error('ENOENT'); }), /ENOENT/);
+});
+
+test('an invalid or unknown run flag under --json still yields exactly one result document with reason dispatch-refused (codex r9)', () => {
+  const bin = new URL('../bin/fleet.mjs', import.meta.url).pathname;
+  for (const argv of [['run', '--json', '--max-strikes', '0'], ['run', '--json', '--no-such-flag']]) {
+    const r = spawnSync(process.execPath, [bin, ...argv], { encoding: 'utf8', cwd: mkdtempSync(join(tmpdir(), 'fleet-flags-')) });
+    assert.equal(r.status, 1, `${argv.join(' ')}: exit 1`);
+    let doc; try { doc = JSON.parse(r.stdout); } catch { doc = null; }
+    assert.ok(doc && typeof doc === 'object', `exactly one (pretty-printed) document on stdout: ${r.stdout.slice(0, 200)}`);
+    assert.equal(doc.reason, 'dispatch-refused');
+    assert.equal(doc.exitCode, 1);
+  }
+});
+
+test('a ticket-store failure before dispatch under --json still yields one result document (codex r10)', () => {
+  const bin = new URL('../bin/fleet.mjs', import.meta.url).pathname;
+  const r = spawnSync(process.execPath, [bin, 'run', '--json', '--no-pr'], { encoding: 'utf8', cwd: mkdtempSync(join(tmpdir(), 'fleet-nostore-')) });
+  assert.notEqual(r.status, 0);
+  let doc; try { doc = JSON.parse(r.stdout); } catch { doc = null; }
+  assert.ok(doc && typeof doc.reason === 'string', `one result document with a reason: ${r.stdout.slice(0, 200)} ${r.stderr.slice(0, 200)}`);
+});
+
+test('--model-plane-git mirror with a concurrency other than 1 is refused (one writable mirror per worker) — under --json as a dispatch-refused document (codex r11)', () => {
+  const bin = new URL('../bin/fleet.mjs', import.meta.url).pathname;
+  const cwd = mkdtempSync(join(tmpdir(), 'fleet-mirror-cc-'));
+  const r = spawnSync(process.execPath, [bin, 'run', '--json', '--model-plane-git', 'mirror', '--model-plane-git-mirror', '/m/mirror.git', '--model-plane-read', 'bounded', '--model-plane-read-only', '/usr', '--concurrency', '2'], { encoding: 'utf8', cwd });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /requires concurrency 1/);
+  assert.equal(JSON.parse(r.stdout).reason, 'dispatch-refused');
+});
+
+test('the production path reads extension files through the bounded single-descriptor reader (a FIFO is refused, never the plain io.readFile)', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { execFileSync } = await import('node:child_process');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-ext-prod-'));
+  try {
+    const fifo = join(dir, 'charter.fifo'); execFileSync('mkfifo', [fifo]);
+    // No injected reader: the default (production) reader must refuse the FIFO without blocking.
+    assert.throws(() => loadExt({ charterFile: fifo }), /not a regular file/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

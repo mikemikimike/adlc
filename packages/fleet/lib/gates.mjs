@@ -17,23 +17,29 @@ import { inScope } from '@adlc/core';
  * exit or a thrown sandbox error is a gate failure (ok:false), never a throw —
  * the scheduler decides what a failure means (a strike).
  */
-export async function runGateCommand(sandbox, command, env) {
+export async function runGateCommand(sandbox, command, env, { timeoutMs = null } = {}) {
   const argv = ['/bin/sh', '-c', command];
   try {
-    const output = await sandbox.run(argv, { env });
+    // fleet-ext item 5: an optional bound (the run's remaining wall clock) reaches
+    // the sandbox as `timeout`, which the exec layer enforces on the child.
+    // A budget of 0 is an EXPIRED budget, never "no timeout" (spawnAsync reads 0 as unbounded; agy fleet r9 c2).
+    const output = await sandbox.run(argv, timeoutMs != null ? { env, timeout: Math.max(1, timeoutMs) } : { env });
     return { ok: true, output: String(output ?? '') };
   } catch (e) {
-    return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}` };
+    return { ok: false, output: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message ?? ''}`, timedOut: e?.timedOut === true };
   }
 }
 
 /** Run the configured build + test gate commands in order; stop at first failure. */
-export async function runGates(sandbox, gate, env) {
+export async function runGates(sandbox, gate, env, opts = {}) {
   const results = [];
   for (const key of ['build', 'test']) {
     const cmd = gate?.[key];
     if (!cmd) continue;
-    const r = await runGateCommand(sandbox, cmd, env);
+    // `remaining()` is re-read before EVERY command: a build that ate most of the
+    // budget leaves the test only what is left, never the stale figure (codex r10).
+    const timeoutMs = typeof opts.remaining === 'function' ? opts.remaining() : opts.timeoutMs;
+    const r = await runGateCommand(sandbox, cmd, env, { timeoutMs });
     results.push({ key, ...r });
     if (!r.ok) return { ok: false, results };
   }

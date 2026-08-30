@@ -46,13 +46,27 @@ export function resolveTrustedBin(bin, pathStr, worktree) {
  * @param opts.trustedPath PATH used to resolve reviewBin (default the orchestrator's)
  * @param opts.provider  optional --provider passthrough (e.g. 'codex', 'openai')
  * @param opts.failOn    passed through to the CLI's deterministic gate (default medium)
- * @param opts.timeoutMs per-review timeout
+ * @param opts.timeoutMs per-review timeout; a per-call `timeoutMs` (the run's remaining wall clock) can only LOWER it
  * @returns a runReview({ worktree, startSha, ticket }) => { ok, findings?, reason? }
  */
-export function makeReviewRunner({ spawn = defaultSpawn, reviewBin = 'adversarial-review', trustedPath, resolveBin = resolveTrustedBin, provider, failOn = 'medium', timeoutMs = 600000, env: source = process.env } = {}) {
-  return async ({ worktree, startSha }) => {
+/** The effective review timeout: the configured one, lowered (never raised) by a per-call bound. */
+export function boundedTimeout(base, call) {
+  // A non-positive bound means "no bound" (codex r2 contract, pinned by test); an EXPIRED budget
+  // never reaches here as 0 — every scheduler remainder is floored at 1 ms (agy fleet r7 c3 declined).
+  return Number.isFinite(call) && call > 0 ? Math.max(1, Math.min(base, Math.floor(call))) : base;
+}
+
+/** The reviewer's own budget; a remaining wall clock only ever SHRINKS it (agy fleet3 c3). */
+export const DEFAULT_REVIEW_TIMEOUT_MS = 600000;
+export function makeReviewRunner({ spawn = defaultSpawn, reviewBin = 'adversarial-review', trustedPath, resolveBin = resolveTrustedBin, provider, failOn = 'medium', timeoutMs = DEFAULT_REVIEW_TIMEOUT_MS, env: source = process.env, maxBytes = null } = {}) {
+  return async ({ worktree, startSha, timeoutMs: callTimeoutMs = null }) => {
     const args = ['--base', startSha, '--json', '--fail-on', failOn];
     if (provider) args.push('--provider', provider);
+    // fleet-ext item 8: the reviewer's inline-diff grounding limit is forwarded
+    // explicitly, and `--allow-summary-review` is NEVER passed — above the limit a
+    // summary-only review silently drops every finding as ungrounded, which is a
+    // false green, not a review.
+    if (Number.isInteger(maxBytes) && maxBytes > 0) args.push('--max-bytes', String(maxBytes));
     const path = trustedPath ?? source.PATH;
     // Pre-resolve to an ABSOLUTE trusted path so exec never resolves relative to
     // cwd=worktree (M2). Fail closed if no trusted binary is found.
@@ -83,10 +97,11 @@ export function makeReviewRunner({ spawn = defaultSpawn, reviewBin = 'adversaria
 
     let res;
     try {
-      res = await spawn(bin, args, { cwd: worktree, env, encoding: 'utf8', timeout: timeoutMs });
+      res = await spawn(bin, args, { cwd: worktree, env, encoding: 'utf8', timeout: boundedTimeout(timeoutMs, callTimeoutMs) });
     } catch (e) {
       return { ok: false, reason: `adversarial-review spawn failed: ${e.message}` };
     }
+    if (res.timedOut) return { ok: false, timedOut: true, reason: 'adversarial-review timed out — failing closed' };
     if (res.error) {
       // ENOENT here means the TRUSTED review binary is not installed — fail
       // closed rather than silently skipping prosecution.
@@ -105,7 +120,13 @@ export function makeReviewRunner({ spawn = defaultSpawn, reviewBin = 'adversaria
       // A 0/2 exit but unparseable stdout means we cannot trust the verdict.
       return { ok: false, reason: 'adversarial-review output was not valid JSON — failing closed' };
     }
-    return { ok: true, findings: Array.isArray(parsed.findings) ? parsed.findings : [] };
+    return {
+      ok: true,
+      findings: Array.isArray(parsed.findings) ? parsed.findings : [],
+      // Review meta the --json result echoes (fleet-ext item 9): the provider that
+      // judged, the tool's own verdict word, and the exit that produced it.
+      review: { provider: provider ?? parsed.provider ?? null, verdict: typeof parsed.verdict === 'string' ? parsed.verdict : (res.status === 0 ? 'approve' : 'needs-attention'), exitCode: res.status },
+    };
   };
 }
 

@@ -325,7 +325,7 @@ test('a commit failure after a successful call PRESERVES the parsed usage', asyn
   // The routine way to reach this path: the worker succeeded but produced
   // nothing committable, so the commit errors.
   io.git = () => (...args) => {
-    if (args[0] === 'commit') throw new Error('nothing to commit, working tree clean');
+    if (args.includes('commit')) throw new Error('nothing to commit, working tree clean');
     if (args[0] === 'rev-parse') return 'SHA';
     return '';
   };
@@ -412,7 +412,7 @@ test('a commit failure is reported as a FAILURE, not as a timeout', async () => 
   const io = fakeIo(rec, env);
   io.spawnWorker = async () => ({ status: 0, stdout: '{"type":"result","result":"ok","usage":{"input_tokens":10,"output_tokens":54,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}', stderr: '' });
   io.git = () => (...args) => {
-    if (args[0] === 'commit') throw new Error('nothing to commit, working tree clean');
+    if (args.includes('commit')) throw new Error('nothing to commit, working tree clean');
     if (args[0] === 'rev-parse') return 'SHA';
     return '';
   };
@@ -427,4 +427,21 @@ test('a commit failure is reported as a FAILURE, not as a timeout', async () => 
   assert.equal(res.exitCode, 1, 'precondition: the commit-failure path');
   assert.equal(res.timedOut, false, 'a commit failure is not a timeout');
   assert.match(res.output, /commit failed/);
+});
+
+test('defaultIo().isFile attests only a REGULAR file: a missing path, a directory and a symlink (even to a regular file) are false', async () => {
+  const { mkdtempSync, writeFileSync, symlinkSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { defaultIo } = await import('../lib/live-deps.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-isfile-'));
+  try {
+    const file = join(dir, 'claude'); writeFileSync(file, '#!/bin/sh\n');
+    const link = join(dir, 'link'); symlinkSync(file, link);
+    const io = defaultIo();
+    assert.equal(io.isFile(file), true, 'a regular file is attested');
+    assert.equal(io.isFile(join(dir, 'missing')), false, 'a missing path is NOT attested (lstat throws → false, never true)');
+    assert.equal(io.isFile(dir), false, 'a directory is not a file');
+    assert.equal(io.isFile(link), false, 'a symlink is not a regular file (lstat, never stat)');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
