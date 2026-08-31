@@ -751,11 +751,15 @@ if (useJson) {
 
 // ── exit ─────────────────────────────────────────────────────────────────────
 
-// Defense in depth: every reachable zero-results path is fail-closed above
-// (the explicit-target and diff-derived-target checks), so this should be
-// unreachable — but a coverage gate must never silently pass() on zero
-// results regardless of how it got here (#658).
-if (results.length === 0) {
+// Defense in depth: with either a diff-derived or an explicit target
+// selected, every zero-results path is already fail-closed above (the
+// explicit-target and diff-derived-target checks) — this is UNREACHABLE in
+// that case. It is stated explicitly (rather than left implicit) so a diff
+// with NEITHER selected — already refused earlier, at the "nothing to
+// mutate" check — can never reach here and be mistaken for this ticket's
+// (#658) diff-derived-zero-mutants case; a coverage gate must still never
+// silently pass() on zero results regardless of how it got here.
+if (results.length === 0 && (diffEligibleFiles.length > 0 || mutableExplicitFiles.length > 0)) {
   opError('no mutants were generated and no target was selected — refusing to report a pass.');
 }
 
