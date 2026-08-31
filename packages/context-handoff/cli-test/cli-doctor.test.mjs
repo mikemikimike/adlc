@@ -90,3 +90,25 @@ test('doctor --clear (dry-run, no --write): prints what WOULD clear, removes not
     assert.ok(existsSync(join(dir, 'handoffs', 'denies', 'orphan-a.json')));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test('doctor without --dir resolves the store from cwd (the ternary is load-bearing)', () => {
+  const root = seeded();
+  try {
+    const r = run(['doctor'], { cwd: root });
+    assert.equal(r.code, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /orphan-a orphaned-unbound/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a store whose only record is INVALID exits 2 (fail-closed attention), never 0', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'handoff-doctor-cli-'));
+  try {
+    const denies = join(root, '.adlc', 'handoffs', 'denies');
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(denies, { recursive: true });
+    writeFileSync(join(denies, 'badrec.json'), '{ not json');
+    const r = run(['doctor', '--dir', join(root, '.adlc')], { cwd: root });
+    assert.equal(r.code, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /invalid record/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

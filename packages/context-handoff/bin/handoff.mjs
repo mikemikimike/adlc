@@ -1100,11 +1100,13 @@ function runDoctor(args) {
     const cleared = doctorClear(root, { key, dir });
     if (!cleared.ok) opError(`doctor: ${cleared.reason}`);
     process.stdout.write(`doctor: cleared ${cleared.cleared.length} orphaned-unbound record(s): ${cleared.cleared.join(', ') || '(none)'}\n`);
-    process.exit(cleared.remainingOpen > 0 ? 2 : 0);
+    process.exit(cleared.remainingOpen > 0 || report.invalidRecords.length > 0 ? 2 : 0);
   }
   if (clear && !write) process.stdout.write(`doctor: dry-run — pass --write (with ADLC_MANIFEST_KEY) to clear ${report.orphans.length} orphaned-unbound record(s)\n`);
   if (report.orphans.length) process.stdout.write(`doctor: ${report.orphans.length} orphaned-unbound record(s); clear with: ${report.clearCommand}\n`);
-  process.exit(report.open.length > 0 ? 2 : 0);
+  // Invalid records are retained FAIL-CLOSED by the gate: a store holding only those is
+  // not clean, and exit 0 would mislead automation (agy r1 #3).
+  process.exit(report.open.length > 0 || report.invalidRecords.length > 0 ? 2 : 0);
 }
 
 const [command, ...rest] = argv;

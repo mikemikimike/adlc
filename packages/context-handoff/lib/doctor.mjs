@@ -45,12 +45,18 @@ const sentinelPath = (root) => join(root, '.adlc', '.deny-store');
 const legacySentinelPath = (root) => join(root, '.adlc', 'handoffs', '.deny-store');
 
 /** Rewrite the sentinel without the cleared sessions (atomic tmp+rename; legacy file removed). */
+function readSentinelSessions(path) {
+  try { const cur = JSON.parse(readFileSync(path, 'utf8')); return Array.isArray(cur.sessions) ? cur.sessions : []; } catch { return []; }
+}
+
 function rewriteSentinelWithout(root, clearedIds) {
   const path = sentinelPath(root);
+  // A store migrated mid-way may hold registrations ONLY in the legacy file: merge both
+  // before filtering, or the first doctor clear would drop every bound/captured session's
+  // registration (agy r1 #1).
   let sessions = [];
-  if (existsSync(path)) {
-    try { const cur = JSON.parse(readFileSync(path, 'utf8')); if (Array.isArray(cur.sessions)) sessions = cur.sessions; } catch { /* rebuilt below */ }
-  }
+  if (existsSync(path)) sessions = readSentinelSessions(path);
+  if (existsSync(legacySentinelPath(root))) sessions = [...new Set([...sessions, ...readSentinelSessions(legacySentinelPath(root))])];
   const next = sessions.filter((s) => !clearedIds.includes(s)).sort();
   mkdirSync(join(root, '.adlc'), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
@@ -66,26 +72,34 @@ function rewriteSentinelWithout(root, clearedIds) {
  * manifest evidence naming exactly what was cleared and why. Fails closed —
  * without a key nothing is touched.
  */
-export function doctorClear(root, { key, dir }) {
+export function doctorClear(root, { key, dir, fs = { unlinkSync } }) {
   if (typeof key !== 'string' || key.length === 0) {
     return { ok: false, exitCode: 1, reason: 'ADLC_MANIFEST_KEY is required for --clear --write; nothing was removed' };
   }
   const report = doctorReport(root);
   if (!report.ok) return { ok: false, exitCode: 1, reason: report.reason };
   const cleared = [];
+  let failed = null;
   for (const o of report.orphans) {
     const p = denyPath(root, o.session_id);
-    try { unlinkSync(p); cleared.push(o.session_id); } catch (err) {
-      return { ok: false, exitCode: 1, reason: `could not remove ${p}: ${err?.message}`, cleared };
+    try { fs.unlinkSync(p); cleared.push(o.session_id); } catch (err) {
+      failed = { session_id: o.session_id, reason: err?.message ?? 'unlink failed' };
+      break;
     }
   }
-  rewriteSentinelWithout(root, cleared);
-  recordHandoffEvidence({
-    gate: 'handoff-doctor-clear',
-    ticket: null,
-    data: { cleared, reason: 'orphaned-unbound (open, no ticket, no content hash, no capture)', writerNote: 'operator-keyed doctor clear' },
-    dir,
-    key,
-  });
+  // A partial failure must never leave the store inconsistent or unaudited: whatever WAS
+  // removed is reflected in the sentinel and recorded as evidence before the error is
+  // reported (agy r1 #2).
+  if (cleared.length > 0 || failed === null) {
+    rewriteSentinelWithout(root, cleared);
+    recordHandoffEvidence({
+      gate: 'handoff-doctor-clear',
+      ticket: null,
+      data: { cleared, ...(failed ? { partial: true, failed } : {}), reason: 'orphaned-unbound (open, no ticket, no content hash, no capture)', writerNote: 'operator-keyed doctor clear' },
+      dir,
+      key,
+    });
+  }
+  if (failed) return { ok: false, exitCode: 1, reason: `could not remove the deny for ${failed.session_id}: ${failed.reason} (cleared so far: ${cleared.join(', ') || 'none'} — sentinel updated, evidence recorded)`, cleared };
   return { ok: true, exitCode: 0, cleared, remainingOpen: report.open.length - cleared.length };
 }

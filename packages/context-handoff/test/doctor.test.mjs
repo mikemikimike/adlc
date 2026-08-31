@@ -43,6 +43,7 @@ test('provenance: new deny records carry writer {pid, argv0, cwd, host, wroteAt}
     assert.equal(rec.writer.pid, process.pid);
     assert.equal(typeof rec.writer.argv0, 'string');
     assert.ok(!rec.writer.argv0.includes('/'), 'argv0 is a basename, never a path');
+    assert.equal(rec.writer.argv0, 'doctor.test.mjs', 'exactly the entry script basename');
     assert.equal(rec.writer.cwd, process.cwd());
     assert.ok(rec.writer.wroteAt);
     // A record written without provenance (the pre-provenance schema) still loads and classifies.
@@ -53,5 +54,44 @@ test('provenance: new deny records carry writer {pid, argv0, cwd, host, wroteAt}
     const l = loaded.records.find((x) => x.session_id === 'legacy-l');
     assert.equal(l.writer, undefined);
     assert.equal(classifyDenyRecord(l, { hasCapture: false }).kind, 'orphaned-unbound');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a legacy-only sentinel is merged, never discarded: the first clear keeps bound sessions registered (agy r1 #1)', async () => {
+  const { writeFileSync, mkdirSync, renameSync } = await import('node:fs');
+  const root = scratch();
+  try {
+    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
+    ensureDenyMarker(root, { sessionId: 'bound-b', ticketId: 'T9', contentHash: 'c'.repeat(64), host: 'pi' });
+    // Simulate the pre-slice layout: registrations live ONLY in the legacy file.
+    mkdirSync(join(root, '.adlc', 'handoffs'), { recursive: true });
+    renameSync(join(root, '.adlc', '.deny-store'), join(root, '.adlc', 'handoffs', '.deny-store'));
+    const { doctorClear } = await import('../lib/doctor.mjs');
+    const r = doctorClear(root, { key: 'd'.repeat(64), dir: join(root, '.adlc') });
+    assert.equal(r.ok, true);
+    const sentinel = JSON.parse(readFileSync(join(root, '.adlc', '.deny-store'), 'utf8'));
+    assert.ok(sentinel.sessions.includes('bound-b'), 'the bound session registration survived the migration');
+    assert.ok(!sentinel.sessions.includes('orphan-a'));
+    assert.ok(!existsSync(join(root, '.adlc', 'handoffs', '.deny-store')), 'the legacy file is healed away');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a partial unlink failure still updates the sentinel and records evidence for what WAS cleared (agy r1 #2)', async () => {
+  const { unlinkSync: realUnlink } = await import('node:fs');
+  const root = scratch();
+  try {
+    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
+    ensureDenyMarker(root, { sessionId: 'orphan-z', host: 'pi' });
+    const { doctorClear } = await import('../lib/doctor.mjs');
+    const fs = { unlinkSync: (p) => { if (p.includes('orphan-z')) throw new Error('EACCES simulated'); return realUnlink(p); } };
+    const r = doctorClear(root, { key: 'd'.repeat(64), dir: join(root, '.adlc'), fs });
+    assert.equal(r.ok, false);
+    assert.deepEqual(r.cleared, ['orphan-a']);
+    const sentinel = JSON.parse(readFileSync(join(root, '.adlc', '.deny-store'), 'utf8'));
+    assert.ok(!sentinel.sessions.includes('orphan-a'), 'the removed record left the sentinel');
+    assert.ok(sentinel.sessions.includes('orphan-z'), 'the still-present record stays registered');
+    const manifest = readFileSync(join(root, '.adlc', 'manifest.jsonl'), 'utf8');
+    const entry = manifest.split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.gate === 'handoff-doctor-clear');
+    assert.ok(entry && entry.data.partial === true && entry.data.failed.session_id === 'orphan-z', 'the evidence names the partial failure');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
