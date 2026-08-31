@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyDenyRecord, doctorReport } from '../lib/doctor.mjs';
+import { classifyDenyRecord, doctorReport, ORPHAN_MIN_AGE_MS } from '../lib/doctor.mjs';
 import { ensureDenyMarker, loadDenyRecords, readDenyMarker } from '../lib/deny-marker.mjs';
 import { writeDenyRecord } from '../lib/deny-persist.mjs';
 import { writeFinal } from '../lib/final.mjs';
@@ -11,8 +11,12 @@ import { writeFinal } from '../lib/final.mjs';
 const scratch = () => mkdtempSync(join(tmpdir(), 'handoff-doctor-'));
 
 test('classifyDenyRecord: ORPHANED-UNBOUND is exactly open + null ticket + null hash + no capture; every near-miss classifies differently', () => {
-  const orphan = { session_id: 's1', ticket_id: null, content_hash: null, status: 'open' };
+  const old = new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString();
+  const orphan = { session_id: 's1', ticket_id: null, content_hash: null, status: 'open', since: old };
   assert.equal(classifyDenyRecord(orphan, { hasCapture: false }).kind, 'orphaned-unbound');
+  // A LIVE session's deny looks identical for a window: a fresh record is never an orphan (agy r2).
+  assert.equal(classifyDenyRecord({ ...orphan, since: new Date().toISOString() }, { hasCapture: false }).kind, 'recent-unbound');
+  assert.equal(classifyDenyRecord({ ...orphan, since: 'not-a-date' }, { hasCapture: false }).kind, 'recent-unbound', 'an unparseable since is never clearable');
   assert.equal(classifyDenyRecord({ ...orphan, ticket_id: 'T1' }, { hasCapture: false }).kind, 'bound');
   assert.equal(classifyDenyRecord({ ...orphan, content_hash: 'h' }, { hasCapture: false }).kind, 'bound');
   assert.equal(classifyDenyRecord(orphan, { hasCapture: true }).kind, 'captured');
@@ -22,7 +26,7 @@ test('classifyDenyRecord: ORPHANED-UNBOUND is exactly open + null ticket + null 
 test('doctorReport over a real store: an orphan is reported with its clear command; a bound deny and a captured deny are NOT clearable; a clean store reports none', () => {
   const root = scratch();
   try {
-    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
+    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' }, { now: () => new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString() });
     ensureDenyMarker(root, { sessionId: 'bound-b', ticketId: 'T9', contentHash: 'c'.repeat(64), host: 'pi' });
     ensureDenyMarker(root, { sessionId: 'captured-c', host: 'pi' });
     writeFinal(root, { sessionId: 'captured-c', ticketId: null, contentHash: null, host: 'pi' });
@@ -47,7 +51,7 @@ test('provenance: new deny records carry writer {pid, argv0, cwd, host, wroteAt}
     assert.equal(rec.writer.cwd, process.cwd());
     assert.ok(rec.writer.wroteAt);
     // A record written without provenance (the pre-provenance schema) still loads and classifies.
-    const legacy = writeDenyRecord(root, { session_id: 'legacy-l', ticket_id: null, content_hash: null, status: 'open', since: new Date().toISOString(), host: 'pi', schema: 1 });
+    const legacy = writeDenyRecord(root, { session_id: 'legacy-l', ticket_id: null, content_hash: null, status: 'open', since: new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString(), host: 'pi', schema: 1 });
     assert.equal(legacy.ok, true);
     const loaded = loadDenyRecords(root);
     assert.equal(loaded.ok, true);
@@ -61,7 +65,7 @@ test('a legacy-only sentinel is merged, never discarded: the first clear keeps b
   const { writeFileSync, mkdirSync, renameSync } = await import('node:fs');
   const root = scratch();
   try {
-    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
+    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' }, { now: () => new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString() });
     ensureDenyMarker(root, { sessionId: 'bound-b', ticketId: 'T9', contentHash: 'c'.repeat(64), host: 'pi' });
     // Simulate the pre-slice layout: registrations live ONLY in the legacy file.
     mkdirSync(join(root, '.adlc', 'handoffs'), { recursive: true });
@@ -80,8 +84,8 @@ test('a partial unlink failure still updates the sentinel and records evidence f
   const { unlinkSync: realUnlink } = await import('node:fs');
   const root = scratch();
   try {
-    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
-    ensureDenyMarker(root, { sessionId: 'orphan-z', host: 'pi' });
+    ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' }, { now: () => new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString() });
+    ensureDenyMarker(root, { sessionId: 'orphan-z', host: 'pi' }, { now: () => new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString() });
     const { doctorClear } = await import('../lib/doctor.mjs');
     const fs = { unlinkSync: (p) => { if (p.includes('orphan-z')) throw new Error('EACCES simulated'); return realUnlink(p); } };
     const r = doctorClear(root, { key: 'd'.repeat(64), dir: join(root, '.adlc'), fs });

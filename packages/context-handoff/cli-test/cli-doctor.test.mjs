@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureDenyMarker } from '../lib/deny-marker.mjs';
+import { ORPHAN_MIN_AGE_MS } from '../lib/doctor.mjs';
 import { writeFinal } from '../lib/final.mjs';
 
 const BIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'handoff.mjs');
@@ -22,7 +23,7 @@ function run(args, { cwd, env = {} } = {}) {
 
 function seeded() {
   const root = mkdtempSync(join(tmpdir(), 'handoff-doctor-cli-'));
-  ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' });
+  ensureDenyMarker(root, { sessionId: 'orphan-a', host: 'pi' }, { now: () => new Date(Date.now() - 2 * ORPHAN_MIN_AGE_MS).toISOString() });
   ensureDenyMarker(root, { sessionId: 'bound-b', ticketId: 'T9', contentHash: 'c'.repeat(64), host: 'pi' });
   ensureDenyMarker(root, { sessionId: 'captured-c', host: 'pi' });
   writeFinal(root, { sessionId: 'captured-c', ticketId: null, contentHash: null, host: 'pi' });
@@ -111,4 +112,27 @@ test('a store whose only record is INVALID exits 2 (fail-closed attention), neve
     assert.equal(r.code, 2, r.stdout + r.stderr);
     assert.match(r.stdout, /invalid record/);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a FRESH unbound deny (a live session mid-handoff) is recent-unbound: reported, never cleared', () => {
+  const root = mkdtempSync(join(tmpdir(), 'handoff-doctor-cli-'));
+  try {
+    ensureDenyMarker(root, { sessionId: 'live-now', host: 'pi' });
+    const dir = join(root, '.adlc');
+    const r = run(['doctor', '--clear', '--write', '--dir', dir], { cwd: root, env: { ADLC_MANIFEST_KEY: TEST_KEY } });
+    assert.equal(r.code, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /live-now recent-unbound/);
+    assert.match(r.stdout, /cleared 0/);
+    assert.ok(existsSync(join(dir, 'handoffs', 'denies', 'live-now.json')), 'the live deny survives');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('--dir is honoured from an UNRELATED cwd (the flag-value index is load-bearing)', () => {
+  const root = seeded();
+  const elsewhere = mkdtempSync(join(tmpdir(), 'handoff-doctor-elsewhere-'));
+  try {
+    const r = run(['doctor', '--dir', join(root, '.adlc')], { cwd: elsewhere });
+    assert.equal(r.code, 2, r.stdout + r.stderr);
+    assert.match(r.stdout, /orphan-a orphaned-unbound/);
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(elsewhere, { recursive: true, force: true }); }
 });

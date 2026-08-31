@@ -13,21 +13,28 @@ import { loadDenyRecords, denyPath } from './deny-marker.mjs';
 import { readFinal } from './final.mjs';
 import { recordHandoffEvidence } from './evidence.mjs';
 
-/** Pure classification. `orphaned-unbound` = open + null ticket + null hash + no capture. */
-export function classifyDenyRecord(record, { hasCapture }) {
+/** A live session's deny is open+unbound+uncaptured for a WINDOW before binding/capture:
+ * only a record older than this is an orphan candidate (agy r2 — clearing a live one would
+ * strand the session it protects). */
+export const ORPHAN_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Pure classification. `orphaned-unbound` = open + null ticket + null hash + no capture + old enough. */
+export function classifyDenyRecord(record, { hasCapture, nowMs = Date.now(), minAgeMs = ORPHAN_MIN_AGE_MS }) {
   if (!record || record.status !== 'open') return { kind: 'closed' };
   if (record.ticket_id != null || record.content_hash != null) return { kind: 'bound' };
   if (hasCapture) return { kind: 'captured' };
+  const sinceMs = Date.parse(record.since ?? '');
+  if (!Number.isFinite(sinceMs) || nowMs - sinceMs < minAgeMs) return { kind: 'recent-unbound' };
   return { kind: 'orphaned-unbound' };
 }
 
 /** Read-only report over the real store. */
-export function doctorReport(root) {
+export function doctorReport(root, { nowMs = Date.now(), minAgeMs = ORPHAN_MIN_AGE_MS } = {}) {
   const loaded = loadDenyRecords(root);
   if (!loaded.ok) return { ok: false, reason: loaded.reason ?? 'deny store unavailable', records: [], orphans: [], open: [] };
   const records = loaded.records.map((r) => {
     const hasCapture = readFinal(root, r.session_id).ok === true;
-    return { ...r, kind: classifyDenyRecord(r, { hasCapture }).kind };
+    return { ...r, kind: classifyDenyRecord(r, { hasCapture, nowMs, minAgeMs }).kind };
   });
   const orphans = records.filter((r) => r.kind === 'orphaned-unbound');
   const open = records.filter((r) => r.kind !== 'closed');
