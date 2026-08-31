@@ -150,6 +150,18 @@ fail closed ("Fork is not available inside a forked worker") with no side effect
 wasted turn — state the preamble explicitly rather than relying on "do not re-delegate" alone.
 Then do not touch lane files; work on the relay/skill/memory until the notifications arrive.
 
+**Verify, don't trust, a lane's first report.** A report that arrives within ~2-3 minutes of
+4-8 tool calls, describing the OTHER lanes rather than progress on its own issue, is not a
+status update — it means the lane spent its whole turn on `ListAgents`/checking siblings and
+did zero real work (empty worktree: no test file, no commit). This happened to 3 of 4 lanes in
+one batch DESPITE the explicit preamble above. Before believing any early lane report, check
+`git -C .worktrees/fix-<n> status --short` and `git log --oneline -1` yourself. If the worktree
+has nothing but the ticket shard, resume the lane with a literal, single, immediately-actionable
+command (name the exact `cd … && adlc coldstart …` line to run NEXT, explicitly forbid checking
+ListAgents/siblings/status again, explicitly forbid sending another message until the PR opens
+or a real blocker is hit) — a first redirect may not be enough; re-verify the worktree a few
+minutes later and repeat the same literal-command redirect if it still shows no progress.
+
 The lane sequence the prompt enforces: P2 `adlc coldstart <id> --prompt-only` (self-audit) →
 P4 red test file first, RED, implement, GREEN, package suite, docs → P3 `adlc rails-guard
 --base origin/main --ticket <id>` → P5 `scripts/mutation-gate.mjs origin/main --max 12` then
