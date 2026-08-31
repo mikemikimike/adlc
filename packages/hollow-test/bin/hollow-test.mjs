@@ -575,10 +575,17 @@ process.on('SIGINT', () => {
 // ── mutation loop ────────────────────────────────────────────────────────────
 
 const results = [];
+// Diff-derived files that could not be read at all (deleted/renamed/permission
+// issue between diff computation and this loop). Tracked separately from a
+// file that WAS read but produced zero mutants — the two are reported with
+// distinct reasons below (#658) rather than being conflated into one vague
+// "nothing happened" message.
+const unreadableTargets = new Set();
 
 for (const target of fileTargets) {
   const content = readFileSafe(target.absolutePath);
   if (content === null) {
+    unreadableTargets.add(target.file);
     if (!useJson) {
       console.warn(`warning: could not read ${target.file} — skipping`);
     }
@@ -656,6 +663,12 @@ for (const target of fileTargets) {
   }
 }
 
+// Per-file mutant counts, shared by both starvation checks below.
+const mutantCountByFile = {};
+for (const r of results) {
+  mutantCountByFile[r.file] = (mutantCountByFile[r.file] ?? 0) + 1;
+}
+
 // ── fail closed: an explicit target that generated zero mutants was never ──
 // actually verified. A file can be readable and have nonzero quota yet still
 // produce no mutants (comment-only, blank, re-export-only, or otherwise no
@@ -667,10 +680,6 @@ for (const target of fileTargets) {
 // close. Distinguish this from the legitimate "every mutant was killed" case
 // by checking per-file counts rather than results.length overall.
 if (mutableExplicitFiles.length > 0) {
-  const mutantCountByFile = {};
-  for (const r of results) {
-    mutantCountByFile[r.file] = (mutantCountByFile[r.file] ?? 0) + 1;
-  }
   const starvedExplicitFiles = mutableExplicitFiles.filter((f) => !mutantCountByFile[f]);
   if (starvedExplicitFiles.length > 0) {
     opError(
@@ -680,6 +689,36 @@ if (mutableExplicitFiles.length > 0) {
       'target was never actually verified; refusing to report a pass.'
     );
   }
+}
+
+// ── fail closed: diff-derived targets that generated ZERO mutants OVERALL ──
+// were never actually verified either — the SAME vacuous-pass class as the
+// explicit-target check above, just for the diff-selected set (#658).
+// Deliberately gated on results.length === 0 (not per-file starvation): a
+// diff where SOME files produced mutants and others did not is issue #657
+// (the --max budget-starvation case) and stays out of scope here — only the
+// all-zero/all-unreadable case, where nothing about the diff was ever
+// exercised at all, fails closed. A file that could not be read at all is
+// reported with a distinct reason from a file that WAS read but had no
+// mutable line, mirroring the explicit-target message's shape.
+if (diffEligibleFiles.length > 0 && results.length === 0) {
+  const noMutantFiles = diffEligibleFiles.filter((f) => !unreadableTargets.has(f));
+  const unreadableFiles = diffEligibleFiles.filter((f) => unreadableTargets.has(f));
+  const parts = [];
+  if (noMutantFiles.length > 0) {
+    parts.push(
+      `${noMutantFiles.join(', ')}: no mutable line was found (comment-only, blank, ` +
+      'or a shape none of the mutation operators recognize)'
+    );
+  }
+  if (unreadableFiles.length > 0) {
+    parts.push(`${unreadableFiles.join(', ')}: could not be read`);
+  }
+  opError(
+    'diff-derived file(s) produced zero mutants — ' +
+    parts.join('; ') +
+    '. The changed code was never actually verified; refusing to report a pass.'
+  );
 }
 
 // Could not determine validity for some mutant — refuse to report a verdict.
@@ -713,10 +752,12 @@ if (useJson) {
 
 // ── exit ─────────────────────────────────────────────────────────────────────
 
+// Defense in depth: every reachable zero-results path is fail-closed above
+// (the explicit-target and diff-derived-target checks), so this should be
+// unreachable — but a coverage gate must never silently pass() on zero
+// results regardless of how it got here (#658).
 if (results.length === 0) {
-  const warnMsg = 'warning: no mutants generated from diff — nothing mutable in diff';
-  if (!useJson) console.warn(warnMsg);
-  pass();
+  opError('no mutants were generated and no target was selected — refusing to report a pass.');
 }
 
 // FAIL CLOSED when nothing valid ever ran (#293). If every mutant was
