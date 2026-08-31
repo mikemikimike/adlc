@@ -663,11 +663,10 @@ for (const target of fileTargets) {
   }
 }
 
-// Per-file mutant counts, shared by both starvation checks below.
-const mutantCountByFile = {};
-for (const r of results) {
-  mutantCountByFile[r.file] = (mutantCountByFile[r.file] ?? 0) + 1;
-}
+// Files with at least one result, shared by both starvation checks below.
+// Membership only — no caller needs an actual count, so there is nothing
+// numeric here for a mutation operator to perturb equivalently.
+const filesWithResults = new Set(results.map((r) => r.file));
 
 // ── fail closed: an explicit target that generated zero mutants was never ──
 // actually verified. A file can be readable and have nonzero quota yet still
@@ -680,7 +679,7 @@ for (const r of results) {
 // close. Distinguish this from the legitimate "every mutant was killed" case
 // by checking per-file counts rather than results.length overall.
 if (mutableExplicitFiles.length > 0) {
-  const starvedExplicitFiles = mutableExplicitFiles.filter((f) => !mutantCountByFile[f]);
+  const starvedExplicitFiles = mutableExplicitFiles.filter((f) => !filesWithResults.has(f));
   if (starvedExplicitFiles.length > 0) {
     opError(
       'explicit --target/--rails file(s) produced zero mutants — ' +
