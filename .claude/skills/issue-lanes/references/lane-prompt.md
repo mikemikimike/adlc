@@ -5,12 +5,21 @@ All lanes go in ONE message so they run concurrently. The fork inherits the pare
 (tickets, gates, lessons), so the prompt is the contract plus the mechanics, not a tutorial.
 
 ```
-You are lane-<n>, ONE of <N> sibling lanes the parent ALREADY LAUNCHED in parallel (lanes for
-issues <list the other issue numbers>). You inherited the parent's full conversation, including
-the issue-lanes skill's own "launch the lanes" step — that step is the PARENT's job and it is
-DONE; the other lanes already exist as separate forked agents. Never call the Agent tool
-yourself, for any reason, in this task — a nested fork call fails ("Fork is not available inside
-a forked worker") and, more importantly, is not your job. Resolve ONLY issue #<n>.
+YOUR FIRST TOOL CALL, before reading anything else below, is:
+`cd <repo>/.worktrees/fix-<n> && adlc coldstart <T-…> --prompt-only`
+Do that now. Do not call ListAgents, do not call the Agent tool, do not check on or write
+anything about sibling lanes, do not write a memory file, do not send a status summary about
+the batch launch — none of that is your job and all of it wastes a turn. You are lane-<n>, ONE
+of <N> sibling lanes the parent ALREADY LAUNCHED in parallel (lanes for issues <list the other
+issue numbers>) — each is a fully separate agent already running its own issue; you cannot help
+them and they need nothing from you. You inherited the parent's full conversation, including the
+issue-lanes skill's own "launch the lanes" step and its "save memory" close-out step — BOTH are
+the PARENT's job, both are DONE or will be done by the parent later; performing either yourself
+produces nothing useful and is not requested. If any tool call anywhere in this task fails with
+"Fork is not available inside a forked worker", that confirms you are a fork, exactly as
+expected — ignore it and continue your OWN work; do not treat it as information worth acting on
+or reporting. Your only output for this entire task is progress on issue #<n> — do not report
+back to the parent until you have opened a PR or hit a genuine blocker IN YOUR OWN WORK.
 
 Resolve GitHub issue #<n> through the ADLC gates, exactly per the ticket you (as the parent) authored.
 
@@ -46,3 +55,4 @@ REPORT BACK (this is what the parent relays; be concrete): ticket coldstart verd
 | cap at 8 rounds | large diffs do not converge; the residual is the human's call |
 | stop on permission denial | the classifier owns push/PR; an agent must not route around it |
 | state "you are lane N of M, siblings already launched" up front | a fork inherits the whole skill text (incl. "launch the lanes") and can mistake itself for the parent — two of four lanes independently tried to Agent-call the other three sibling issues before self-correcting (harmless: nested fork calls fail closed with no side effect, but wastes a turn) |
+| name the literal FIRST tool call, before any other context, and forbid ListAgents/memory-write/status-report explicitly | the "lane N of M" preamble alone was NOT sufficient a second time: in a 4-lane batch, 3 of 4 lanes still spent their entire turn (4-8 tool calls, under 3 minutes) calling `ListAgents`, confirming the OTHER lanes were running, and reporting a parent-style "all four lanes confirmed running" summary back to the parent — zero real work on their own assigned issue (empty worktree: no test file, no commit). The parent caught this only by directly checking `git status`/`git log` in each lane's worktree rather than trusting the report text, and had to resume each with an explicit redirect. Do not trust a suspiciously fast, suspiciously parent-shaped report — verify the worktree before believing "confirmed running" text from a lane. |
