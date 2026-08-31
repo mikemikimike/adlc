@@ -1,0 +1,13 @@
+{
+  "body": "CONTEXT. A pre-containment pi session (fixed by 59bb1e71) left an orphaned deny (session sess-1, ticket null, hash null) in the real .adlc store; D3 then fail-closed every new pi session for 8 days and the cause took a manual investigation (2026-08-31 triage). Two defenses: a doctor command that dead-ends this in one operator command, and provenance on the records so the next leak is self-diagnosing. ACCEPTANCE. (1) `handoff doctor` (read-only by default) loads the deny store and classifies each record; ORPHANED-UNBOUND = status open AND ticket_id null AND content_hash null AND no capture for the session in the store; the report names each record, its classification, its provenance when present, and the exact clear command; exit 0 = no orphans, exit 2 = orphans found. (2) `handoff doctor --clear --write` removes ONLY orphaned-unbound records (never a bound or captured deny), updates the deny-store membership file, requires ADLC_MANIFEST_KEY, and appends a signed handoff-doctor-clear manifest entry naming the cleared session ids and reasons; without the key it fails closed writing nothing. (3) ensureDenyMarker/writeDenyRecord stamp writer provenance {pid, ppid, argv (basename argv0 + args, redacted through the safe-command rules), cwd, host, wroteAt} on new records; readers tolerate records without it (schema stays 1); doctor prints it. (4) The adapter mutation gate treats a doctor-cleared store exactly as empty (a fresh session is not denied). (5) All existing context-handoff tests keep passing. VERIFY. packages/context-handoff tests: unit (classification predicate incl. each near-miss: bound ticket, present hash, matching capture, non-open status), cli-test (doctor report and clear round-trip against a real temp store incl. key-missing fail-closed and manifest entry assertion), provenance stamped + tolerated when absent; run the package suite and the workspace mutation gate.",
+  "budget": "direct",
+  "category": "feat",
+  "duration": 1,
+  "edges": [],
+  "id": "T-01M1AXGESETGS9RCD3BGP8KQH6",
+  "rails": [],
+  "scope": [
+    "packages/context-handoff/**"
+  ],
+  "title": "context-handoff: `handoff doctor` clears orphaned unbound denies; deny records carry writer provenance"
+}
