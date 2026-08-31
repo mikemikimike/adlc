@@ -12,6 +12,9 @@ import { existsSync } from 'node:fs';
 import { parseArgs } from '@adlc/core';
 import { resolveActiveTicketId } from '@adlc/tickets';
 import { readDenyMarker, normalizeBindField } from '../lib/deny-marker.mjs';
+import { doctorReport, doctorClear } from '../lib/doctor.mjs';
+import { dirname as pathDirname, join as pathJoin, resolve as pathResolve } from 'node:path';
+import { resolveManifestKey } from '../lib/evidence.mjs';
 import { consumeDenyRecord } from '../lib/deny-lifecycle.mjs';
 import { normalizeBypassGrant, authorized } from '../lib/mutation-gate.mjs';
 import { writeFinal, readFinal, buildFinal, CONTENT_KIND_CAPTURE } from '../lib/final.mjs';
@@ -28,6 +31,7 @@ import { createSuperviseDeps, splitPassthrough } from '../lib/supervise-runtime.
 import { capCaptureBody, hashCaptureBody, writeVerifiedCapture } from '../lib/capture.mjs';
 import { buildBootstrapPrompt, composeBrief } from '../lib/brief.mjs';
 import {
+
   finalAssistantMessageFrom,
   parseTranscript,
   transcriptTimestamp,
@@ -1073,6 +1077,36 @@ if (argv.length === 0 || argv[0] === '--help' || argv[0] === '-h') {
   helpAndExit();
 }
 
+
+// ── doctor (T-01M1AXGESETGS9RCD3BGP8KQH6) ─────────────────────────────────────
+// Orphaned-unbound denies (a pre-containment writer's leak) dead-end here in one
+// command. Read-only by default; exit 2 while ANY open deny remains, 0 only on a
+// store with none. --clear --write needs the key and records signed evidence.
+function runDoctor(args) {
+  const dirFlag = args.indexOf('--dir');
+  const dir = dirFlag >= 0 ? args[dirFlag + 1] : pathJoin(process.cwd(), '.adlc');
+  const root = pathDirname(pathResolve(dir));
+  const clear = args.includes('--clear');
+  const write = args.includes('--write');
+  const report = doctorReport(root);
+  if (!report.ok) opError(`doctor: ${report.reason}`);
+  for (const r of report.records) {
+    const w = r.writer ? ` writer={pid:${r.writer.pid} argv0:${r.writer.argv0} cwd:${r.writer.cwd} at:${r.writer.wroteAt}}` : ' writer=(none recorded)';
+    process.stdout.write(`doctor: ${r.session_id} ${r.kind} since=${r.since ?? '?'} host=${r.host ?? '?'}${w}\n`);
+  }
+  if (report.invalidRecords.length) process.stdout.write(`doctor: ${report.invalidRecords.length} invalid record(s) retained (fail-closed)\n`);
+  if (clear && write) {
+    const key = resolveManifestKey();
+    const cleared = doctorClear(root, { key, dir });
+    if (!cleared.ok) opError(`doctor: ${cleared.reason}`);
+    process.stdout.write(`doctor: cleared ${cleared.cleared.length} orphaned-unbound record(s): ${cleared.cleared.join(', ') || '(none)'}\n`);
+    process.exit(cleared.remainingOpen > 0 ? 2 : 0);
+  }
+  if (clear && !write) process.stdout.write(`doctor: dry-run — pass --write (with ADLC_MANIFEST_KEY) to clear ${report.orphans.length} orphaned-unbound record(s)\n`);
+  if (report.orphans.length) process.stdout.write(`doctor: ${report.orphans.length} orphaned-unbound record(s); clear with: ${report.clearCommand}\n`);
+  process.exit(report.open.length > 0 ? 2 : 0);
+}
+
 const [command, ...rest] = argv;
 switch (command) {
   case 'write':
@@ -1093,6 +1127,9 @@ switch (command) {
   case 'continue':
     runContinue(rest);
     break;
+  case 'doctor':
+    runDoctor(rest);
+    break;
   case 'supervise':
     // Awaited: the loop is long-lived, and an unawaited rejection here would
     // exit 0 while the supervised session was still running.
@@ -1105,6 +1142,6 @@ switch (command) {
     break;
   default:
     opError(
-      `unknown subcommand "${command}" (expected write|resume|bypass|repair|unlock|continue|supervise)`,
+      `unknown subcommand "${command}" (expected write|resume|bypass|repair|unlock|continue|supervise|doctor)`,
     );
 }
