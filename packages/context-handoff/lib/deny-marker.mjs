@@ -1,4 +1,6 @@
+import { hostname as osHostname } from 'node:os';
 import {
+
   mkdirSync,
   writeFileSync,
   readFileSync,
@@ -80,6 +82,8 @@ export function normalizeBindField(value) {
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
 }
+
+const hostnameOf = () => { try { return osHostname(); } catch { return null; } };
 
 export function denyPath(root, sessionId) {
   assertSafeSessionId(sessionId);
@@ -207,6 +211,17 @@ export function ensureDenyMarker(
     status: 'open',
     since: now(),
     host,
+    // Writer provenance (T-01M1AXGESETGS9RCD3BGP8KQH6): the sess-1 leak took a manual
+    // investigation because nothing said WHO wrote the record. basename argv0 only —
+    // never a path; args are omitted entirely (they can carry operator secrets).
+    writer: {
+      pid: process.pid,
+      ppid: process.ppid ?? null,
+      argv0: String(process.argv[1] ?? process.argv0 ?? 'node').split('/').pop(),
+      cwd: process.cwd(),
+      host: hostnameOf(),
+      wroteAt: now(),
+    },
     schema: 1,
   };
   const tmp = uniqueTmpPath(path);
@@ -593,7 +608,6 @@ export function loadDenyRecords(
   return { ok: true, records, invalidRecords, registeredSessions, denyStoreUnavailable: false };
 
 }
-
 
 /**
  * Compose loadDenyRecords output into evaluateMutationGate input.
